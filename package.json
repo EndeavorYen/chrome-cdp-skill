@@ -1,11 +1,25 @@
 {
   "name": "pi-chrome-cdp",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "description": "Give your AI agent access to your live Chrome session — works out of the box, connects to tabs you already have open",
-  "keywords": ["pi-package", "pi", "pi-coding-agent", "skills", "chrome", "cdp", "browser", "devtools"],
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "skills",
+    "chrome",
+    "cdp",
+    "browser",
+    "devtools"
+  ],
   "license": "MIT",
-  "files": ["skills/", "README.md"],
+  "files": [
+    "skills/",
+    "README.md"
+  ],
   "pi": {
-    "skills": ["./skills"]
+    "skills": [
+      "./skills"
+    ]
   }
 }
