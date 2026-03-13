@@ -1,0 +1,10 @@
+{
+  "name": "pi-chrome-cdp",
+  "version": "1.0.0",
+  "description": "Lightweight Chrome DevTools Protocol CLI skill for pi coding agents — no Puppeteer, works with 100+ tabs",
+  "keywords": ["pi-package"],
+  "license": "MIT",
+  "pi": {
+    "skills": ["."]
+  }
+}
