@@ -729,6 +729,8 @@ Usage: cdp <command> [args]
                                     Optional interval in ms between clicks (default 1500)
   evalraw <target> <method> [json]  Send a raw CDP command; returns JSON result
                                     e.g. evalraw <t> "DOM.getDocument" '{}'
+  open  [url]                       Open a new tab (default: about:blank)
+                                    Note: each new tab triggers a fresh "Allow debugging?" prompt
   stop  [target]                    Stop daemon(s)
 
 <target> is a unique targetId prefix from "cdp list". If a prefix is ambiguous,
@@ -798,6 +800,18 @@ async function main() {
     writeFileSync(PAGES_CACHE, JSON.stringify(pages), { mode: 0o600 });
     console.log(formatPageList(pages));
     setTimeout(() => process.exit(0), 100);
+    return;
+  }
+
+  // Open new tab
+  if (cmd === 'open') {
+    const url = args[0] || 'about:blank';
+    const cdp = new CDP();
+    await cdp.connect(getWsUrl());
+    const { targetId } = await cdp.send('Target.createTarget', { url });
+    cdp.close();
+    console.log(`Opened new tab: ${targetId.slice(0, 8)}  ${url}`);
+    console.log('Note: this tab will need "Allow debugging?" approval on first access.');
     return;
   }
 

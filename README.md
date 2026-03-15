@@ -45,6 +45,7 @@ scripts/cdp.mjs clickxy <target> <x> <y>          # click at CSS pixel coordinat
 scripts/cdp.mjs type   <target> "text"            # type at focused element (works in cross-origin iframes)
 scripts/cdp.mjs loadall <target> "selector"       # click "load more" until gone
 scripts/cdp.mjs evalraw <target> <method> [json]  # raw CDP command passthrough
+scripts/cdp.mjs open   [url]                      # open new tab (triggers Allow prompt)
 scripts/cdp.mjs stop   [target]                   # stop daemon(s)
 ```
 
