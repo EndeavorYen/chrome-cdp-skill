@@ -19,15 +19,21 @@ const IDLE_TIMEOUT = 20 * 60 * 1000;
 const DAEMON_CONNECT_RETRIES = 20;
 const DAEMON_CONNECT_DELAY = 300;
 const MIN_TARGET_PREFIX_LEN = 8;
-process.umask(0o077);
-const RUNTIME_DIR = process.env.XDG_RUNTIME_DIR
-  ? resolve(process.env.XDG_RUNTIME_DIR, 'cdp')
-  : resolve(homedir(), '.cache', 'cdp');
+const IS_WINDOWS = process.platform === 'win32';
+if (!IS_WINDOWS) process.umask(0o077);
+const RUNTIME_DIR = IS_WINDOWS
+  ? resolve(homedir(), '.cache', 'cdp')
+  : process.env.XDG_RUNTIME_DIR
+    ? resolve(process.env.XDG_RUNTIME_DIR, 'cdp')
+    : resolve(homedir(), '.cache', 'cdp');
 try { mkdirSync(RUNTIME_DIR, { recursive: true, mode: 0o700 }); } catch {}
-const SOCK_PREFIX = resolve(RUNTIME_DIR, 'cdp-');
 const PAGES_CACHE = resolve(RUNTIME_DIR, 'pages.json');
 
-function sockPath(targetId) { return `${SOCK_PREFIX}${targetId}.sock`; }
+function sockPath(targetId) {
+  return IS_WINDOWS
+    ? `\\\\.\\pipe\\cdp-${targetId}`
+    : resolve(RUNTIME_DIR, `cdp-${targetId}.sock`);
+}
 
 function getWsUrl() {
   const home = homedir();
@@ -51,6 +57,11 @@ function getWsUrl() {
     ...linuxBrowsers.flatMap(b => [
       resolve(home, '.config', b, 'DevToolsActivePort'),
       resolve(home, '.config', b, 'Default/DevToolsActivePort'),
+    ]),
+    // Windows: ~/AppData/Local/<name>/User Data/DevToolsActivePort
+    ...['Google/Chrome', 'BraveSoftware/Brave-Browser', 'Microsoft/Edge'].flatMap(b => [
+      resolve(home, 'AppData/Local', b, 'User Data/DevToolsActivePort'),
+      resolve(home, 'AppData/Local', b, 'User Data/Default/DevToolsActivePort'),
     ]),
   ].filter(Boolean);
   const portFile = candidates.find(p => existsSync(p));
@@ -483,7 +494,7 @@ async function runDaemon(targetId) {
     if (!alive) return;
     alive = false;
     server.close();
-    try { unlinkSync(sp); } catch {}
+    if (!IS_WINDOWS) try { unlinkSync(sp); } catch {}
     cdp.close();
     process.exit(0);
   }
@@ -571,7 +582,7 @@ async function runDaemon(targetId) {
     });
   });
 
-  try { unlinkSync(sp); } catch {}
+  if (!IS_WINDOWS) try { unlinkSync(sp); } catch {}
   server.listen(sp);
 }
 
@@ -593,7 +604,7 @@ async function getOrStartTabDaemon(targetId) {
   try { return await connectToSocket(sp); } catch {}
 
   // Clean stale socket
-  try { unlinkSync(sp); } catch {}
+  if (!IS_WINDOWS) try { unlinkSync(sp); } catch {}
 
   // Spawn daemon
   const child = spawn(process.execPath, [process.argv[1], '_daemon', targetId], {
@@ -679,7 +690,7 @@ async function stopDaemons(targetPrefix) {
       const conn = await connectToSocket(sp);
       await sendCommand(conn, { cmd: 'stop' });
     } catch {
-      try { unlinkSync(sp); } catch {}
+      if (!IS_WINDOWS) try { unlinkSync(sp); } catch {}
     }
   }
 }
