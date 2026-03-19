@@ -328,13 +328,7 @@ async function evalStr(cdp, sid, expression) {
 }
 
 async function shotStr(cdp, sid, filePath, targetId) {
-  let dpr = 1;
-  try {
-    const raw = await evalStr(cdp, sid, 'window.devicePixelRatio');
-    const parsed = parseFloat(raw);
-    if (parsed > 0) dpr = parsed;
-  } catch {}
-
+  const dpr = await getDpr(cdp, sid);
   const { data } = await cdp.send('Page.captureScreenshot', { format: 'png' }, sid);
   const out = filePath || resolve(RUNTIME_DIR, `screenshot-${(targetId || 'unknown').slice(0, 8)}.png`);
   writeFileSync(out, Buffer.from(data, 'base64'));
@@ -419,8 +413,9 @@ async function netStr(cdp, sid) {
 async function statusStr(cdp, sid, consoleBuf, exceptionBuf, navBuf, lastReadSeq) {
   let title = '', url = '';
   try {
-    title = await evalStr(cdp, sid, 'document.title');
-    url = await evalStr(cdp, sid, 'window.location.href');
+    const info = JSON.parse(await evalStr(cdp, sid, 'JSON.stringify({ title: document.title, url: window.location.href })'));
+    title = info.title;
+    url = info.url;
   } catch {}
 
   const lines = [];
@@ -544,8 +539,12 @@ async function summaryStr(cdp, sid, consoleBuf, exceptionBuf) {
     lines.push('Scroll: no scroll');
   }
 
-  const errors = consoleBuf.all().filter(e => e.level === 'error').length;
-  const warnings = consoleBuf.all().filter(e => e.level === 'warning' || e.level === 'warn').length;
+  const allConsole = consoleBuf.all();
+  let errors = 0, warnings = 0;
+  for (const e of allConsole) {
+    if (e.level === 'error') errors++;
+    else if (e.level === 'warning' || e.level === 'warn') warnings++;
+  }
   const exceptions = exceptionBuf.all().length;
   const parts = [];
   if (errors > 0) parts.push(`${errors} error${errors > 1 ? 's' : ''}`);
@@ -554,6 +553,25 @@ async function summaryStr(cdp, sid, consoleBuf, exceptionBuf) {
   lines.push(`Console: ${parts.length > 0 ? parts.join(', ') : 'clean'}`);
 
   return lines.join('\n');
+}
+
+// Shared: dispatch a realistic mouse click at CSS pixel coordinates
+async function dispatchClick(cdp, sid, x, y) {
+  const base = { x, y, button: 'left', clickCount: 1, modifiers: 0 };
+  await cdp.send('Input.dispatchMouseEvent', { ...base, type: 'mouseMoved' }, sid);
+  await cdp.send('Input.dispatchMouseEvent', { ...base, type: 'mousePressed' }, sid);
+  await sleep(50);
+  await cdp.send('Input.dispatchMouseEvent', { ...base, type: 'mouseReleased' }, sid);
+}
+
+// Shared: get device pixel ratio
+async function getDpr(cdp, sid) {
+  try {
+    const raw = await evalStr(cdp, sid, 'window.devicePixelRatio');
+    const parsed = parseFloat(raw);
+    if (parsed > 0) return parsed;
+  } catch {}
+  return 1;
 }
 
 // Click element by CSS selector
@@ -571,11 +589,7 @@ async function clickStr(cdp, sid, selector) {
   const result = await evalStr(cdp, sid, expr);
   const r = JSON.parse(result);
   if (!r.ok) throw new Error(r.error);
-  const base = { x: r.x, y: r.y, button: 'left', clickCount: 1, modifiers: 0 };
-  await cdp.send('Input.dispatchMouseEvent', { ...base, type: 'mouseMoved' }, sid);
-  await cdp.send('Input.dispatchMouseEvent', { ...base, type: 'mousePressed' }, sid);
-  await sleep(50);
-  await cdp.send('Input.dispatchMouseEvent', { ...base, type: 'mouseReleased' }, sid);
+  await dispatchClick(cdp, sid, r.x, r.y);
   return `Clicked <${r.tag}> "${r.text}"`;
 }
 
@@ -584,11 +598,7 @@ async function clickXyStr(cdp, sid, x, y) {
   const cx = parseFloat(x);
   const cy = parseFloat(y);
   if (isNaN(cx) || isNaN(cy)) throw new Error('x and y must be numbers (CSS pixels)');
-  const base = { x: cx, y: cy, button: 'left', clickCount: 1, modifiers: 0 };
-  await cdp.send('Input.dispatchMouseEvent', { ...base, type: 'mouseMoved' }, sid);
-  await cdp.send('Input.dispatchMouseEvent', { ...base, type: 'mousePressed' }, sid);
-  await sleep(50);
-  await cdp.send('Input.dispatchMouseEvent', { ...base, type: 'mouseReleased' }, sid);
+  await dispatchClick(cdp, sid, cx, cy);
   return `Clicked at CSS (${cx}, ${cy})`;
 }
 
@@ -723,13 +733,7 @@ async function selectStr(cdp, sid, selector, value) {
 }
 
 async function fullshotStr(cdp, sid, filePath, targetId) {
-  let dpr = 1;
-  try {
-    const raw = await evalStr(cdp, sid, 'window.devicePixelRatio');
-    const parsed = parseFloat(raw);
-    if (parsed > 0) dpr = parsed;
-  } catch {}
-
+  const dpr = await getDpr(cdp, sid);
   const metrics = await cdp.send('Page.getLayoutMetrics', {}, sid);
   const width = metrics.cssContentSize?.width || metrics.contentSize?.width || 1280;
   const height = metrics.cssContentSize?.height || metrics.contentSize?.height || 800;
@@ -762,11 +766,19 @@ async function scanshotStr(cdp, sid, targetId) {
   for (let y = 0; y < scrollH; y += step) {
     segments.push(y);
   }
-  // Ensure we don't have a tiny last segment — merge if < 30% viewport
+  // If the last segment is tiny (< 30% viewport), replace it with a
+  // bottom-aligned capture so no content is clipped
   if (segments.length > 1) {
     const lastY = segments[segments.length - 1];
     const lastH = scrollH - lastY;
-    if (lastH < vh * 0.3) segments.pop();
+    if (lastH < vh * 0.3) {
+      segments.pop();
+      // Scroll the last capture so the viewport's bottom edge aligns with page bottom
+      const bottomY = Math.max(0, scrollH - vh);
+      if (bottomY > segments[segments.length - 1]) {
+        segments.push(bottomY);
+      }
+    }
   }
 
   const files = [];
@@ -879,11 +891,7 @@ async function loadAllStr(cdp, sid, selector, intervalMs = 1500) {
     const result = await evalStr(cdp, sid, expr);
     if (result === 'null' || result === '') break;
     const r = JSON.parse(result);
-    const base = { x: r.x, y: r.y, button: 'left', clickCount: 1, modifiers: 0 };
-    await cdp.send('Input.dispatchMouseEvent', { ...base, type: 'mouseMoved' }, sid);
-    await cdp.send('Input.dispatchMouseEvent', { ...base, type: 'mousePressed' }, sid);
-    await sleep(50);
-    await cdp.send('Input.dispatchMouseEvent', { ...base, type: 'mouseReleased' }, sid);
+    await dispatchClick(cdp, sid, r.x, r.y);
     clicks++;
     await sleep(intervalMs);
   }
