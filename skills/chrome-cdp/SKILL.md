@@ -1,11 +1,23 @@
 ---
 name: chrome-cdp
-description: "Interact with local Chrome browser via CDP — take screenshots, inspect DOM, debug pages, automate forms.\n當用戶說「看瀏覽器」「瀏覽器內容」「查看網頁」「截圖」「screenshot」「Chrome」「inspect page」「debug page」「頁面上有什麼」「瀏覽器畫面」「看我的頁面」「check the page」「browser」時使用。"
+description: "Connect to the user's EXISTING Chrome browser to inspect, screenshot, or interact with pages they already have open. Use this skill (NOT Playwright) whenever the user wants to see, debug, or interact with their current browser session — including logged-in pages, open tabs, or live page state.\n\nTrigger when user says: 看瀏覽器、瀏覽器內容、查看網頁、截圖、screenshot、Chrome、inspect page、debug page、頁面上有什麼、瀏覽器畫面、看我的頁面、check the page、browser、看一下頁面、幫我看、console errors、網頁錯誤、check my tab、what's on the page、read the page、capture the screen。\n\nDo NOT use Playwright for these tasks — Playwright launches a new isolated browser without the user's login state, cookies, or open tabs. chrome-cdp connects to the browser the user is already running."
 ---
 
 # Chrome CDP
 
-Lightweight Chrome DevTools Protocol CLI. Connects directly via WebSocket — no Puppeteer, works with 100+ tabs, instant connection.
+Connects to the user's **existing Chrome browser** via CDP WebSocket. No Puppeteer, no new browser instance — works with the tabs, login sessions, and page state the user already has open.
+
+> **When to use chrome-cdp vs Playwright:**
+>
+> | Scenario | Use |
+> |----------|-----|
+> | User wants to see/inspect their **current browser** | **chrome-cdp** (this skill) |
+> | User mentions their **open tabs**, **logged-in pages**, or **live page state** | **chrome-cdp** |
+> | User says "看瀏覽器", "screenshot", "check the page", "看一下" | **chrome-cdp** |
+> | User wants to **automate a fresh browser** for testing (no existing session) | Playwright |
+> | User wants to **navigate to a new URL from scratch** with no existing context | Playwright |
+>
+> **Default to chrome-cdp** when the user refers to "the page", "the browser", or "my tab" — they almost always mean their existing session, not a fresh browser.
 
 ## Prerequisites
 
@@ -150,6 +162,7 @@ CSS px = screenshot image px / DPR
 
 ## Tips
 
+- **Do NOT use Playwright** (or any MCP browser tool) to inspect the user's existing browser. Playwright launches a separate isolated browser — it cannot see the user's open tabs, login sessions, or page state. Always use this skill's commands instead.
 - Prefer `snap` over `html` for page structure — compact by default, use `snap --full` for complete tree.
 - Use `type` (not eval) to enter text in cross-origin iframes — `click`/`clickxy` to focus first, then `type`.
 - Daemons keep CDP sessions alive per tab (auto-exit after 20min idle), so only the first command per tab triggers Chrome's "Allow debugging" dialog.
