@@ -555,6 +555,235 @@ async function summaryStr(cdp, sid, consoleBuf, exceptionBuf) {
   return lines.join('\n');
 }
 
+// Roles that get visual layout annotations in perceive output
+const ENRICHED_ROLES = new Set([
+  'banner', 'navigation', 'main', 'contentinfo', 'complementary',
+  'heading', 'img', 'image', 'video', 'form', 'table', 'dialog',
+  'region', 'article', 'alert',
+]);
+
+// Perceive: enriched accessibility tree with inline visual layout annotations
+async function perceiveStr(cdp, sid, consoleBuf, exceptionBuf) {
+  // Get AX tree nodes and page metadata + layout map in parallel
+  const [axResult, metaJson] = await Promise.all([
+    cdp.send('Accessibility.getFullAXTree', {}, sid),
+    evalStr(cdp, sid, `(function() {
+      const vw = window.innerWidth, vh = window.innerHeight;
+      const scrollY = Math.round(window.scrollY);
+      const scrollMax = Math.round(document.documentElement.scrollHeight - window.innerHeight);
+
+      // Interactive element counts
+      const counts = {};
+      for (const el of document.querySelectorAll('a, button, input, select, textarea, [role="button"], [tabindex]')) {
+        const tag = el.tagName.toLowerCase();
+        const type = tag === 'input' ? 'input[' + (el.type || 'text') + ']' : tag;
+        counts[type] = (counts[type] || 0) + 1;
+      }
+
+      // Build layout map keyed by ARIA role (matching AX tree roles)
+      const TAG_ROLE = {
+        header:'banner', nav:'navigation', main:'main', footer:'contentinfo',
+        aside:'complementary', form:'form', table:'table', dialog:'dialog',
+        article:'article', section:'region', img:'img', video:'video',
+        h1:'heading', h2:'heading', h3:'heading', h4:'heading', h5:'heading', h6:'heading'
+      };
+      const selectors = 'header,nav,main,footer,aside,section,article,form,h1,h2,h3,h4,h5,h6,img,video,table,dialog,[role="banner"],[role="navigation"],[role="main"],[role="contentinfo"],[role="dialog"],[role="alert"],[role="region"],[role="complementary"]';
+      const layoutMap = {};
+      let count = 0;
+      for (const el of document.querySelectorAll(selectors)) {
+        const rect = el.getBoundingClientRect();
+        if (rect.width < 1 || rect.height < 1) continue;
+        const cs = window.getComputedStyle(el);
+        if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+
+        const tag = el.tagName.toLowerCase();
+        const role = el.getAttribute('role') || TAG_ROLE[tag] || tag;
+        const info = { h: Math.round(rect.height) };
+
+        // Only include width if element is significantly narrower than viewport
+        const w = Math.round(rect.width);
+        if (w < vw * 0.9) info.w = w;
+
+        // Key visual properties (only non-defaults)
+        const bg = cs.backgroundColor;
+        if (bg && bg !== 'rgba(0, 0, 0, 0)' && bg !== 'transparent') info.bg = bg;
+        if (tag.match(/^h[1-6]$/)) {
+          info.font = cs.fontSize + ' ' + cs.fontWeight;
+          if (cs.color && cs.color !== 'rgb(0, 0, 0)') info.color = cs.color;
+        }
+        if (cs.display === 'flex' || cs.display === 'grid') {
+          info.display = cs.display;
+          if (cs.gap && cs.gap !== 'normal' && cs.gap !== '0px') info.gap = cs.gap;
+        }
+        if (cs.opacity !== '1') info.opacity = cs.opacity;
+
+        // Viewport visibility
+        const top = rect.top, bot = rect.bottom;
+        if (bot < 0) info.vis = 'above';
+        else if (top > vh) info.vis = 'below';
+        // else: in viewport (default, no annotation needed)
+
+        if (!layoutMap[role]) layoutMap[role] = [];
+        layoutMap[role].push(info);
+        if (++count >= 150) break;
+      }
+
+      // Focused element
+      const focused = document.activeElement;
+      const focusDesc = focused && focused !== document.body
+        ? '<' + focused.tagName.toLowerCase() + (focused.id ? '#' + focused.id : '') + '>'
+        : 'none';
+
+      return JSON.stringify({
+        title: document.title, url: window.location.href,
+        vw, vh, scrollY, scrollMax,
+        counts, focused: focusDesc, layoutMap
+      });
+    })()`)
+  ]);
+
+  const meta = JSON.parse(metaJson);
+
+  // Console health
+  const allConsole = consoleBuf.all();
+  let errors = 0, warnings = 0;
+  for (const e of allConsole) {
+    if (e.level === 'error') errors++;
+    else if (e.level === 'warning' || e.level === 'warn') warnings++;
+  }
+  const exceptions = exceptionBuf.all().length;
+
+  // Build layout consumption cursors (each role's entries are consumed in document order)
+  const layoutCursors = {};
+  for (const [role, entries] of Object.entries(meta.layoutMap)) {
+    layoutCursors[role] = { entries, idx: 0 };
+  }
+  function consumeLayout(role) {
+    const cursor = layoutCursors[role];
+    if (!cursor || cursor.idx >= cursor.entries.length) return null;
+    return cursor.entries[cursor.idx++];
+  }
+
+  // Build enriched AX tree
+  const { nodes } = axResult;
+  const nodesById = new Map(nodes.map(n => [n.nodeId, n]));
+  const childrenByParent = new Map();
+  for (const n of nodes) {
+    if (!n.parentId) continue;
+    if (!childrenByParent.has(n.parentId)) childrenByParent.set(n.parentId, []);
+    childrenByParent.get(n.parentId).push(n);
+  }
+
+  const treeLines = [];
+  const visited = new Set();
+  function visit(node, depth) {
+    if (!node || visited.has(node.nodeId)) return;
+    visited.add(node.nodeId);
+    if (shouldShowAxNode(node, true)) {
+      const role = node.role?.value || '';
+      let line = formatAxNode(node, depth);
+
+      // Enrich landmark/structural nodes with layout annotations
+      if (ENRICHED_ROLES.has(role)) {
+        const layout = consumeLayout(role);
+        if (layout) {
+          const parts = [];
+          // Dimensions (height always; width only if not full-width)
+          if (layout.w) parts.push(`${layout.w}×${layout.h}px`);
+          else if (layout.h >= 40) parts.push(`↕${layout.h}px`);
+          // Visual properties
+          if (layout.bg) parts.push(`bg:${layout.bg}`);
+          if (layout.font) parts.push(layout.font);
+          if (layout.color) parts.push(`color:${layout.color}`);
+          if (layout.display) {
+            let d = layout.display;
+            if (layout.gap) d += ` gap:${layout.gap}`;
+            parts.push(d);
+          }
+          if (layout.opacity) parts.push(`opacity:${layout.opacity}`);
+          // Viewport visibility
+          if (layout.vis === 'above') parts.push('↑above fold');
+          else if (layout.vis === 'below') parts.push('↓below fold');
+          if (parts.length > 0) line += '  ' + parts.join('  ');
+        }
+      }
+      treeLines.push(line);
+    }
+    for (const child of orderedAxChildren(node, nodesById, childrenByParent)) {
+      visit(child, depth + 1);
+    }
+  }
+  const roots = nodes.filter(n => !n.parentId || !nodesById.has(n.parentId));
+  for (const root of roots) visit(root, 0);
+  for (const node of nodes) visit(node, 0);
+
+  // === Assemble output ===
+  const lines = [];
+  lines.push(`Page: ${meta.title} — ${meta.url}`);
+
+  const scrollPct = meta.scrollMax > 0 ? Math.round(meta.scrollY / meta.scrollMax * 100) : 0;
+  lines.push(`Viewport: ${meta.vw}×${meta.vh} | Scroll: ${meta.scrollY}/${meta.scrollMax > 0 ? meta.scrollMax : 0} (${scrollPct}%) | Focused: ${meta.focused}`);
+
+  const countParts = Object.entries(meta.counts).map(([k, v]) => `${v} ${k}`);
+  lines.push(`Interactive: ${countParts.length > 0 ? countParts.join(', ') : 'none'}`);
+
+  const healthParts = [];
+  if (errors > 0) healthParts.push(`${errors} error${errors > 1 ? 's' : ''}`);
+  if (warnings > 0) healthParts.push(`${warnings} warning${warnings > 1 ? 's' : ''}`);
+  if (exceptions > 0) healthParts.push(`${exceptions} exception${exceptions > 1 ? 's' : ''}`);
+  lines.push(`Console: ${healthParts.length > 0 ? healthParts.join(', ') : 'clean'}`);
+
+  lines.push('');
+  lines.push(...treeLines);
+
+  return lines.join('\n');
+}
+
+// Element screenshot: targeted capture of a specific element by CSS selector
+async function elshotStr(cdp, sid, selector, targetId) {
+  if (!selector) throw new Error('CSS selector required');
+  // Scroll element into view and get its bounding rect
+  const expr = `
+    (function() {
+      const el = document.querySelector(${JSON.stringify(selector)});
+      if (!el) return { ok: false, error: 'Element not found: ' + ${JSON.stringify(selector)} };
+      el.scrollIntoView({ block: 'center', inline: 'center' });
+      const rect = el.getBoundingClientRect();
+      return {
+        ok: true,
+        x: rect.x, y: rect.y, w: rect.width, h: rect.height,
+        tag: el.tagName, id: el.id,
+        text: el.textContent.trim().substring(0, 60)
+      };
+    })()
+  `;
+  const result = await evalStr(cdp, sid, expr);
+  const r = JSON.parse(result);
+  if (!r.ok) throw new Error(r.error);
+
+  // Small padding around the element (clamped to viewport)
+  const pad = 8;
+  const clipX = Math.max(0, r.x - pad);
+  const clipY = Math.max(0, r.y - pad);
+  const clipW = r.w + pad * 2;
+  const clipH = r.h + pad * 2;
+
+  await sleep(100); // let scroll settle
+
+  const { data } = await cdp.send('Page.captureScreenshot', {
+    format: 'png',
+    clip: { x: clipX, y: clipY, width: clipW, height: clipH, scale: 1 }
+  }, sid);
+
+  const prefix = (targetId || 'unknown').slice(0, 8);
+  const selSafe = selector.replace(/[^a-zA-Z0-9_-]/g, '_').substring(0, 30);
+  const out = resolve(RUNTIME_DIR, `elshot-${prefix}-${selSafe}.png`);
+  writeFileSync(out, Buffer.from(data, 'base64'));
+
+  const desc = `<${r.tag}>${r.id ? '#' + r.id : ''} "${r.text}"`;
+  return `${out}\nElement screenshot of ${desc} — ${Math.round(r.w)}×${Math.round(r.h)} CSS px (clip: ${Math.round(clipW)}×${Math.round(clipH)} with padding)`;
+}
+
 // Shared: dispatch a realistic mouse click at CSS pixel coordinates
 async function dispatchClick(cdp, sid, x, y) {
   const base = { x, y, button: 'left', clickCount: 1, modifiers: 0 };
@@ -1024,6 +1253,8 @@ async function runDaemon(targetId) {
         case 'status': result = await statusStr(cdp, sessionId, consoleBuf, exceptionBuf, navBuf, lastReadSeq); break;
         case 'console': result = await consoleStr(consoleBuf, exceptionBuf, lastReadSeq, args[0]); break;
         case 'summary': result = await summaryStr(cdp, sessionId, consoleBuf, exceptionBuf); break;
+        case 'perceive': result = await perceiveStr(cdp, sessionId, consoleBuf, exceptionBuf); break;
+        case 'elshot': result = await elshotStr(cdp, sessionId, args[0], targetId); break;
         case 'click': result = await clickStr(cdp, sessionId, args[0]); break;
         case 'clickxy': result = await clickXyStr(cdp, sessionId, args[0], args[1]); break;
         case 'type': result = await typeStr(cdp, sessionId, args[0]); break;
@@ -1216,9 +1447,11 @@ const USAGE = `cdp - lightweight Chrome DevTools Protocol CLI (no Puppeteer)
 Usage: cdp <command> [args]
 
   list                              List open pages (shows unique target prefixes)
+  perceive <target>                 Full page perception: summary + accessibility tree + visual layout metadata (recommended starting point)
   snap  <target> [--full]           Accessibility tree snapshot (compact by default, --full for complete)
   eval  <target> <expr>             Evaluate JS expression
-  shot  <target> [file]             Screenshot (default: screenshot-<target>.png in runtime dir); prints coordinate mapping
+  elshot <target> <selector>        Element screenshot: captures a specific element by CSS selector (auto scrolls + clips)
+  shot  <target> [file]             Viewport screenshot; prints coordinate mapping
   html  <target> [selector]         Get HTML (full page or CSS selector)
   nav   <target> <url>              Navigate to URL and wait for load completion
   status <target>                    Page state + new console/exception entries (primary debug entry point)
@@ -1273,15 +1506,15 @@ DAEMON IPC (for advanced use / scripting)
     Request:  {"id":<number>, "cmd":"<command>", "args":["arg1","arg2",...]}
     Response: {"id":<number>, "ok":true,  "result":"<string>"}
            or {"id":<number>, "ok":false, "error":"<message>"}
-  Commands mirror the CLI: status, summary, console, snap, eval, shot, fullshot, scanshot,
-  html, nav, net, click, clickxy, hover, type, press, scroll, fill, select,
-  waitfor, loadall, styles, cookies, evalraw, stop. Use evalraw to send arbitrary CDP methods.
+  Commands mirror the CLI: perceive, status, summary, console, snap, eval, shot, elshot,
+  fullshot, scanshot, html, nav, net, click, clickxy, hover, type, press, scroll, fill,
+  select, waitfor, loadall, styles, cookies, evalraw, stop. Use evalraw to send arbitrary CDP methods.
   The socket disappears after 20 min of inactivity or when the tab closes.
 `;
 
 const NEEDS_TARGET = new Set([
   'snap','snapshot','eval','shot','screenshot','html','nav','navigate',
-  'net','network','click','clickxy','type','press','scroll','hover','waitfor','loadall','fill','select','fullshot','scanshot','styles','cookies','evalraw','status','console','summary',
+  'net','network','click','clickxy','type','press','scroll','hover','waitfor','loadall','fill','select','fullshot','scanshot','styles','cookies','evalraw','status','console','summary','perceive','elshot',
 ]);
 
 async function main() {
@@ -1379,6 +1612,8 @@ async function main() {
     const expr = cmdArgs.join(' ');
     if (!expr) { console.error('Error: expression required'); process.exit(1); }
     cmdArgs[0] = expr;
+  } else if (cmd === 'elshot') {
+    if (!cmdArgs[0]) { console.error('Error: CSS selector required'); process.exit(1); }
   } else if (cmd === 'type') {
     // Join all remaining args as text (allows spaces)
     const text = cmdArgs.join(' ');

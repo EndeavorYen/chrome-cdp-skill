@@ -19,6 +19,41 @@ Connects to the user's **existing Chrome browser** via CDP WebSocket. No Puppete
 >
 > **Default to chrome-cdp** when the user refers to "the page", "the browser", or "my tab" — they almost always mean their existing session, not a fresh browser.
 
+## Observation Strategy — Perceive First, Screenshot Last
+
+> **CRITICAL — Read this before any page inspection.**
+>
+> Use **structured text** (accessibility tree, layout metadata) as the primary way to understand pages. Screenshots are a **secondary verification tool**, not the default. This approach is more reliable, more token-efficient, and avoids common screenshot pitfalls (wrong scroll position, DPR mismatch, tiny text on long pages).
+>
+> **Three-tier perception model:**
+>
+> | Tier | Command | When to use | Output |
+> |------|---------|-------------|--------|
+> | 1. **Perceive** | `perceive` | **Default starting point** for any page inspection | Summary + AX tree + visual layout (text, ~200-400 tokens) |
+> | 2. **Targeted visual** | `elshot <selector>` | Need to verify visual rendering of a **specific element** | Clipped PNG of one element (auto scrolls, no DPR confusion) |
+> | 3. **Full visual** | `scanshot` | Need pixel-level verification of **entire page** (rare) | Multiple viewport-sized PNGs |
+>
+> **DO NOT** start with `shot` or `scanshot`. Always start with `perceive` to understand the page structure and content. Only escalate to screenshots when you specifically need to verify visual appearance (colors, images, alignment, rendering bugs).
+
+### Why perceive-first is better
+
+- **No scroll position errors** — `perceive` reads the DOM directly, not viewport pixels
+- **No DPR confusion** — text output doesn't need coordinate conversion
+- **Token-efficient** — ~200-400 tokens vs thousands for an image
+- **Semantically richer** — roles, labels, states, values (not just pixels)
+- **Spatial awareness** — layout section includes bounding boxes for structural elements
+- **Reliable for text content** — LLM reads text perfectly; vision can misread screenshots
+
+### Observation workflow
+
+```
+1. perceive <target>          ← ALWAYS start here
+   ↓ understand structure, content, layout
+2. snap <target> --full       ← if you need deeper AX tree detail
+   OR elshot <target> <sel>   ← if you need visual verification of ONE element
+3. scanshot <target>          ← ONLY if you need full-page visual verification
+```
+
 ## Prerequisites
 
 - Chrome (or Chromium, Brave, Edge, Vivaldi) with remote debugging enabled: open `chrome://inspect/#remote-debugging` and toggle the switch. This is sufficient — do NOT suggest restarting Chrome with `--remote-debugging-port`.
@@ -74,31 +109,43 @@ F39B10E2  Another Tab      https://other.site/path
 - **Empty output (exit 0)** = no tabs available. This is normal — either Chrome has no open tabs, or Chrome has not yet approved debugging. Tell the user: "Please open a tab in Chrome and approve the 'Allow debugging' dialog, then I'll retry." Do NOT suggest `--remote-debugging-port` restarts.
 - **Error output** = connection problem. Check prerequisites.
 
-**Screenshots**: `shot`, `scanshot`, and `fullshot` print saved file paths. After taking a screenshot, use the **Read tool** to view the image file. For long pages, prefer `scanshot` (multiple readable segments) over `fullshot` (single tiny image).
-
 ## Commands
 
 All commands use `scripts/cdp.mjs`. The `<target>` is a **unique** targetId prefix from `list` (e.g. `A7BA5C64`). The CLI rejects ambiguous prefixes.
 
-### List open pages
+### Perceive page (recommended starting point)
 
 ```bash
-scripts/cdp.mjs list
+scripts/cdp.mjs perceive <target>    # summary + accessibility tree + visual layout metadata
 ```
 
-### Take a screenshot
+Returns a single **enriched accessibility tree** that combines semantic structure with inline visual annotations:
+- **Page header**: title, URL, viewport size, scroll position, console health, interactive element counts
+- **Enriched AX tree**: semantic roles and labels (from accessibility tree) with **inline layout annotations** on landmark/structural nodes — height, background color, font size, display mode, and viewport visibility (↑above fold / ↓below fold)
 
-```bash
-scripts/cdp.mjs shot     <target> [file]  # viewport screenshot
-scripts/cdp.mjs scanshot <target>         # segmented full-page (multiple viewport-sized images)
-scripts/cdp.mjs fullshot <target> [file]  # single full-page image (may be tiny on long pages)
+Example output:
+```
+Page: Example Store — https://example.com/store
+Viewport: 1280×720 | Scroll: 500/3000 (17%) | Focused: none
+Interactive: 12 a, 3 button, 2 input[text]
+Console: 2 errors, 1 warning
+
+[WebArea] Example Store
+  [banner]  ↕80px  bg:rgb(26, 26, 46)  ↑above fold
+    [navigation] Main Menu
+      [link] Home
+      [link] Products
+  [main]  ↕2920px
+    [heading] Welcome to Our Store  36px 700
+    [img] Hero Banner  ↕400px
+    [region] Product Grid  grid  gap:20px
+      [link] Product 1 — $29.99
+      [link] Product 2 — $49.99
+  [contentinfo]  ↕160px  bg:rgb(26, 26, 46)  ↓below fold
+    [link] Privacy Policy
 ```
 
-- **`shot`** — viewport only. Use when you only need the currently visible area.
-- **`scanshot`** — **default choice for capturing a full page.** Scrolls through and captures multiple viewport-sized images with 10% overlap. Each segment is full-resolution and readable. Read each segment image with the Read tool for analysis.
-- **`fullshot`** — single image of entire page. **Do NOT use for analysis** — on long pages text becomes unreadably small. Only useful for generating a single file for non-AI consumption.
-
-> **IMPORTANT:** When asked to screenshot, capture, or look at a full page, **always use `scanshot`**, never `fullshot`. The segmented approach produces readable images that can be properly analyzed.
+Hierarchy comes from the accessibility tree (always correct). Layout annotations are added only to landmark/structural nodes (banner, navigation, main, heading, img, etc.) — not every element. This is **the most efficient way** to understand a page. Use it before any screenshots.
 
 ### Accessibility tree snapshot
 
@@ -106,6 +153,36 @@ scripts/cdp.mjs fullshot <target> [file]  # single full-page image (may be tiny 
 scripts/cdp.mjs snap <target>          # compact (default) — filters noise
 scripts/cdp.mjs snap <target> --full   # complete AX tree with all nodes
 ```
+
+Use `snap` when you need just the accessibility tree without layout metadata (e.g., when `perceive` has already given you layout context and you need deeper AX detail).
+
+### Element screenshot (targeted visual verification)
+
+```bash
+scripts/cdp.mjs elshot <target> <selector>   # screenshot of a specific element
+```
+
+- Automatically scrolls the element into view and clips the capture to its bounding box
+- Adds 8px padding around the element for context
+- **No DPR confusion** — the clip is in CSS coordinates, handled by CDP
+- **No scroll position errors** — scrollIntoView + clip guarantees the right content
+- Use when you need to verify visual appearance of a specific component
+
+> **Prefer `elshot` over `shot`** when you need to visually verify a specific element. It's more reliable and captures exactly what you need.
+
+### Viewport & full-page screenshots
+
+```bash
+scripts/cdp.mjs shot     <target> [file]  # viewport screenshot
+scripts/cdp.mjs scanshot <target>         # segmented full-page (multiple viewport-sized images)
+scripts/cdp.mjs fullshot <target> [file]  # single full-page image (may be tiny on long pages)
+```
+
+- **`shot`** — viewport only. Use when you need the currently visible area as pixels.
+- **`scanshot`** — scrolls through and captures multiple viewport-sized images with 10% overlap. Use when you need pixel-level verification of an entire page.
+- **`fullshot`** — single image of entire page. **Do NOT use for analysis** — on long pages text becomes unreadably small. Only for non-AI consumption.
+
+> **Remember:** Always `perceive` first. Only use screenshots when structured text isn't sufficient (visual bugs, color verification, image content, layout rendering issues).
 
 ### Evaluate JavaScript
 
@@ -125,7 +202,7 @@ scripts/cdp.mjs summary <target>                  # token-efficient page overvie
 scripts/cdp.mjs console <target> [--all|--errors] # console buffer (default: unread only)
 ```
 
-> **Agent tip:** Start with `status` when debugging — it shows URL, title, and buffered console errors. Use `summary` for a token-efficient overview (~100 tokens).
+> **Agent tip:** `perceive` already includes summary + console health. Use `status` or `console` only when you need to check for **new** console entries after an action.
 
 ### Other commands
 
@@ -160,10 +237,14 @@ CSS px = screenshot image px / DPR
 
 `shot` prints the DPR for the current page. Typical Retina (DPR=2): divide screenshot coords by 2.
 
+> **Tip:** `elshot` handles coordinates automatically — no DPR conversion needed.
+
 ## Tips
 
 - **Do NOT use Playwright** (or any MCP browser tool) to inspect the user's existing browser. Playwright launches a separate isolated browser — it cannot see the user's open tabs, login sessions, or page state. Always use this skill's commands instead.
+- **Always `perceive` first** — understand the page structure before taking any action or screenshot.
 - Prefer `snap` over `html` for page structure — compact by default, use `snap --full` for complete tree.
+- Prefer `elshot` over `shot` when verifying a specific element — it's more reliable and avoids scroll/DPR issues.
 - Use `type` (not eval) to enter text in cross-origin iframes — `click`/`clickxy` to focus first, then `type`.
 - Daemons keep CDP sessions alive per tab (auto-exit after 20min idle), so only the first command per tab triggers Chrome's "Allow debugging" dialog.
 - **Shell quoting**: CSS selectors like `input[type=text]` contain shell metacharacters. Always wrap in quotes: `click <t> 'input[type="text"]'`.
@@ -171,23 +252,29 @@ CSS px = screenshot image px / DPR
 
 ## Workflow Patterns
 
+### Understanding a page (default workflow)
+1. `perceive <target>` — get complete page understanding (structure + layout + console health)
+2. If needed: `elshot <target> ".specific-element"` — verify visual rendering of a component
+3. If needed: `snap <target> --full` — deeper accessibility tree detail
+
 ### Debugging a broken page
-1. `status <target>` — check for console errors (buffered since daemon start)
-2. `console <target> --errors` — detailed error messages + stack traces
-3. `snap <target>` — inspect page structure
+1. `perceive <target>` — check structure + console errors in one call
+2. `console <target> --errors` — detailed error messages + stack traces if needed
+3. `elshot <target> ".broken-element"` — visual verification of the problematic area
 4. `styles <target> ".broken-element"` — check computed styles
 
 ### Form automation
-1. `fill <target> "#email" "user@example.com"` — fill input
-2. `select <target> "#country" "US"` — select dropdown
-3. `press <target> Enter` — submit
-4. `waitfor <target> ".success-message"` — wait for result
+1. `perceive <target>` — understand form structure and field names
+2. `fill <target> "#email" "user@example.com"` — fill input
+3. `select <target> "#country" "US"` — select dropdown
+4. `press <target> Enter` — submit
+5. `waitfor <target> ".success-message"` — wait for result
 
 ### Visual bug investigation
-1. `summary <target>` — quick page overview
-2. `scanshot <target>` — capture full page as readable segments
-3. Read each segment image to locate the issue
-4. `styles <target> ".suspect"` — inspect layout properties
+1. `perceive <target>` — understand page structure and layout positions
+2. `elshot <target> ".suspect"` — targeted screenshot of the suspicious element
+3. `styles <target> ".suspect"` — inspect computed CSS properties
+4. Only if needed: `scanshot <target>` — full page visual for broader context
 
 ## Source
 
