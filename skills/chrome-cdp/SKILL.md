@@ -262,9 +262,22 @@ CSS px = screenshot image px / DPR
 3. If needed: `snap <target> --full` — deeper accessibility tree detail
 
 ### Comparing pages or evaluating design quality
+<<<<<<< HEAD
 1. `perceive` **both** pages — compare structure, layout, style hints (colors, bold, font sizes)
 2. `elshot` **specific sections** only if perceive shows identical structure but you need subjective aesthetic comparison
 3. Analyze from perceive data: content hierarchy, data density, style anomalies, layout organization
+=======
+1. `perceive` **both** pages — compare structure, information architecture, component organization
+2. `elshot` **specific sections** on each page for visual comparison — e.g.:
+   - `elshot <t> "header"` or `elshot <t> "nav"` — navigation/header design
+   - `elshot <t> ".card"` or `elshot <t> ".ant-card:first-child"` — card component styling
+   - `elshot <t> "table"` — data table design
+   - `elshot <t> "footer"` — footer area
+3. Analyze from perceive data: content hierarchy, data density, alert presentation, layout organization
+4. Analyze from elshot images: typography, color usage, spacing, visual polish
+5. **DO NOT use `shot` + `scroll`** to manually scan pages — that's just slow scanshot. Use `elshot` with CSS selectors for each section you want to compare.
+6. **DO NOT use `scanshot`** for comparisons — `elshot` on 3-4 key sections per page gives better targeted comparison than 8+ full-page screenshots
+>>>>>>> 022856e (fix: perceive truncated-row leak, icon noise, and shot+scroll guidance)
 
 ### Debugging a broken page
 1. `perceive <target>` — structure + console errors + style anomalies in one call

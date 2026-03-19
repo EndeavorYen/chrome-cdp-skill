@@ -773,11 +773,19 @@ async function perceiveStr(cdp, sid, consoleBuf, exceptionBuf) {
 
   const treeLines = [];
   const visited = new Set();
+  // Mark an entire subtree as visited (prevents fallback loop from re-emitting truncated nodes)
+  function markSubtreeVisited(nodeId) {
+    visited.add(nodeId);
+    for (const child of (childrenByParent.get(nodeId) || [])) {
+      markSubtreeVisited(child.nodeId);
+    }
+  }
   function visit(node, depth, parentNode = null, tableAncestorId = null) {
     if (!node || visited.has(node.nodeId)) return;
     visited.add(node.nodeId);
 
     const role = node.role?.value || '';
+    const name = node.name?.value ?? '';
 
     // Detect table context: track row counts per table ancestor
     if (role === 'table' || role === 'grid' || role === 'treegrid') {
@@ -796,7 +804,16 @@ async function perceiveStr(cdp, sid, consoleBuf, exceptionBuf) {
         if (count === TABLE_ROW_LIMIT) {
           treeLines.push(formatAxNode({ role: { value: 'note' }, name: { value: '... more rows truncated' } }, depth));
         }
-        return; // skip remaining rows and their children
+        markSubtreeVisited(node.nodeId); // prevent fallback loop from re-emitting children
+        return;
+      }
+    }
+
+    // Filter decorative icon images (short lowercase names like "thunderbolt", "check-circle")
+    if (role === 'image') {
+      if (name.length < 25 && name === name.toLowerCase() && !name.includes(' ')) {
+        markSubtreeVisited(node.nodeId);
+        return;
       }
     }
 
