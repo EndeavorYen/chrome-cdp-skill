@@ -4,6 +4,13 @@
 
 ### Added
 
+- **`perceive <target>`** — enriched accessibility tree with inline visual layout annotations. Combines summary metadata (title, URL, viewport, scroll position, interactive element counts, console health) with the compact AX tree, where landmark/structural nodes are annotated with height, background color, font size, display mode, and viewport visibility (↑above fold / ↓below fold). Gives agents complete page understanding in ~200-400 tokens without any screenshots.
+- **`elshot <target> <selector>`** — element-level screenshot: scrolls the element into view, clips capture to its bounding box with 8px padding. Eliminates wrong-scroll-position and DPR-conversion errors that plague viewport screenshots.
+- **Perceive-first observation strategy** in SKILL.md — three-tier model (perceive → elshot → scanshot) that guides agents to use structured text as the primary page understanding mechanism, with screenshots as secondary verification.
+- **CLAUDE.md** — project overview, architecture diagram, coding conventions, and problem-solving principles for LLM agent context.
+
+### Previous
+
 - **`scanshot <target>`** — segmented full-page capture: scrolls through the page taking viewport-sized screenshots with 10% overlap. Each segment is full-resolution and readable by AI vision, unlike `fullshot` which produces a single tiny image on long pages.
 
 ### Previous (merged fork)

@@ -16,12 +16,14 @@ Auto-detects Chrome, Chromium, Brave, Edge, and Vivaldi on macOS, Linux (includi
 
 ## What this fork adds
 
-The upstream is an excellent **observe-and-click** tool (12 commands). This fork extends it to **25 commands** with:
+The upstream is an excellent **observe-and-click** tool (12 commands). This fork extends it to **27 commands** with:
 
+- **Perceive-first observation** — `perceive` produces an enriched accessibility tree with inline layout annotations (height, background color, font size, display mode, viewport visibility). One command gives the agent complete page understanding without any screenshots.
+- **Element-level screenshots** — `elshot` captures a specific element by CSS selector, auto-scrolling into view and clipping to its bounds. No DPR confusion, no wrong-scroll-position errors.
 - **Background console observation** — daemon passively buffers console output, exceptions, and navigations via `RingBuffer`; query anytime with `status` / `console` / `summary`
 - **Realistic click simulation** — uses CDP `Input.dispatchMouseEvent` (mouseMoved → mousePressed → mouseReleased) instead of `el.click()`, working with React, Vue, Angular, and Shadow DOM
 - **Form automation** — `fill`, `select`, `press`, `waitfor` for complete form workflows
-- **Page inspection** — `fullshot` (full-page screenshot), `styles` (computed CSS), `cookies`, `hover`, `scroll`
+- **Page inspection** — `scanshot` (segmented full-page), `styles` (computed CSS), `cookies`, `hover`, `scroll`
 - **WSL2 support** — proven patterns for controlling Windows Chrome from WSL2 (see [SKILL.md](skills/chrome-cdp/SKILL.md))
 
 ## Architecture
@@ -60,21 +62,25 @@ list                               # list open tabs
 open   [url]                       # open new tab
 stop   [target]                    # stop daemon(s)
 
-# Observation
+# Perception (start here)
+perceive <target>                  # enriched AX tree with layout annotations (recommended)
+snap     <target> [--full]         # accessibility tree (compact by default)
+summary  <target>                  # token-efficient overview (~100 tokens)
+status   <target>                  # URL, title + new console/exception entries
+console  <target> [--all|--errors] # console buffer (default: unread only)
+
+# Visual verification (only when needed)
+elshot   <target> <selector>       # element screenshot (auto scroll + clip, no DPR issues)
 shot     <target> [file]           # viewport screenshot
 scanshot <target>                  # segmented full-page (readable viewport-sized images)
 fullshot <target> [file]           # single full-page image (tiny on long pages)
-snap    <target> [--full]          # accessibility tree (compact by default)
+
+# Inspection
 html    <target> [selector]        # full HTML or scoped to CSS selector
 eval    <target> <expr>            # evaluate JS in page context
-net     <target>                   # network resource timing
 styles  <target> <selector>        # computed styles (meaningful props only)
+net     <target>                   # network resource timing
 cookies <target>                   # list cookies for current page
-
-# Background-buffered status
-status  <target>                   # URL, title + new console/exception entries
-summary <target>                   # token-efficient overview (~100 tokens)
-console <target> [--all|--errors]  # console buffer (default: unread only)
 
 # Interaction
 click   <target> <selector>        # click element (CDP mouse events)
