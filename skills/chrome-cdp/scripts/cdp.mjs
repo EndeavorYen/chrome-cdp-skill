@@ -764,6 +764,9 @@ async function perceiveStr(cdp, sid, consoleBuf, exceptionBuf) {
   // Track table rows to cap output
   const TABLE_ROW_LIMIT = 5;
   const tableRowCounts = new Map(); // nodeId of table-like ancestor → count
+  const tableIdxMap = new Map(); // tableAncestorId (nodeId) → sequential table index
+  let nextTableIdx = 0;
+  const rowCellIdx = new Map(); // tableAncestorId → current cell index in current row
 
   const treeLines = [];
   const visited = new Set();
@@ -777,10 +780,14 @@ async function perceiveStr(cdp, sid, consoleBuf, exceptionBuf) {
     if (role === 'table' || role === 'grid' || role === 'treegrid') {
       tableAncestorId = node.nodeId;
       tableRowCounts.set(tableAncestorId, 0);
+      if (!tableIdxMap.has(tableAncestorId)) {
+        tableIdxMap.set(tableAncestorId, nextTableIdx++);
+      }
     }
     if (tableAncestorId && role === 'row') {
       const count = tableRowCounts.get(tableAncestorId) || 0;
       tableRowCounts.set(tableAncestorId, count + 1);
+      rowCellIdx.set(tableAncestorId, 0);
       if (count >= TABLE_ROW_LIMIT) {
         if (count === TABLE_ROW_LIMIT) {
           treeLines.push(formatAxNode({ role: { value: 'note' }, name: { value: '... more rows truncated' } }, depth));
@@ -811,6 +818,17 @@ async function perceiveStr(cdp, sid, consoleBuf, exceptionBuf) {
           if (layout.vis === 'above') parts.push('↑above fold');
           else if (layout.vis === 'below') parts.push('↓below fold');
           if (parts.length > 0) line += '  ' + parts.join('  ');
+        }
+      }
+      // Enrich table cells with style hints
+      if (tableAncestorId && (role === 'cell' || role === 'gridcell' || role === 'columnheader' || role === 'rowheader')) {
+        const ti = tableIdxMap.get(tableAncestorId);
+        const ci = rowCellIdx.get(tableAncestorId) || 0;
+        rowCellIdx.set(tableAncestorId, ci + 1);
+        if (ti != null && meta.styleHints) {
+          const cellName = (node.name?.value ?? '').trim().slice(0, 50);
+          const hint = meta.styleHints[ti + ':' + cellName + ':' + ci];
+          if (hint) line += '  ' + hint;
         }
       }
       treeLines.push(line);
