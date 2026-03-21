@@ -636,9 +636,19 @@ async function perceiveStr(cdp, sid, consoleBuf, exceptionBuf) {
       // === Style hints: detect visual anomalies on table cells ===
       const styleHints = {};
       let styleHintCount = 0;
-      const tables = document.querySelectorAll('table, [role="grid"], [role="treegrid"]');
-      for (let ti = 0; ti < tables.length && styleHintCount < 100; ti++) {
-        const tbl = tables[ti];
+      const allTables = document.querySelectorAll('table, [role="grid"], [role="treegrid"]');
+      // Filter out presentation/hidden tables to match AX tree traversal order
+      const visTables = [];
+      for (const t of allTables) {
+        const r = t.getAttribute('role');
+        if (r === 'presentation' || r === 'none') continue;
+        if (t.getAttribute('aria-hidden') === 'true') continue;
+        const cs = window.getComputedStyle(t);
+        if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+        visTables.push(t);
+      }
+      for (let ti = 0; ti < visTables.length && styleHintCount < 100; ti++) {
+        const tbl = visTables[ti];
         const rows = tbl.querySelectorAll('tr, [role="row"]');
         // Separate header rows from data rows
         const dataRows = [];
@@ -682,7 +692,8 @@ async function perceiveStr(cdp, sid, consoleBuf, exceptionBuf) {
         }
 
         // Emit hints for cells that deviate from baseline
-        for (const row of dataRows) {
+        for (let ri = 0; ri < dataRows.length; ri++) {
+          const row = dataRows[ri];
           const cells = row.querySelectorAll('td, th, [role="cell"], [role="gridcell"], [role="columnheader"], [role="rowheader"]');
           let ci = 0;
           for (const cell of cells) {
@@ -705,8 +716,7 @@ async function perceiveStr(cdp, sid, consoleBuf, exceptionBuf) {
             }
 
             if (hints.length > 0 && styleHintCount < 100) {
-              const text = cell.textContent.trim().slice(0, 50);
-              const key = ti + ':' + text + ':' + ci;
+              const key = ti + ':' + ri + ':' + ci;
               styleHints[key] = hints.join(' ');
               styleHintCount++;
             }
@@ -767,6 +777,7 @@ async function perceiveStr(cdp, sid, consoleBuf, exceptionBuf) {
   const tableIdxMap = new Map(); // tableAncestorId (nodeId) → sequential table index
   let nextTableIdx = 0;
   const rowCellIdx = new Map(); // tableAncestorId → current cell index in current row
+  const dataRowIdx = new Map(); // tableAncestorId → current data row index (excludes header rows)
 
   const treeLines = [];
   const visited = new Set();
@@ -780,6 +791,7 @@ async function perceiveStr(cdp, sid, consoleBuf, exceptionBuf) {
     if (role === 'table' || role === 'grid' || role === 'treegrid') {
       tableAncestorId = node.nodeId;
       tableRowCounts.set(tableAncestorId, 0);
+      dataRowIdx.set(tableAncestorId, -1); // incremented on first data row
       if (!tableIdxMap.has(tableAncestorId)) {
         tableIdxMap.set(tableAncestorId, nextTableIdx++);
       }
@@ -793,6 +805,18 @@ async function perceiveStr(cdp, sid, consoleBuf, exceptionBuf) {
           treeLines.push(formatAxNode({ role: { value: 'note' }, name: { value: '... more rows truncated' } }, depth));
         }
         return; // skip remaining rows and their children
+      }
+    }
+
+    // Track cell index unconditionally (even for filtered nodes) to stay aligned with browser-side
+    const isCellRole = tableAncestorId && (role === 'cell' || role === 'gridcell' || role === 'columnheader' || role === 'rowheader');
+    let cellColIdx = -1;
+    if (isCellRole) {
+      cellColIdx = rowCellIdx.get(tableAncestorId) || 0;
+      rowCellIdx.set(tableAncestorId, cellColIdx + 1);
+      // Track data row index: increment on first data cell of each row (cell/gridcell, not columnheader)
+      if ((role === 'cell' || role === 'gridcell') && cellColIdx === 0) {
+        dataRowIdx.set(tableAncestorId, (dataRowIdx.get(tableAncestorId) ?? -1) + 1);
       }
     }
 
@@ -820,14 +844,12 @@ async function perceiveStr(cdp, sid, consoleBuf, exceptionBuf) {
           if (parts.length > 0) line += '  ' + parts.join('  ');
         }
       }
-      // Enrich table cells with style hints
-      if (tableAncestorId && (role === 'cell' || role === 'gridcell' || role === 'columnheader' || role === 'rowheader')) {
+      // Enrich table cells with style hints (positional key: tableIdx:rowIdx:colIdx)
+      if (isCellRole && meta.styleHints) {
         const ti = tableIdxMap.get(tableAncestorId);
-        const ci = rowCellIdx.get(tableAncestorId) || 0;
-        rowCellIdx.set(tableAncestorId, ci + 1);
-        if (ti != null && meta.styleHints) {
-          const cellName = (node.name?.value ?? '').trim().slice(0, 50);
-          const hint = meta.styleHints[ti + ':' + cellName + ':' + ci];
+        const ri = dataRowIdx.get(tableAncestorId) ?? -1;
+        if (ti != null && ri >= 0) {
+          const hint = meta.styleHints[ti + ':' + ri + ':' + cellColIdx];
           if (hint) line += '  ' + hint;
         }
       }
