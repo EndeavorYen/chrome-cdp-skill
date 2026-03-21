@@ -636,6 +636,13 @@ async function perceiveStr(cdp, sid, consoleBuf, exceptionBuf) {
       // === Style hints: detect visual anomalies on table cells ===
       const styleHints = {};
       let styleHintCount = 0;
+      const CELL_SEL = 'td, th, [role="cell"], [role="gridcell"], [role="columnheader"], [role="rowheader"]';
+      const BASELINE_ROW_CAP = 20; // enough rows for reliable baseline, avoids scanning huge tables
+      function majority(counts) {
+        let best = null, bestN = 0;
+        for (const [v, n] of Object.entries(counts)) { if (n > bestN) { best = v; bestN = n; } }
+        return best;
+      }
       const allTables = document.querySelectorAll('table, [role="grid"], [role="treegrid"]');
       // Filter out presentation/hidden tables to match AX tree traversal order
       const visTables = [];
@@ -650,7 +657,6 @@ async function perceiveStr(cdp, sid, consoleBuf, exceptionBuf) {
       for (let ti = 0; ti < visTables.length && styleHintCount < 100; ti++) {
         const tbl = visTables[ti];
         const rows = tbl.querySelectorAll('tr, [role="row"]');
-        // Separate header rows from data rows
         const dataRows = [];
         for (const row of rows) {
           const firstCell = row.querySelector('td, [role="cell"], [role="gridcell"]');
@@ -658,11 +664,14 @@ async function perceiveStr(cdp, sid, consoleBuf, exceptionBuf) {
         }
         if (dataRows.length === 0) continue;
         const smallTable = dataRows.length < 4;
+        const scanRows = dataRows.slice(0, BASELINE_ROW_CAP);
 
-        // Collect per-column baselines from all data cells
+        // Single pass: collect styles, build baselines, cache per-cell data
         const colBgs = {}, colWeights = {}, colColors = {};
-        for (const row of dataRows) {
-          const cells = row.querySelectorAll('td, th, [role="cell"], [role="gridcell"], [role="columnheader"], [role="rowheader"]');
+        const cellCache = []; // [{cells: [{bg, fw, clr, ci}]}] per row
+        for (const row of scanRows) {
+          const cells = row.querySelectorAll(CELL_SEL);
+          const rowData = [];
           let ci = 0;
           for (const cell of cells) {
             if (cell.colSpan > 1) { ci += cell.colSpan; continue; }
@@ -674,54 +683,37 @@ async function perceiveStr(cdp, sid, consoleBuf, exceptionBuf) {
             colBgs[ci][bg] = (colBgs[ci][bg] || 0) + 1;
             colWeights[ci][fw] = (colWeights[ci][fw] || 0) + 1;
             colColors[ci][clr] = (colColors[ci][clr] || 0) + 1;
+            rowData.push({ bg, fw, clr, ci });
             ci++;
           }
+          cellCache.push(rowData);
         }
 
-        // Find majority value per column
-        function majority(counts) {
-          let best = null, bestN = 0;
-          for (const [v, n] of Object.entries(counts)) { if (n > bestN) { best = v; bestN = n; } }
-          return best;
-        }
+        // Compute baselines from collected data
         const baseBg = {}, baseWeight = {}, baseColor = {};
         for (const ci of Object.keys(colBgs)) {
           baseBg[ci] = majority(colBgs[ci]);
-          baseWeight[ci] = majority(colWeights[ci]);
+          baseWeight[ci] = parseInt(majority(colWeights[ci])) || 400;
           baseColor[ci] = majority(colColors[ci]);
         }
 
-        // Emit hints for cells that deviate from baseline
-        for (let ri = 0; ri < dataRows.length; ri++) {
-          const row = dataRows[ri];
-          const cells = row.querySelectorAll('td, th, [role="cell"], [role="gridcell"], [role="columnheader"], [role="rowheader"]');
-          let ci = 0;
-          for (const cell of cells) {
-            if (cell.colSpan > 1) { ci += cell.colSpan; continue; }
-            const cs = window.getComputedStyle(cell);
+        // Emit hints from cached styles (no second getComputedStyle pass)
+        for (let ri = 0; ri < cellCache.length; ri++) {
+          for (const { bg, fw, clr, ci } of cellCache[ri]) {
             const hints = [];
-
-            const bg = cs.backgroundColor;
             if (bg && bg !== 'rgba(0, 0, 0, 0)' && bg !== 'transparent') {
               if (smallTable || bg !== baseBg[ci]) hints.push('bg:' + bg);
             }
-            const fw = parseInt(cs.fontWeight) || 400;
-            if (fw > 400) {
-              const baseW = parseInt(baseWeight[ci]) || 400;
-              if (smallTable || fw !== baseW) hints.push('bold');
-            }
-            const clr = cs.color;
+            if (fw > 400 && (smallTable || fw !== baseWeight[ci])) hints.push('bold');
             if (clr && clr !== 'rgb(0, 0, 0)') {
               if (smallTable || clr !== baseColor[ci]) hints.push('color:' + clr);
             }
-
-            if (hints.length > 0 && styleHintCount < 100) {
-              const key = ti + ':' + ri + ':' + ci;
-              styleHints[key] = hints.join(' ');
-              styleHintCount++;
+            if (hints.length > 0) {
+              styleHints[ti + ':' + ri + ':' + ci] = hints.join(' ');
+              if (++styleHintCount >= 100) break;
             }
-            ci++;
           }
+          if (styleHintCount >= 100) break;
         }
       }
 
