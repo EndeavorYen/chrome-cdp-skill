@@ -633,6 +633,88 @@ async function perceiveStr(cdp, sid, consoleBuf, exceptionBuf) {
         if (++count >= 150) break;
       }
 
+      // === Style hints: detect visual anomalies on table cells ===
+      const styleHints = {};
+      let styleHintCount = 0;
+      const tables = document.querySelectorAll('table, [role="grid"], [role="treegrid"]');
+      for (let ti = 0; ti < tables.length && styleHintCount < 100; ti++) {
+        const tbl = tables[ti];
+        const rows = tbl.querySelectorAll('tr, [role="row"]');
+        // Separate header rows from data rows
+        const dataRows = [];
+        for (const row of rows) {
+          const firstCell = row.querySelector('td, [role="cell"], [role="gridcell"]');
+          if (firstCell) dataRows.push(row);
+        }
+        if (dataRows.length === 0) continue;
+        const smallTable = dataRows.length < 4;
+
+        // Collect per-column baselines from all data cells
+        const colBgs = {}, colWeights = {}, colColors = {};
+        for (const row of dataRows) {
+          const cells = row.querySelectorAll('td, th, [role="cell"], [role="gridcell"], [role="columnheader"], [role="rowheader"]');
+          let ci = 0;
+          for (const cell of cells) {
+            if (cell.colSpan > 1) { ci += cell.colSpan; continue; }
+            const cs = window.getComputedStyle(cell);
+            const bg = cs.backgroundColor;
+            const fw = parseInt(cs.fontWeight) || 400;
+            const clr = cs.color;
+            if (!colBgs[ci]) { colBgs[ci] = {}; colWeights[ci] = {}; colColors[ci] = {}; }
+            colBgs[ci][bg] = (colBgs[ci][bg] || 0) + 1;
+            colWeights[ci][fw] = (colWeights[ci][fw] || 0) + 1;
+            colColors[ci][clr] = (colColors[ci][clr] || 0) + 1;
+            ci++;
+          }
+        }
+
+        // Find majority value per column
+        function majority(counts) {
+          let best = null, bestN = 0;
+          for (const [v, n] of Object.entries(counts)) { if (n > bestN) { best = v; bestN = n; } }
+          return best;
+        }
+        const baseBg = {}, baseWeight = {}, baseColor = {};
+        for (const ci of Object.keys(colBgs)) {
+          baseBg[ci] = majority(colBgs[ci]);
+          baseWeight[ci] = majority(colWeights[ci]);
+          baseColor[ci] = majority(colColors[ci]);
+        }
+
+        // Emit hints for cells that deviate from baseline
+        for (const row of dataRows) {
+          const cells = row.querySelectorAll('td, th, [role="cell"], [role="gridcell"], [role="columnheader"], [role="rowheader"]');
+          let ci = 0;
+          for (const cell of cells) {
+            if (cell.colSpan > 1) { ci += cell.colSpan; continue; }
+            const cs = window.getComputedStyle(cell);
+            const hints = [];
+
+            const bg = cs.backgroundColor;
+            if (bg && bg !== 'rgba(0, 0, 0, 0)' && bg !== 'transparent') {
+              if (smallTable || bg !== baseBg[ci]) hints.push('bg:' + bg);
+            }
+            const fw = parseInt(cs.fontWeight) || 400;
+            if (fw > 400) {
+              const baseW = parseInt(baseWeight[ci]) || 400;
+              if (smallTable || fw !== baseW) hints.push('bold');
+            }
+            const clr = cs.color;
+            if (clr && clr !== 'rgb(0, 0, 0)') {
+              if (smallTable || clr !== baseColor[ci]) hints.push('color:' + clr);
+            }
+
+            if (hints.length > 0 && styleHintCount < 100) {
+              const text = cell.textContent.trim().slice(0, 50);
+              const key = ti + ':' + text + ':' + ci;
+              styleHints[key] = hints.join(' ');
+              styleHintCount++;
+            }
+            ci++;
+          }
+        }
+      }
+
       // Focused element
       const focused = document.activeElement;
       const focusDesc = focused && focused !== document.body
@@ -642,7 +724,7 @@ async function perceiveStr(cdp, sid, consoleBuf, exceptionBuf) {
       return JSON.stringify({
         title: document.title, url: window.location.href,
         vw, vh, scrollY, scrollMax,
-        counts, focused: focusDesc, layoutMap
+        counts, focused: focusDesc, layoutMap, styleHints
       });
     })()`)
   ]);
