@@ -648,6 +648,180 @@ function parsePerceiveArgs(args) {
   return opts;
 }
 
+// Pure tree-building logic extracted from perceiveStr for testability.
+// Takes raw AX nodes + page metadata, returns enriched tree lines and ref node IDs.
+function buildPerceiveTree(nodes, meta, refMap, opts = {}) {
+  const { maxDepth = Infinity, interactiveOnly = false } = opts;
+
+  const nodesById = new Map(nodes.map(n => [n.nodeId, n]));
+  const childrenByParent = new Map();
+  for (const n of nodes) {
+    if (!n.parentId) continue;
+    if (!childrenByParent.has(n.parentId)) childrenByParent.set(n.parentId, []);
+    childrenByParent.get(n.parentId).push(n);
+  }
+
+  // Layout consumption cursors (each role's entries are consumed in document order)
+  const layoutCursors = {};
+  for (const [role, entries] of Object.entries(meta.layoutMap || {})) {
+    layoutCursors[role] = { entries, idx: 0 };
+  }
+  function consumeLayout(role) {
+    const cursor = layoutCursors[role];
+    if (!cursor || cursor.idx >= cursor.entries.length) return null;
+    return cursor.entries[cursor.idx++];
+  }
+
+  // Track table rows to cap output
+  const TABLE_ROW_LIMIT = 5;
+  const tableRowCounts = new Map();
+  const tableIdxMap = new Map();
+  let nextTableIdx = 0;
+  const rowCellIdx = new Map();
+  const dataRowIdx = new Map();
+
+  // Clear and rebuild ref map
+  refMap.clear();
+  let refCounter = 0;
+  const refNodeIds = [];
+
+  const treeLines = [];
+  const visited = new Set();
+
+  function markSubtreeVisited(nodeId) {
+    visited.add(nodeId);
+    for (const child of (childrenByParent.get(nodeId) || [])) {
+      markSubtreeVisited(child.nodeId);
+    }
+  }
+
+  function visit(node, depth, parentNode = null, tableAncestorId = null) {
+    if (!node || visited.has(node.nodeId)) return;
+    visited.add(node.nodeId);
+
+    const role = node.role?.value || '';
+    const name = node.name?.value ?? '';
+
+    // Depth limit: still assign refs but don't output deeper nodes
+    if (depth > maxDepth) {
+      if (INTERACTIVE_ROLES.has(role) && node.backendDOMNodeId) {
+        refCounter++;
+        refMap.set(refCounter, node.backendDOMNodeId);
+        refNodeIds.push({ ref: refCounter, backendDOMNodeId: node.backendDOMNodeId });
+      }
+      for (const child of orderedAxChildren(node, nodesById, childrenByParent)) {
+        visit(child, depth + 1, node, tableAncestorId);
+      }
+      return;
+    }
+
+    // Detect table context: track row counts per table ancestor
+    if (role === 'table' || role === 'grid' || role === 'treegrid') {
+      tableAncestorId = node.nodeId;
+      tableRowCounts.set(tableAncestorId, 0);
+      dataRowIdx.set(tableAncestorId, -1);
+      if (!tableIdxMap.has(tableAncestorId)) {
+        tableIdxMap.set(tableAncestorId, nextTableIdx++);
+      }
+    }
+    if (tableAncestorId && role === 'row') {
+      const count = tableRowCounts.get(tableAncestorId) || 0;
+      tableRowCounts.set(tableAncestorId, count + 1);
+      rowCellIdx.set(tableAncestorId, 0);
+      if (count >= TABLE_ROW_LIMIT) {
+        if (count === TABLE_ROW_LIMIT) {
+          treeLines.push(formatAxNode({ role: { value: 'note' }, name: { value: '... more rows truncated' } }, depth));
+        }
+        markSubtreeVisited(node.nodeId);
+        return;
+      }
+    }
+
+    // Filter decorative icon images (short lowercase names like "thunderbolt", "check-circle")
+    if (role === 'image') {
+      if (name.length < 25 && name === name.toLowerCase() && !name.includes(' ')) {
+        markSubtreeVisited(node.nodeId);
+        return;
+      }
+    }
+
+    // Track cell index unconditionally (even for filtered nodes) to stay aligned with browser-side
+    const isCellRole = tableAncestorId && (role === 'cell' || role === 'gridcell' || role === 'columnheader' || role === 'rowheader');
+    let cellColIdx = -1;
+    if (isCellRole) {
+      cellColIdx = rowCellIdx.get(tableAncestorId) || 0;
+      rowCellIdx.set(tableAncestorId, cellColIdx + 1);
+      if ((role === 'cell' || role === 'gridcell') && cellColIdx === 0) {
+        dataRowIdx.set(tableAncestorId, (dataRowIdx.get(tableAncestorId) ?? -1) + 1);
+      }
+    }
+
+    const isInteractive = INTERACTIVE_ROLES.has(role);
+
+    // --interactive mode: only show interactive elements and their immediate structural parents
+    if (interactiveOnly && !isInteractive && !ENRICHED_ROLES.has(role)) {
+      for (const child of orderedAxChildren(node, nodesById, childrenByParent)) {
+        visit(child, depth, node, tableAncestorId);
+      }
+      return;
+    }
+
+    if (shouldShowAxNode(node, true, parentNode)) {
+      let line = formatAxNode(node, depth);
+
+      // Assign @ref to interactive elements
+      if (isInteractive && node.backendDOMNodeId) {
+        refCounter++;
+        refMap.set(refCounter, node.backendDOMNodeId);
+        refNodeIds.push({ ref: refCounter, backendDOMNodeId: node.backendDOMNodeId });
+        line += `  @${refCounter}`;
+      }
+
+      // Enrich landmark/structural nodes with layout annotations
+      if (ENRICHED_ROLES.has(role)) {
+        const layout = consumeLayout(role);
+        if (layout) {
+          const parts = [];
+          if (layout.w) parts.push(`${layout.w}×${layout.h}px`);
+          else if (layout.h >= 40) parts.push(`↕${layout.h}px`);
+          if (layout.bg) parts.push(`bg:${layout.bg}`);
+          if (layout.font) parts.push(layout.font);
+          if (layout.color) parts.push(`color:${layout.color}`);
+          if (layout.display) {
+            let d = layout.display;
+            if (layout.gap) d += ` gap:${layout.gap}`;
+            parts.push(d);
+          }
+          if (layout.opacity) parts.push(`opacity:${layout.opacity}`);
+          if (layout.vis === 'above') parts.push('↑above fold');
+          else if (layout.vis === 'below') parts.push('↓below fold');
+          if (parts.length > 0) line += '  ' + parts.join('  ');
+        }
+      }
+
+      // Enrich table cells with style hints (positional key: tableIdx:rowIdx:colIdx)
+      if (isCellRole && meta.styleHints) {
+        const ti = tableIdxMap.get(tableAncestorId);
+        const ri = dataRowIdx.get(tableAncestorId) ?? -1;
+        if (ti != null && ri >= 0) {
+          const hint = meta.styleHints[ti + ':' + ri + ':' + cellColIdx];
+          if (hint) line += '  ' + hint;
+        }
+      }
+      treeLines.push(line);
+    }
+    for (const child of orderedAxChildren(node, nodesById, childrenByParent)) {
+      visit(child, depth + 1, node, tableAncestorId);
+    }
+  }
+
+  const roots = nodes.filter(n => !n.parentId || !nodesById.has(n.parentId));
+  for (const root of roots) visit(root, 0);
+  for (const node of nodes) visit(node, 0);
+
+  return { treeLines, refNodeIds };
+}
+
 async function perceiveStr(cdp, sid, consoleBuf, exceptionBuf, refMap, lastPerceiveStore, opts = {}) {
   const { diff: diffMode = false, selector: scopeSelector = null, interactive: interactiveOnly = false, maxDepth = Infinity, cursorInteractive = false } = opts;
   // Get AX tree nodes and page metadata + layout map in parallel
@@ -863,172 +1037,7 @@ async function perceiveStr(cdp, sid, consoleBuf, exceptionBuf, refMap, lastPerce
   }
   const exceptions = exceptionBuf.all().length;
 
-  // Build layout consumption cursors (each role's entries are consumed in document order)
-  const layoutCursors = {};
-  for (const [role, entries] of Object.entries(meta.layoutMap)) {
-    layoutCursors[role] = { entries, idx: 0 };
-  }
-  function consumeLayout(role) {
-    const cursor = layoutCursors[role];
-    if (!cursor || cursor.idx >= cursor.entries.length) return null;
-    return cursor.entries[cursor.idx++];
-  }
-
-  // Build enriched AX tree
-  const { nodes } = axResult;
-  const nodesById = new Map(nodes.map(n => [n.nodeId, n]));
-  const childrenByParent = new Map();
-  for (const n of nodes) {
-    if (!n.parentId) continue;
-    if (!childrenByParent.has(n.parentId)) childrenByParent.set(n.parentId, []);
-    childrenByParent.get(n.parentId).push(n);
-  }
-
-  // Track table rows to cap output
-  const TABLE_ROW_LIMIT = 5;
-  const tableRowCounts = new Map(); // nodeId of table-like ancestor → count
-  const tableIdxMap = new Map(); // tableAncestorId (nodeId) → sequential table index
-  let nextTableIdx = 0;
-  const rowCellIdx = new Map(); // tableAncestorId → current cell index in current row
-  const dataRowIdx = new Map(); // tableAncestorId → current data row index (excludes header rows)
-
-  // Clear and rebuild ref map
-  refMap.clear();
-  let refCounter = 0;
-  const refNodeIds = []; // collect {refNum, backendDOMNodeId} for batch rect resolution
-
-  const treeLines = [];
-  const visited = new Set();
-  // Mark an entire subtree as visited (prevents fallback loop from re-emitting truncated nodes)
-  function markSubtreeVisited(nodeId) {
-    visited.add(nodeId);
-    for (const child of (childrenByParent.get(nodeId) || [])) {
-      markSubtreeVisited(child.nodeId);
-    }
-  }
-  function visit(node, depth, parentNode = null, tableAncestorId = null) {
-    if (!node || visited.has(node.nodeId)) return;
-    visited.add(node.nodeId);
-
-    const role = node.role?.value || '';
-    const name = node.name?.value ?? '';
-
-    // Depth limit: still assign refs but don't output deeper nodes
-    if (depth > maxDepth) {
-      // Still recurse to collect refs for interactive elements below the depth limit
-      if (INTERACTIVE_ROLES.has(role) && node.backendDOMNodeId) {
-        refCounter++;
-        refMap.set(refCounter, node.backendDOMNodeId);
-        refNodeIds.push({ ref: refCounter, backendDOMNodeId: node.backendDOMNodeId });
-      }
-      for (const child of orderedAxChildren(node, nodesById, childrenByParent)) {
-        visit(child, depth + 1, node, tableAncestorId);
-      }
-      return;
-    }
-
-    // Detect table context: track row counts per table ancestor
-    if (role === 'table' || role === 'grid' || role === 'treegrid') {
-      tableAncestorId = node.nodeId;
-      tableRowCounts.set(tableAncestorId, 0);
-      dataRowIdx.set(tableAncestorId, -1); // incremented on first data row
-      if (!tableIdxMap.has(tableAncestorId)) {
-        tableIdxMap.set(tableAncestorId, nextTableIdx++);
-      }
-    }
-    if (tableAncestorId && role === 'row') {
-      const count = tableRowCounts.get(tableAncestorId) || 0;
-      tableRowCounts.set(tableAncestorId, count + 1);
-      rowCellIdx.set(tableAncestorId, 0);
-      if (count >= TABLE_ROW_LIMIT) {
-        if (count === TABLE_ROW_LIMIT) {
-          treeLines.push(formatAxNode({ role: { value: 'note' }, name: { value: '... more rows truncated' } }, depth));
-        }
-        markSubtreeVisited(node.nodeId);
-        return;
-      }
-    }
-
-    // Filter decorative icon images (short lowercase names like "thunderbolt", "check-circle")
-    if (role === 'image') {
-      if (name.length < 25 && name === name.toLowerCase() && !name.includes(' ')) {
-        markSubtreeVisited(node.nodeId);
-        return;
-      }
-    }
-
-    // Track cell index unconditionally (even for filtered nodes) to stay aligned with browser-side
-    const isCellRole = tableAncestorId && (role === 'cell' || role === 'gridcell' || role === 'columnheader' || role === 'rowheader');
-    let cellColIdx = -1;
-    if (isCellRole) {
-      cellColIdx = rowCellIdx.get(tableAncestorId) || 0;
-      rowCellIdx.set(tableAncestorId, cellColIdx + 1);
-      if ((role === 'cell' || role === 'gridcell') && cellColIdx === 0) {
-        dataRowIdx.set(tableAncestorId, (dataRowIdx.get(tableAncestorId) ?? -1) + 1);
-      }
-    }
-
-    const isInteractive = INTERACTIVE_ROLES.has(role);
-
-    // --interactive mode: only show interactive elements and their immediate structural parents
-    if (interactiveOnly && !isInteractive && !ENRICHED_ROLES.has(role)) {
-      // Still recurse to find interactive children
-      for (const child of orderedAxChildren(node, nodesById, childrenByParent)) {
-        visit(child, depth, node, tableAncestorId); // keep same depth for compact output
-      }
-      return;
-    }
-
-    if (shouldShowAxNode(node, true, parentNode)) {
-      let line = formatAxNode(node, depth);
-
-      // Assign @ref to interactive elements
-      if (isInteractive && node.backendDOMNodeId) {
-        refCounter++;
-        refMap.set(refCounter, node.backendDOMNodeId);
-        refNodeIds.push({ ref: refCounter, backendDOMNodeId: node.backendDOMNodeId });
-        line += `  @${refCounter}`;
-      }
-
-      // Enrich landmark/structural nodes with layout annotations
-      if (ENRICHED_ROLES.has(role)) {
-        const layout = consumeLayout(role);
-        if (layout) {
-          const parts = [];
-          if (layout.w) parts.push(`${layout.w}×${layout.h}px`);
-          else if (layout.h >= 40) parts.push(`↕${layout.h}px`);
-          if (layout.bg) parts.push(`bg:${layout.bg}`);
-          if (layout.font) parts.push(layout.font);
-          if (layout.color) parts.push(`color:${layout.color}`);
-          if (layout.display) {
-            let d = layout.display;
-            if (layout.gap) d += ` gap:${layout.gap}`;
-            parts.push(d);
-          }
-          if (layout.opacity) parts.push(`opacity:${layout.opacity}`);
-          if (layout.vis === 'above') parts.push('↑above fold');
-          else if (layout.vis === 'below') parts.push('↓below fold');
-          if (parts.length > 0) line += '  ' + parts.join('  ');
-        }
-      }
-      // Enrich table cells with style hints (positional key: tableIdx:rowIdx:colIdx)
-      if (isCellRole && meta.styleHints) {
-        const ti = tableIdxMap.get(tableAncestorId);
-        const ri = dataRowIdx.get(tableAncestorId) ?? -1;
-        if (ti != null && ri >= 0) {
-          const hint = meta.styleHints[ti + ':' + ri + ':' + cellColIdx];
-          if (hint) line += '  ' + hint;
-        }
-      }
-      treeLines.push(line);
-    }
-    for (const child of orderedAxChildren(node, nodesById, childrenByParent)) {
-      visit(child, depth + 1, node, tableAncestorId);
-    }
-  }
-  const roots = nodes.filter(n => !n.parentId || !nodesById.has(n.parentId));
-  for (const root of roots) visit(root, 0);
-  for (const node of nodes) visit(node, 0);
+  const { treeLines, refNodeIds } = buildPerceiveTree(axResult.nodes, meta, refMap, { maxDepth, interactiveOnly });
 
   // === Batch-resolve @ref bounding rects (parallel, non-scrolling) ===
   const refRects = new Map(); // ref number → {x, y, w, h}
@@ -2406,4 +2415,14 @@ async function main() {
   }
 }
 
-main().catch(e => { console.error(e.message); process.exit(1); });
+// Test exports — only available when NODE_ENV=test to avoid side effects
+if (process.env.NODE_ENV !== 'test') {
+  main().catch(e => { console.error(e.message); process.exit(1); });
+}
+export const __test__ = process.env.NODE_ENV === 'test' ? {
+  RingBuffer, CDP, resolvePrefix, getDisplayPrefixLength, sockPath,
+  shouldShowAxNode, formatAxNode, orderedAxChildren, isRef,
+  validateUrl, parsePerceiveArgs, dialogStr, netlogStr,
+  formatPageList, buildPerceiveTree, evalStr, navStr, clickStr, fillStr,
+  KEY_MAP, ENRICHED_ROLES, INTERACTIVE_ROLES,
+} : undefined;

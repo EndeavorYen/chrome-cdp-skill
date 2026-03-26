@@ -2,3 +2,9 @@ package-lock.json
 
 # Serena
 .serena/
+
+# Node_Modules
+node_modules/
+
+# Misc
+coverage/
