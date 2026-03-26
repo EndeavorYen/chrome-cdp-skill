@@ -243,21 +243,43 @@ scripts/cdp.mjs console <target> [--all|--errors] # console buffer (default: unr
 ### Batch commands (reduce IPC overhead)
 
 ```bash
-scripts/cdp.mjs batch <target> '[{"cmd":"click","args":["@3"]},{"cmd":"perceive","args":["--diff"]}]'
+# Pipe syntax (preferred — concise, easy to write):
+scripts/cdp.mjs batch <target> 'fill @3 hello | fill @5 world | click @7'
+
+# JSON syntax (still supported):
+scripts/cdp.mjs batch <target> '[{"cmd":"fill","args":["@3","hello"]},{"cmd":"click","args":["@7"]}]'
+
+# Parallel execution (for independent commands like multiple screenshots):
+scripts/cdp.mjs batch <target> --parallel 'elshot @3 | elshot @5 | elshot @7'
 ```
 
-Executes multiple commands in a single IPC call. Returns a JSON array of results. Useful for form-filling workflows where you need to fill multiple fields and verify the result in one round trip.
+Executes multiple commands in a single IPC call. Returns a JSON array of results.
+
+- **Pipe syntax**: commands separated by `|`, args separated by spaces. Auto-detected when input doesn't start with `[`.
+- **`--parallel`**: runs all commands concurrently via `Promise.all`. Safe for: `elshot`, `fill`, `eval`, `html`, `text`, `table`, `styles`, `cookies`. Rejected for commands that auto-perceive (`click`, `scroll`, `nav`, `perceive`, etc.) since they mutate shared state.
 
 ### Action feedback (automatic)
 
-`click`, `clickxy`, `press` (Enter/Escape/Tab), and `select` **automatically wait for DOM to settle and return a perceive diff**. No need to manually run `perceive --diff` after these actions. Example:
+These commands **automatically wait for DOM to settle and return perceive feedback** — no need to manually run `perceive` or `perceive --diff` afterwards:
 
+| Command | Auto-returns |
+|---------|-------------|
+| `click`, `clickxy`, `select` | perceive diff |
+| `press` (Enter/Escape/Tab) | perceive diff |
+| `scroll` | perceive diff |
+| `viewport` (when resizing) | perceive diff |
+| `nav` | **full perceive** (new page, not a diff) |
+
+Example:
 ```
-$ cdp click <target> @3
-Clicked <BUTTON> "Submit" (@3)
+$ cdp nav <target> https://example.com
+Navigated to https://example.com
 ---
-Page: Example — https://example.com
-... (perceive diff showing what changed)
+Page: Example Store — https://example.com
+Viewport: 1280×720 | Scroll: 0/3000 (0%) | ...
+[WebArea] Example Store
+  [banner] ...
+  [main] ...
 ```
 
 This eliminates the observe-act-observe loop and makes agents ~2x more efficient.
@@ -272,7 +294,7 @@ scripts/cdp.mjs click   <target> <sel|@ref>    # click (auto-returns perceive di
 scripts/cdp.mjs clickxy <target> <x> <y>       # click at CSS pixel coords (auto-returns perceive diff)
 scripts/cdp.mjs type    <target> <text>         # Input.insertText at current focus; works in cross-origin iframes
 scripts/cdp.mjs press   <target> <key>         # press key (Enter/Escape/Tab auto-return perceive diff)
-scripts/cdp.mjs scroll  <target> <dir|x,y> [px]  # scroll page (down/up/left/right; default 500px)
+scripts/cdp.mjs scroll  <target> <dir|x,y> [px]  # scroll page (auto-returns perceive diff)
 scripts/cdp.mjs loadall <target> <selector> [ms]  # click "load more" until gone (default 1500ms between clicks)
 scripts/cdp.mjs hover   <target> <sel|@ref>          # hover element (triggers :hover, tooltips)
 scripts/cdp.mjs waitfor <target> <selector> [ms]      # wait for element to appear (default 10s)
@@ -420,19 +442,17 @@ CSS px = screenshot image px / DPR
 
 ### Navigating to a URL (prefer `nav` over `open`)
 
-When the user asks you to visit/open a URL:
+`nav` **auto-returns a full perceive** of the loaded page — no separate `perceive` call needed.
 
 1. **If you already have a target ID** (from a prior `list` or command):
    ```bash
-   scripts/cdp.mjs nav <target> <url>        # reuse existing tab — no Allow prompt!
-   scripts/cdp.mjs perceive <target>          # inspect the loaded page
+   scripts/cdp.mjs nav <target> <url>        # navigates + auto-perceives (one call!)
    ```
 
 2. **If no target ID yet**, run `list` first to find a reusable tab:
    ```bash
    scripts/cdp.mjs list                       # find an existing tab
-   scripts/cdp.mjs nav <target> <url>         # navigate it — no Allow prompt!
-   scripts/cdp.mjs perceive <target>          # inspect
+   scripts/cdp.mjs nav <target> <url>         # navigates + auto-perceives
    ```
 
 3. **Only use `open` when the user needs multiple tabs** open at the same time (e.g. comparing two pages side by side). Each `open` triggers Chrome's "Allow debugging?" dialog which requires user interaction.
@@ -460,14 +480,16 @@ When the user asks you to visit/open a URL:
 
 ### Form automation
 1. `perceive <target>` — understand form structure and get @refs for fields
-2. `fill <target> @3 "user@example.com"` — fill input by @ref
-3. `fill <target> @5 "password123"` — fill another field
-4. `click <target> @7` — submit (auto-returns perceive diff showing result!)
-5. No need for manual `perceive --diff` — click already includes it
-6. For bulk operations, use `batch`:
+2. Use `batch` with pipe syntax for the entire fill+submit in one call:
    ```bash
-   batch <target> '[{"cmd":"fill","args":["@3","user@example.com"]},{"cmd":"fill","args":["@5","pass"]},{"cmd":"click","args":["@7"]}]'
+   batch <target> 'fill @3 user@example.com | fill @5 password123 | click @7'
    ```
+3. The final `click` auto-returns perceive diff showing the result
+4. For parallel fills (independent fields), add `--parallel`:
+   ```bash
+   batch <target> --parallel 'fill @3 user@example.com | fill @5 password123'
+   ```
+   Then `click <target> @7` to submit.
 
 ### Data extraction
 1. `text <target>` — get all readable text (for search or comparison)
@@ -481,9 +503,8 @@ When the user asks you to visit/open a URL:
 
 ### Responsive testing
 1. `perceive <target>` — baseline at current viewport
-2. `viewport <target> 375x812` — switch to mobile
-3. `perceive <target> --diff` — see what changed in layout
-4. `viewport <target> 1280x720` — switch back to desktop
+2. `viewport <target> 375x812` — switch to mobile (auto-returns perceive diff!)
+3. `viewport <target> 1280x720` — switch back to desktop (auto-returns perceive diff!)
 
 ### Visual bug investigation
 1. `perceive <target>` — structure + layout positions + style hints

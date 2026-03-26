@@ -1919,6 +1919,9 @@ async function runDaemon(targetId) {
 
   // Action feedback: wait for DOM to settle, then return perceive diff
   const OBSERVE_KEYS = new Set(['enter', 'escape', 'tab']);
+  const BATCH_BLOCKED = new Set(['batch', 'stop']);
+  // Commands that mutate shared state (refMap, lastPerceiveStore) — unsafe for parallel execution
+  const BATCH_NO_PARALLEL = new Set(['click', 'clickxy', 'select', 'press', 'scroll', 'nav', 'navigate', 'viewport', 'perceive', 'snap', 'snapshot']);
   async function actionFeedback(actionResult) {
     await waitForSettle(cdp, sessionId);
     const diff = await perceiveStr(cdp, sessionId, consoleBuf, exceptionBuf, refMap, lastPerceiveStore, { diff: true });
@@ -1952,7 +1955,12 @@ async function runDaemon(targetId) {
           break;
         }
         case 'html': result = await htmlStr(cdp, sessionId, args[0]); break;
-        case 'nav': case 'navigate': result = await navStr(cdp, sessionId, args[0]); break;
+        case 'nav': case 'navigate': {
+          const navResult = await navStr(cdp, sessionId, args[0]);
+          const p = await perceiveStr(cdp, sessionId, consoleBuf, exceptionBuf, refMap, lastPerceiveStore, {});
+          result = navResult + '\n---\n' + p;
+          break;
+        }
         case 'net': case 'network': result = await netStr(cdp, sessionId); break;
         case 'status': result = await statusStr(cdp, sessionId, consoleBuf, exceptionBuf, navBuf, lastReadSeq); break;
         case 'console': result = await consoleStr(consoleBuf, exceptionBuf, lastReadSeq, args[0]); break;
@@ -1971,7 +1979,12 @@ async function runDaemon(targetId) {
           if (OBSERVE_KEYS.has(args[0]?.toLowerCase())) result = await actionFeedback(result);
           break;
         }
-        case 'scroll': result = await scrollStr(cdp, sessionId, args[0], args[1]); break;
+        case 'scroll': {
+          const scrollResult = await scrollStr(cdp, sessionId, args[0], args[1]);
+          const diff = await perceiveStr(cdp, sessionId, consoleBuf, exceptionBuf, refMap, lastPerceiveStore, { diff: true });
+          result = scrollResult + '\n---\n' + diff;
+          break;
+        }
         case 'hover': result = await hoverStr(cdp, sessionId, args[0], refMap); break;
         case 'waitfor': result = await waitForStr(cdp, sessionId, args[0], args[1]); break;
         case 'loadall': result = await loadAllStr(cdp, sessionId, args[0], args[1] ? parseInt(args[1]) : 1500); break;
@@ -1984,7 +1997,11 @@ async function runDaemon(targetId) {
         case 'cookieset': result = await cookieSetStr(cdp, sessionId, args[0]); break;
         case 'cookiedel': result = await cookieDelStr(cdp, sessionId, args[0]); break;
         case 'dialog': result = await dialogStr(dialogBuf, dialogAutoAcceptRef, args[0]); break;
-        case 'viewport': result = await viewportStr(cdp, sessionId, args[0]); break;
+        case 'viewport': {
+          result = await viewportStr(cdp, sessionId, args[0]);
+          if (args[0]) result = await actionFeedback(result); // auto-diff when resizing
+          break;
+        }
         case 'upload': result = await uploadStr(cdp, sessionId, args[0], args[1]); break;
         case 'text': result = await textStr(cdp, sessionId); break;
         case 'table': result = await tableStr(cdp, sessionId, args[0]); break;
@@ -1996,14 +2013,34 @@ async function runDaemon(targetId) {
         case 'evalraw': result = await evalRawStr(cdp, sessionId, args[0], args[1]); break;
         case 'batch': {
           let commands;
-          try { commands = JSON.parse(args[0]); } catch { return { ok: false, error: 'batch requires a JSON array: [{"cmd":"...", "args":[...]}, ...]' }; }
-          if (!Array.isArray(commands)) return { ok: false, error: 'batch argument must be a JSON array' };
-          const results = [];
-          for (const c of commands) {
-            if (c.cmd === 'batch') { results.push({ cmd: 'batch', ok: false, error: 'nested batch not allowed' }); continue; }
-            if (c.cmd === 'stop') { results.push({ cmd: 'stop', ok: false, error: 'stop not allowed inside batch' }); continue; }
+          const parallel = args.includes('--parallel');
+          const input = args.filter(a => a !== '--parallel').join(' ') || '';
+          if (input.startsWith('[')) {
+            try { commands = JSON.parse(input); } catch { return { ok: false, error: 'batch: invalid JSON array' }; }
+            if (!Array.isArray(commands)) return { ok: false, error: 'batch argument must be a JSON array' };
+          } else {
+            commands = input.split('|').map(segment => {
+              const parts = segment.trim().split(/\s+/);
+              return { cmd: parts[0], args: parts.slice(1) };
+            }).filter(c => c.cmd);
+          }
+          if (!commands.length) return { ok: false, error: 'batch: no commands provided' };
+          const blocked = commands.filter(c => BATCH_BLOCKED.has(c.cmd));
+          if (blocked.length) return { ok: false, error: `batch: ${blocked.map(c => c.cmd).join(', ')} not allowed inside batch` };
+          if (parallel) {
+            const unsafe = commands.filter(c => BATCH_NO_PARALLEL.has(c.cmd));
+            if (unsafe.length) return { ok: false, error: `batch --parallel: ${[...new Set(unsafe.map(c => c.cmd))].join(', ')} mutate shared state — use sequential batch` };
+          }
+          const runOne = async (c) => {
             const sub = await handleCommand({ cmd: c.cmd, args: c.args || [] });
-            results.push({ cmd: c.cmd, ok: sub.ok, result: sub.result, error: sub.error });
+            return { cmd: c.cmd, ok: sub.ok, result: sub.result, error: sub.error };
+          };
+          let results;
+          if (parallel) {
+            results = await Promise.all(commands.map(runOne));
+          } else {
+            results = [];
+            for (const c of commands) results.push(await runOne(c));
           }
           result = JSON.stringify(results, null, 2);
           break;
@@ -2227,16 +2264,19 @@ Usage: cdp <command> [args]
   netlog  <target> [--clear]        Network request log (XHR/Fetch/Document with status + timing)
   evalraw <target> <method> [json]  Send a raw CDP command; returns JSON result
                                     e.g. evalraw <t> "DOM.getDocument" '{}'
-  batch <target> <json>             Execute multiple commands in one call (reduces IPC overhead)
-                                    JSON array: [{"cmd":"click","args":["@1"]},{"cmd":"perceive","args":["--diff"]}]
+  batch <target> <cmds> [--parallel] Execute multiple commands in one call (reduces IPC overhead)
+                                    Pipe syntax: 'fill @3 hello | fill @5 world | click @7'
+                                    JSON syntax: '[{"cmd":"click","args":["@1"]},{"cmd":"perceive","args":["--diff"]}]'
+                                    --parallel  Run commands concurrently (for independent ops like multiple elshots)
   open  [url]                       Open a new tab (default: about:blank)
                                     Note: each new tab triggers a fresh "Allow debugging?" prompt
   stop  [target]                    Stop daemon(s)
 
 ACTION FEEDBACK
-  click, clickxy, press (Enter/Escape/Tab), and select automatically wait for DOM
-  to settle and return a perceive diff showing what changed. No need to manually
-  run perceive --diff after these actions.
+  click, clickxy, press (Enter/Escape/Tab), select, scroll, and viewport (when
+  resizing) automatically wait for DOM to settle and return a perceive diff.
+  nav automatically returns a full perceive of the loaded page.
+  No need to manually run perceive or perceive --diff after these actions.
 
 <target> is a unique targetId prefix from "cdp list". If a prefix is ambiguous,
 use more characters.
@@ -2396,8 +2436,8 @@ async function main() {
     if (!cmdArgs[0] || !cmdArgs[1]) { console.error('Error: selector and file path(s) required'); process.exit(1); }
     // args[0] = selector, args[1] = comma-separated file paths (no join needed)
   } else if (cmd === 'batch') {
-    if (!cmdArgs[0]) { console.error('Error: JSON array required'); process.exit(1); }
-    cmdArgs[0] = cmdArgs.join(' '); // join in case of spaces in JSON
+    const filtered = cmdArgs.filter(a => a !== '--parallel');
+    if (!filtered[0]) { console.error('Error: commands required (pipe syntax or JSON array)'); process.exit(1); }
   }
 
   if ((cmd === 'nav' || cmd === 'navigate') && !cmdArgs[0]) {
