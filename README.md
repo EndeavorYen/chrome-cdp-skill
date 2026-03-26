@@ -216,7 +216,28 @@ evalraw <target> <method> [json]   # raw CDP command passthrough
 <details>
 <summary><strong>WSL2 → Windows Browser Control</strong></summary>
 
-This tool works across the WSL2 → Windows boundary — most CDP tools don't. The proven pattern:
+This tool works across the WSL2 → Windows boundary — most CDP tools don't.
+
+```mermaid
+graph LR
+    subgraph WSL2["WSL2 (Linux)"]
+        Agent["AI Agent<br/>(Claude Code)"]
+        Script["cdp.mjs"]
+    end
+
+    subgraph Windows["Windows"]
+        Node["node.exe"]
+        Chrome["Chrome<br/>(user's browser)"]
+    end
+
+    Agent -- "invokes" --> Script
+    Script -- "/mnt/c/.../node.exe" --> Node
+    Node -- "CDP WebSocket<br/>localhost:port" --> Chrome
+```
+
+The key insight: WSL2 cannot connect to Windows `localhost` directly, so the script calls **Windows-side `node.exe`** via its `/mnt/c/` path, which then connects to Chrome natively.
+
+The proven pattern:
 
 1. Start Chrome **on Windows** and enable debugging at `chrome://inspect/#remote-debugging`
 2. Agent uses **Windows-side Node.js** to run the CDP script (WSL cannot connect to Windows localhost directly)
