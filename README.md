@@ -10,51 +10,28 @@
 
 Your AI agent sees the tabs you already have open, your logged-in accounts, your cookies, your page state. No separate browser instance. No re-login. No lost context.
 
----
+- **`perceive`** — structured page understanding in ~200 tokens. No screenshots, no vision model.
+- **`@ref` targeting** — `click @3`, `fill @7 "text"` — no CSS selectors, no coordinate math.
+- **Action feedback** — click/press/select auto-return a perceive diff of what changed.
+- **WSL2 → Windows** — the only CDP tool that crosses the WSL2 boundary.
+- **42 commands, 0 deps, 1 file** — form automation, network logging, cookies, console observation — all included.
 
-### `perceive` — the agent reads the page like a human, not like OCR
+```mermaid
+sequenceDiagram
+    participant Agent
+    participant Chrome
 
-One command returns a structured accessibility tree with layout annotations, style hints, scroll position, and interactive element counts. **~200 tokens** instead of an expensive vision model call on a screenshot.
+    Agent->>Chrome: perceive
+    Chrome-->>Agent: AX tree + @1 [link] "Home" + @2 [link] "Settings"<br/>+ @3 [textbox] "Email" + @4 [button] "Submit"
 
-### `@ref` — interact by reference, not by guessing
+    Agent->>Chrome: fill @3 "user@example.com"
+    Chrome-->>Agent: △ @3 [textbox] → value:"user@example.com"
 
-`perceive` assigns every interactive element a stable index: `@1`, `@2`, `@3`... with bounding coordinates. Then: `click @3`, `fill @7 "text"`, `hover @12` — **no CSS selectors, no coordinate math.**
-
-### Action feedback — the agent sees what changed, instantly
-
-`click`, `press`, `select` automatically wait for DOM to settle and return a **perceive diff** — the agent knows exactly what happened without re-scanning the page.
-
-### WSL2 → Windows — the only CDP tool that crosses the boundary
-
-Control your **Windows Chrome from WSL2**. Built-in detection, proven patterns, documented setup.
-
-### 42 commands. Zero dependencies. One file.
-
-Single-file implementation (~2400 lines), pure Node.js built-ins. No `npm install`. Form automation, network logging, cookie management, full-page capture, background console observation — all included.
-
----
-
-## See it in action
-
-```text
-$ cdp perceive abc1
-📍 My App (1280×720 scroll:0/2400) — https://app.example.com
-  [nav] h:48 bg:rgb(24,24,27)
-    @1 [link] "Home" (12,8 60×20)
-    @2 [link] "Settings" (80,8 70×20)
-  [main] ↓below fold
-    @3 [textbox] "Email" (200,350 200×30)
-    @4 [button] "Submit" (200,400 100×40)
-
-$ cdp fill abc1 @3 "user@example.com"
-  △ @3 [textbox] "Email" → value:"user@example.com"
-
-$ cdp click abc1 @4
-  △ [dialog] "Submitted successfully"
-  △ @4 [button] "Submit" → disabled
+    Agent->>Chrome: click @4
+    Chrome-->>Agent: △ [dialog] "Submitted successfully"<br/>△ @4 [button] → disabled
 ```
 
-Three commands. The agent perceived the page, filled a form field by `@ref`, clicked submit, and got instant feedback — all without a single screenshot or CSS selector.
+No CSS selectors. No coordinate guessing. No second screenshot. The agent interacts by `@ref` and gets instant feedback on what changed.
 
 <details>
 <summary><strong>How does this compare?</strong></summary>
@@ -77,23 +54,15 @@ Three commands. The agent perceived the page, filled a form field by `@ref`, cli
 
 ```bash
 git clone https://github.com/EndeavorYen/chrome-cdp-ex.git
-```
 
-Then load it in Claude Code:
-
-```bash
+# Option A: load in Claude Code (current session)
 claude --plugin-dir ./chrome-cdp-ex
-```
 
-Or install globally (available in all projects):
-
-```bash
+# Option B: install globally (available in all projects)
 cp -r chrome-cdp-ex/skills/chrome-cdp ~/.claude/skills/
 ```
 
-### Enable Chrome debugging
-
-Navigate to `chrome://inspect/#remote-debugging` and toggle the switch. That's it — do **not** restart Chrome with `--remote-debugging-port`.
+Then enable Chrome debugging: navigate to `chrome://inspect/#remote-debugging` and toggle the switch. Do **not** restart Chrome with `--remote-debugging-port`.
 
 **Requires:** Node.js 22+ (uses built-in WebSocket). Auto-detects Chrome, Chromium, Brave, Edge, and Vivaldi on macOS, Linux (including Flatpak), and Windows.
 
@@ -147,7 +116,7 @@ closetab <target>                  # close a browser tab
 
 </details>
 
-<details>
+<details open>
 <summary><strong>Perception</strong> — start here</summary>
 
 ```bash
