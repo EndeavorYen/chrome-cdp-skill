@@ -12,7 +12,7 @@
 
 Same ugly page. Same prompt. 5 rounds. Three independent AI agents — each with a different browser observation tool. **The only variable: how much the tool reveals about the page's visual state.**
 
-| Before | After: `chrome-cdp` | After: Playwright | After: Other CDP |
+| Before | `chrome-cdp-ex` | Playwright | Other CDP |
 |--------|---------------------|-------------------|------------------|
 | ![before](experiment/round-0.png) | ![chrome-cdp result](experiment/final-A.png) | ![playwright result](experiment/final-B.png) | ![other cdp result](experiment/final-C.png) |
 
@@ -32,7 +32,7 @@ The agent with `perceive` (layout + colors + spacing + coordinates) produced the
 | **Dependencies** | **0** | Playwright + Chromium binary | Varies |
 | **Commands** | **42** | N/A (programmatic API) | ~14 |
 
-## One command. Complete page understanding.
+## One command. Complete page understanding
 
 Other tools give the agent a screenshot and say "figure it out." Or dump a raw accessibility tree with no context. `perceive` gives the agent **everything it needs in one call:**
 
