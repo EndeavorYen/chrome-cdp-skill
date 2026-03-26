@@ -36,6 +36,7 @@ class RingBuffer {
   since(seq) { return this.buf.filter(e => e._seq > seq); }
   all() { return [...this.buf]; }
   latest() { return this.seq; }
+  clear() { this.buf.length = 0; }
 }
 
 function sockPath(targetId) {
@@ -320,9 +321,17 @@ async function snapshotStr(cdp, sid, compact = false) {
   return lines.join('\n');
 }
 
-async function evalStr(cdp, sid, expression) {
+async function evalStr(cdp, sid, expression, autoWrap = false) {
+  // Auto-wrap: if expression contains `await`, wrap in async IIFE
+  let expr = expression;
+  if (autoWrap && /\bawait\b/.test(expr)) {
+    // Multi-statement or has semicolons → block body; otherwise expression body
+    expr = expr.includes(';') || expr.includes('\n')
+      ? `(async()=>{${expr}})()`
+      : `(async()=>(${expr}))()`;
+  }
   const result = await cdp.send('Runtime.evaluate', {
-    expression, returnByValue: true, awaitPromise: true,
+    expression: expr, returnByValue: true, awaitPromise: true,
   }, sid);
   if (result.exceptionDetails) {
     throw new Error(result.exceptionDetails.text || result.exceptionDetails.exception?.description);
@@ -592,6 +601,19 @@ async function resolveRef(cdp, sid, refMap, ref) {
 
 function isRef(s) { return /^@\d+$/.test(s); }
 
+// Wait for DOM mutations to stop after an action (350ms of silence = settled)
+async function waitForSettle(cdp, sid, timeoutMs = 3000) {
+  await evalStr(cdp, sid, `new Promise(resolve => {
+    let timer;
+    const done = () => { obs.disconnect(); resolve(); };
+    const reset = () => { clearTimeout(timer); timer = setTimeout(done, 350); };
+    const obs = new MutationObserver(reset);
+    obs.observe(document.body || document.documentElement, { childList: true, subtree: true, attributes: true });
+    timer = setTimeout(done, 350);
+    setTimeout(() => { clearTimeout(timer); obs.disconnect(); resolve(); }, ${timeoutMs});
+  })`);
+}
+
 function validateUrl(url) {
   let parsed;
   try { parsed = new URL(url); } catch { throw new Error(`Invalid URL: ${url}`); }
@@ -612,10 +634,34 @@ function validateUrl(url) {
 }
 
 // Perceive: enriched accessibility tree with inline visual layout annotations
-async function perceiveStr(cdp, sid, consoleBuf, exceptionBuf, refMap, lastPerceiveStore, diffMode = false) {
+// Options parsed from args: --diff, --selector <sel>, --interactive/-i, --depth <N>, --cursor-interactive/-C
+function parsePerceiveArgs(args) {
+  const opts = { diff: false, selector: null, interactive: false, maxDepth: Infinity, cursorInteractive: false };
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--diff') opts.diff = true;
+    else if (a === '-s' || a === '--selector') opts.selector = args[++i];
+    else if (a === '-i' || a === '--interactive') opts.interactive = true;
+    else if (a === '-d' || a === '--depth') opts.maxDepth = parseInt(args[++i]) || Infinity;
+    else if (a === '-C' || a === '--cursor-interactive') opts.cursorInteractive = true;
+  }
+  return opts;
+}
+
+async function perceiveStr(cdp, sid, consoleBuf, exceptionBuf, refMap, lastPerceiveStore, opts = {}) {
+  const { diff: diffMode = false, selector: scopeSelector = null, interactive: interactiveOnly = false, maxDepth = Infinity, cursorInteractive = false } = opts;
   // Get AX tree nodes and page metadata + layout map in parallel
+  const axPromise = scopeSelector
+    ? (async () => {
+        const { root } = await cdp.send('DOM.getDocument', {}, sid);
+        const { nodeId } = await cdp.send('DOM.querySelector', { nodeId: root.nodeId, selector: scopeSelector }, sid);
+        if (!nodeId) throw new Error(`Scope selector not found: ${scopeSelector}`);
+        const { node } = await cdp.send('DOM.describeNode', { nodeId }, sid);
+        return cdp.send('Accessibility.getFullAXTree', { backendNodeId: node.backendNodeId }, sid);
+      })()
+    : cdp.send('Accessibility.getFullAXTree', {}, sid);
   const [axResult, metaJson] = await Promise.all([
-    cdp.send('Accessibility.getFullAXTree', {}, sid),
+    axPromise,
     evalStr(cdp, sid, `(function() {
       const vw = window.innerWidth, vh = window.innerHeight;
       const scrollY = Math.round(window.scrollY);
@@ -767,10 +813,41 @@ async function perceiveStr(cdp, sid, consoleBuf, exceptionBuf, refMap, lastPerce
         ? '<' + focused.tagName.toLowerCase() + (focused.id ? '#' + focused.id : '') + '>'
         : 'none';
 
+      // Cursor-interactive scan: find non-ARIA clickable elements (cursor:pointer, onclick, tabindex)
+      const cursorInteractives = [];
+      if (${cursorInteractive}) {
+        const ARIA_INTERACTIVE = new Set(['A','BUTTON','INPUT','SELECT','TEXTAREA']);
+        const seen = new Set();
+        for (const el of document.querySelectorAll('*')) {
+          if (ARIA_INTERACTIVE.has(el.tagName)) continue;
+          if (el.getAttribute('role')) continue;
+          if (el.closest('a, button, input, select, textarea, [role]')) continue;
+          const cs = window.getComputedStyle(el);
+          const clickable = cs.cursor === 'pointer' || el.hasAttribute('onclick') || (el.hasAttribute('tabindex') && el.tabIndex >= 0);
+          if (!clickable) continue;
+          if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+          const rect = el.getBoundingClientRect();
+          if (rect.width < 5 || rect.height < 5) continue;
+          // Build a CSS selector path for this element
+          let sel = el.tagName.toLowerCase();
+          if (el.id) sel += '#' + CSS.escape(el.id);
+          else if (el.className && typeof el.className === 'string') {
+            const cls = el.className.trim().split(/\\s+/).slice(0, 2).map(c => '.' + CSS.escape(c)).join('');
+            sel += cls;
+          }
+          const key = sel + '|' + Math.round(rect.x) + ',' + Math.round(rect.y);
+          if (seen.has(key)) continue;
+          seen.add(key);
+          const text = el.textContent.trim().substring(0, 60);
+          cursorInteractives.push({ sel, text, x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width), h: Math.round(rect.height) });
+          if (cursorInteractives.length >= 50) break;
+        }
+      }
+
       return JSON.stringify({
         title: document.title, url: window.location.href,
         vw, vh, scrollY, scrollMax,
-        counts, focused: focusDesc, layoutMap, styleHints
+        counts, focused: focusDesc, layoutMap, styleHints, cursorInteractives
       });
     })()`)
   ]);
@@ -818,6 +895,7 @@ async function perceiveStr(cdp, sid, consoleBuf, exceptionBuf, refMap, lastPerce
   // Clear and rebuild ref map
   refMap.clear();
   let refCounter = 0;
+  const refNodeIds = []; // collect {refNum, backendDOMNodeId} for batch rect resolution
 
   const treeLines = [];
   const visited = new Set();
@@ -834,6 +912,20 @@ async function perceiveStr(cdp, sid, consoleBuf, exceptionBuf, refMap, lastPerce
 
     const role = node.role?.value || '';
     const name = node.name?.value ?? '';
+
+    // Depth limit: still assign refs but don't output deeper nodes
+    if (depth > maxDepth) {
+      // Still recurse to collect refs for interactive elements below the depth limit
+      if (INTERACTIVE_ROLES.has(role) && node.backendDOMNodeId) {
+        refCounter++;
+        refMap.set(refCounter, node.backendDOMNodeId);
+        refNodeIds.push({ ref: refCounter, backendDOMNodeId: node.backendDOMNodeId });
+      }
+      for (const child of orderedAxChildren(node, nodesById, childrenByParent)) {
+        visit(child, depth + 1, node, tableAncestorId);
+      }
+      return;
+    }
 
     // Detect table context: track row counts per table ancestor
     if (role === 'table' || role === 'grid' || role === 'treegrid') {
@@ -852,7 +944,7 @@ async function perceiveStr(cdp, sid, consoleBuf, exceptionBuf, refMap, lastPerce
         if (count === TABLE_ROW_LIMIT) {
           treeLines.push(formatAxNode({ role: { value: 'note' }, name: { value: '... more rows truncated' } }, depth));
         }
-        markSubtreeVisited(node.nodeId); // prevent fallback loop from re-emitting children
+        markSubtreeVisited(node.nodeId);
         return;
       }
     }
@@ -871,19 +963,30 @@ async function perceiveStr(cdp, sid, consoleBuf, exceptionBuf, refMap, lastPerce
     if (isCellRole) {
       cellColIdx = rowCellIdx.get(tableAncestorId) || 0;
       rowCellIdx.set(tableAncestorId, cellColIdx + 1);
-      // Track data row index: increment on first data cell of each row (cell/gridcell, not columnheader)
       if ((role === 'cell' || role === 'gridcell') && cellColIdx === 0) {
         dataRowIdx.set(tableAncestorId, (dataRowIdx.get(tableAncestorId) ?? -1) + 1);
       }
+    }
+
+    const isInteractive = INTERACTIVE_ROLES.has(role);
+
+    // --interactive mode: only show interactive elements and their immediate structural parents
+    if (interactiveOnly && !isInteractive && !ENRICHED_ROLES.has(role)) {
+      // Still recurse to find interactive children
+      for (const child of orderedAxChildren(node, nodesById, childrenByParent)) {
+        visit(child, depth, node, tableAncestorId); // keep same depth for compact output
+      }
+      return;
     }
 
     if (shouldShowAxNode(node, true, parentNode)) {
       let line = formatAxNode(node, depth);
 
       // Assign @ref to interactive elements
-      if (INTERACTIVE_ROLES.has(role) && node.backendDOMNodeId) {
+      if (isInteractive && node.backendDOMNodeId) {
         refCounter++;
         refMap.set(refCounter, node.backendDOMNodeId);
+        refNodeIds.push({ ref: refCounter, backendDOMNodeId: node.backendDOMNodeId });
         line += `  @${refCounter}`;
       }
 
@@ -926,6 +1029,43 @@ async function perceiveStr(cdp, sid, consoleBuf, exceptionBuf, refMap, lastPerce
   const roots = nodes.filter(n => !n.parentId || !nodesById.has(n.parentId));
   for (const root of roots) visit(root, 0);
   for (const node of nodes) visit(node, 0);
+
+  // === Batch-resolve @ref bounding rects (parallel, non-scrolling) ===
+  const refRects = new Map(); // ref number → {x, y, w, h}
+  if (refNodeIds.length > 0) {
+    const results = await Promise.allSettled(refNodeIds.map(async ({ ref, backendDOMNodeId }) => {
+      const { object } = await cdp.send('DOM.resolveNode', { backendNodeId: backendDOMNodeId }, sid);
+      const res = await cdp.send('Runtime.callFunctionOn', {
+        objectId: object.objectId,
+        functionDeclaration: `function() { const r = this.getBoundingClientRect(); return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) }; }`,
+        returnByValue: true,
+      }, sid);
+      return { ref, rect: res.result.value };
+    }));
+    for (const r of results) {
+      if (r.status === 'fulfilled') refRects.set(r.value.ref, r.value.rect);
+    }
+  }
+
+  // Inject @ref coordinates into treeLines
+  for (let i = 0; i < treeLines.length; i++) {
+    const m = treeLines[i].match(/@(\d+)$/);
+    if (m) {
+      const rect = refRects.get(parseInt(m[1]));
+      if (rect) treeLines[i] += `  (${rect.x},${rect.y} ${rect.w}×${rect.h})`;
+    }
+  }
+
+  // === Cursor-interactive @c refs ===
+  let cRefCounter = 0;
+  if (cursorInteractive && meta.cursorInteractives?.length > 0) {
+    treeLines.push('');
+    treeLines.push('[Cursor-interactive elements] (non-ARIA clickable)');
+    for (const ci of meta.cursorInteractives) {
+      cRefCounter++;
+      treeLines.push(`  [clickable] ${ci.text || ci.sel}  @c${cRefCounter}  (${ci.x},${ci.y} ${ci.w}×${ci.h})`);
+    }
+  }
 
   // === Assemble output ===
   const lines = [];
@@ -1476,6 +1616,160 @@ async function evalRawStr(cdp, sid, method, paramsJson) {
   return JSON.stringify(result, null, 2);
 }
 
+function dialogStr(dialogBuf, dialogAutoAcceptRef, flag) {
+  if (flag === 'accept') { dialogAutoAcceptRef.value = true; return 'Dialog auto-accept: ON (default)'; }
+  if (flag === 'dismiss') { dialogAutoAcceptRef.value = false; return 'Dialog auto-accept: OFF (dialogs will be dismissed/rejected)'; }
+  if (flag) throw new Error(`Unknown dialog flag: "${flag}". Use "accept" or "dismiss".`);
+  const mode = dialogAutoAcceptRef.value ? 'ON' : 'OFF';
+  const entries = dialogBuf.all();
+  if (entries.length === 0) return `No dialogs recorded. Auto-accept: ${mode}`;
+  const lines = [`Dialogs (${entries.length}, auto-accept: ${mode}):`];
+  for (const e of entries) {
+    const ago = Math.round((Date.now() - e.ts) / 1000);
+    lines.push(`  [${e.type}] "${e.message}" (${ago}s ago)`);
+  }
+  return lines.join('\n');
+}
+
+function netlogStr(netReqBuf, flag) {
+  if (flag === '--clear') { netReqBuf.clear(); return 'Network log cleared'; }
+  const entries = netReqBuf.all();
+  if (entries.length === 0) return 'No network requests captured (tracking XHR/Fetch/Document only)';
+  const lines = [`Network requests (${entries.length}):`];
+  for (const e of entries) {
+    const ago = Math.round((Date.now() - e.ts) / 1000);
+    const size = e.size > 1024 ? `${(e.size / 1024).toFixed(1)}KB` : `${e.size}B`;
+    lines.push(`  ${e.method} ${e.url} → ${e.status} (${e.duration}ms, ${size}) ${ago}s ago`);
+  }
+  return lines.join('\n');
+}
+
+async function viewportStr(cdp, sid, size) {
+  if (!size) {
+    const dims = await evalStr(cdp, sid, `JSON.stringify({w:window.innerWidth,h:window.innerHeight,dpr:window.devicePixelRatio})`);
+    const d = JSON.parse(dims);
+    return `Viewport: ${d.w}×${d.h} (DPR: ${d.dpr})`;
+  }
+  const match = size.match(/^(\d+)[x×](\d+)$/);
+  if (!match) throw new Error('Format: <width>x<height> (e.g. 375x812, 1280x720)');
+  const width = parseInt(match[1]), height = parseInt(match[2]);
+  await cdp.send('Emulation.setDeviceMetricsOverride', {
+    width, height, deviceScaleFactor: 0, mobile: width <= 768,
+  }, sid);
+  return `Viewport resized to ${width}×${height}${width <= 768 ? ' (mobile mode)' : ''}`;
+}
+
+async function cookieSetStr(cdp, sid, cookieStr) {
+  if (!cookieStr) throw new Error('Cookie string required: "name=value" or "name=value; domain=.example.com"');
+  const parts = cookieStr.split(';').map(s => s.trim());
+  const [name, ...valParts] = parts[0].split('=');
+  const value = valParts.join('='); // handle values with = in them
+  if (!name) throw new Error('Cookie name required');
+
+  const cookie = { name: name.trim(), value };
+  for (const part of parts.slice(1)) {
+    const [k, ...v] = part.split('=');
+    const key = k.trim().toLowerCase();
+    const val = v.join('=').trim();
+    if (key === 'domain') cookie.domain = val;
+    else if (key === 'path') cookie.path = val;
+    else if (key === 'secure') cookie.secure = true;
+    else if (key === 'httponly') cookie.httpOnly = true;
+    else if (key === 'samesite') cookie.sameSite = val;
+  }
+
+  // Batch location queries into a single eval round-trip
+  const loc = JSON.parse(await evalStr(cdp, sid, 'JSON.stringify({hostname:location.hostname,href:location.href})'));
+  if (!cookie.domain) cookie.domain = loc.hostname;
+  cookie.url = loc.href;
+
+  const { success } = await cdp.send('Network.setCookie', cookie, sid);
+  if (!success) throw new Error(`Failed to set cookie: ${name}`);
+  return `Cookie set: ${name}=${value.substring(0, 30)}${value.length > 30 ? '...' : ''} (domain: ${cookie.domain})`;
+}
+
+async function cookieDelStr(cdp, sid, name) {
+  if (!name) throw new Error('Cookie name required');
+  const url = await evalStr(cdp, sid, 'window.location.href');
+  await cdp.send('Network.deleteCookies', { name, url }, sid);
+  return `Cookie deleted: ${name}`;
+}
+
+async function uploadStr(cdp, sid, selector, filePaths) {
+  if (!selector) throw new Error('CSS selector for <input type="file"> required');
+  if (!filePaths) throw new Error('File path(s) required (comma-separated for multiple)');
+  const files = filePaths.split(',').map(f => f.trim());
+  const { root } = await cdp.send('DOM.getDocument', {}, sid);
+  const { nodeId } = await cdp.send('DOM.querySelector', { nodeId: root.nodeId, selector }, sid);
+  if (!nodeId) throw new Error('Element not found: ' + selector);
+  // Validate it's a file input — attributes is a flat [name, value, name, value, ...] array
+  const { node } = await cdp.send('DOM.describeNode', { nodeId }, sid);
+  const attrs = node.attributes || [];
+  const typeIdx = attrs.indexOf('type');
+  if (node.nodeName !== 'INPUT' || typeIdx === -1 || attrs[typeIdx + 1] !== 'file')
+    throw new Error('Element is not an <input type="file">');
+  await cdp.send('DOM.setFileInputFiles', { files, nodeId }, sid);
+  return `Uploaded ${files.length} file(s) to ${selector}: ${files.join(', ')}`;
+}
+
+// --- Clean text extraction ---
+async function textStr(cdp, sid) {
+  return evalStr(cdp, sid, `(function() {
+    const clone = document.body.cloneNode(true);
+    for (const el of clone.querySelectorAll('script,style,noscript,svg,link,meta')) el.remove();
+    return clone.textContent.replace(/[ \\t]+/g, ' ').replace(/(\\n\\s*){3,}/g, '\\n\\n').trim();
+  })()`);
+}
+
+// --- Full table data extraction ---
+async function tableStr(cdp, sid, selector) {
+  const sel = selector || 'table';
+  return evalStr(cdp, sid, `(function() {
+    const tables = document.querySelectorAll(${JSON.stringify(sel)});
+    if (tables.length === 0) return 'No tables found' + (${JSON.stringify(sel)} !== 'table' ? ' matching ' + ${JSON.stringify(sel)} : '');
+    const results = [];
+    for (let ti = 0; ti < tables.length && ti < 10; ti++) {
+      const tbl = tables[ti];
+      const caption = tbl.querySelector('caption')?.textContent?.trim() || tbl.getAttribute('aria-label') || 'Table ' + (ti + 1);
+      const rows = [];
+      for (const tr of tbl.querySelectorAll('tr')) {
+        const cells = [];
+        for (const cell of tr.querySelectorAll('th, td')) {
+          cells.push(cell.textContent.trim().replace(/\\s+/g, ' '));
+        }
+        if (cells.length > 0) rows.push(cells.join('\\t'));
+      }
+      results.push(caption + ':\\n' + rows.join('\\n'));
+    }
+    return results.join('\\n\\n');
+  })()`);
+}
+
+// --- Navigation history ---
+async function historyNavStr(cdp, sid, direction) {
+  const { currentIndex, entries } = await cdp.send('Page.getNavigationHistory', {}, sid);
+  const targetIdx = currentIndex + direction;
+  if (targetIdx < 0) throw new Error('No previous page in history');
+  if (targetIdx >= entries.length) throw new Error('No forward page in history');
+  await cdp.send('Page.navigateToHistoryEntry', { entryId: entries[targetIdx].id }, sid);
+  await sleep(500);
+  const url = await evalStr(cdp, sid, 'window.location.href');
+  return `Navigated ${direction < 0 ? 'back' : 'forward'} to: ${url}`;
+}
+
+async function reloadStr(cdp, sid) {
+  const loadEvent = cdp.waitForEvent('Page.loadEventFired', NAVIGATION_TIMEOUT);
+  await cdp.send('Page.reload', {}, sid);
+  try { await loadEvent.promise; } catch {}
+  return 'Page reloaded';
+}
+
+// --- Tab close ---
+async function closetabStr(cdp, targetId) {
+  await cdp.send('Target.closeTarget', { targetId });
+  return `Closed tab: ${targetId.slice(0, 8)}`;
+}
+
 // ---------------------------------------------------------------------------
 // Per-tab daemon
 // ---------------------------------------------------------------------------
@@ -1505,6 +1799,8 @@ async function runDaemon(targetId) {
   const consoleBuf = new RingBuffer(200);
   const exceptionBuf = new RingBuffer(50);
   const navBuf = new RingBuffer(10);
+  const netReqBuf = new RingBuffer(100); // network request/response pairs
+  const pendingReqs = new Map(); // requestId → {method, url, ts}
   let lastReadSeq = { console: 0, exception: 0 };
 
   // --- Ref system & perceive diff state ---
@@ -1515,6 +1811,7 @@ async function runDaemon(targetId) {
   try { await cdp.send('Runtime.enable', {}, sessionId); } catch {}
   try { await cdp.send('Page.enable', {}, sessionId); } catch {}
   try { await cdp.send('DOM.enable', {}, sessionId); } catch {}
+  try { await cdp.send('Network.enable', {}, sessionId); } catch {}
 
   cdp.onEvent('Runtime.consoleAPICalled', (params) => {
     const level = params.type || 'log';
@@ -1539,6 +1836,47 @@ async function runDaemon(targetId) {
     if (!params.frame.parentId) { // main frame only
       navBuf.push({ url: params.frame.url, ts: Date.now() });
     }
+  });
+
+  // --- Network request/response tracking ---
+  cdp.onEvent('Network.requestWillBeSent', (params) => {
+    // Only track XHR/Fetch, skip images/scripts/stylesheets for noise reduction
+    if (params.type === 'XHR' || params.type === 'Fetch' || params.type === 'Document') {
+      pendingReqs.set(params.requestId, {
+        method: params.request.method,
+        url: params.request.url.substring(0, 200),
+        ts: Date.now(),
+      });
+    }
+  });
+  cdp.onEvent('Network.responseReceived', (params) => {
+    const req = pendingReqs.get(params.requestId);
+    if (!req) return;
+    pendingReqs.delete(params.requestId);
+    netReqBuf.push({
+      method: req.method,
+      url: req.url,
+      status: params.response.status,
+      type: params.type,
+      duration: Date.now() - req.ts,
+      size: params.response.encodedDataLength || 0,
+      ts: req.ts,
+    });
+  });
+
+  cdp.onEvent('Network.loadingFailed', (params) => {
+    pendingReqs.delete(params.requestId);
+  });
+
+  // --- Dialog handling (alert/confirm/prompt/beforeunload) ---
+  const dialogBuf = new RingBuffer(20);
+  const dialogAutoAcceptRef = { value: true }; // auto-dismiss by default to prevent page lockups
+  cdp.onEvent('Page.javascriptDialogOpening', (params) => {
+    dialogBuf.push({ type: params.type, message: params.message, ts: Date.now() });
+    cdp.send('Page.handleJavaScriptDialog', {
+      accept: dialogAutoAcceptRef.value,
+      promptText: dialogAutoAcceptRef.value ? params.defaultPrompt || '' : undefined,
+    }, sessionId).catch(() => {});
   });
 
   // Shutdown helpers
@@ -1570,6 +1908,14 @@ async function runDaemon(targetId) {
     idleTimer = setTimeout(shutdown, IDLE_TIMEOUT);
   }
 
+  // Action feedback: wait for DOM to settle, then return perceive diff
+  const OBSERVE_KEYS = new Set(['enter', 'escape', 'tab']);
+  async function actionFeedback(actionResult) {
+    await waitForSettle(cdp, sessionId);
+    const diff = await perceiveStr(cdp, sessionId, consoleBuf, exceptionBuf, refMap, lastPerceiveStore, { diff: true });
+    return actionResult + '\n---\n' + diff;
+  }
+
   // Handle a command
   async function handleCommand({ cmd, args }) {
     resetIdle();
@@ -1587,7 +1933,7 @@ async function runDaemon(targetId) {
           break;
         }
         case 'snap': case 'snapshot': result = await snapshotStr(cdp, sessionId, args[0] !== '--full'); break;
-        case 'eval': result = await evalStr(cdp, sessionId, args[0]); break;
+        case 'eval': result = await evalStr(cdp, sessionId, args[0], true); break;
         case 'shot': case 'screenshot': {
           if (args[0] === '--annotate' || args[0] === '-a') {
             result = await annotshotStr(cdp, sessionId, targetId, refMap);
@@ -1603,25 +1949,41 @@ async function runDaemon(targetId) {
         case 'console': result = await consoleStr(consoleBuf, exceptionBuf, lastReadSeq, args[0]); break;
         case 'summary': result = await summaryStr(cdp, sessionId, consoleBuf, exceptionBuf); break;
         case 'perceive': {
-          const diffFlag = args.includes('--diff');
-          result = await perceiveStr(cdp, sessionId, consoleBuf, exceptionBuf, refMap, lastPerceiveStore, diffFlag);
+          const popts = parsePerceiveArgs(args);
+          result = await perceiveStr(cdp, sessionId, consoleBuf, exceptionBuf, refMap, lastPerceiveStore, popts);
           break;
         }
         case 'elshot': result = await elshotStr(cdp, sessionId, args[0], targetId, refMap); break;
-        case 'click': result = await clickStr(cdp, sessionId, args[0], refMap); break;
-        case 'clickxy': result = await clickXyStr(cdp, sessionId, args[0], args[1]); break;
+        case 'click': result = await actionFeedback(await clickStr(cdp, sessionId, args[0], refMap)); break;
+        case 'clickxy': result = await actionFeedback(await clickXyStr(cdp, sessionId, args[0], args[1])); break;
         case 'type': result = await typeStr(cdp, sessionId, args[0]); break;
-        case 'press': result = await pressStr(cdp, sessionId, args[0]); break;
+        case 'press': {
+          result = await pressStr(cdp, sessionId, args[0]);
+          if (OBSERVE_KEYS.has(args[0]?.toLowerCase())) result = await actionFeedback(result);
+          break;
+        }
         case 'scroll': result = await scrollStr(cdp, sessionId, args[0], args[1]); break;
         case 'hover': result = await hoverStr(cdp, sessionId, args[0], refMap); break;
         case 'waitfor': result = await waitForStr(cdp, sessionId, args[0], args[1]); break;
         case 'loadall': result = await loadAllStr(cdp, sessionId, args[0], args[1] ? parseInt(args[1]) : 1500); break;
         case 'fill': result = await fillStr(cdp, sessionId, args[0], args[1], refMap); break;
-        case 'select': result = await selectStr(cdp, sessionId, args[0], args[1]); break;
+        case 'select': result = await actionFeedback(await selectStr(cdp, sessionId, args[0], args[1])); break;
         case 'fullshot': result = await fullshotStr(cdp, sessionId, args[0], targetId); break;
         case 'scanshot': result = await scanshotStr(cdp, sessionId, targetId); break;
         case 'styles': result = await stylesStr(cdp, sessionId, args[0]); break;
         case 'cookies': result = await cookiesStr(cdp, sessionId); break;
+        case 'cookieset': result = await cookieSetStr(cdp, sessionId, args[0]); break;
+        case 'cookiedel': result = await cookieDelStr(cdp, sessionId, args[0]); break;
+        case 'dialog': result = await dialogStr(dialogBuf, dialogAutoAcceptRef, args[0]); break;
+        case 'viewport': result = await viewportStr(cdp, sessionId, args[0]); break;
+        case 'upload': result = await uploadStr(cdp, sessionId, args[0], args[1]); break;
+        case 'text': result = await textStr(cdp, sessionId); break;
+        case 'table': result = await tableStr(cdp, sessionId, args[0]); break;
+        case 'back': result = await historyNavStr(cdp, sessionId, -1); break;
+        case 'forward': result = await historyNavStr(cdp, sessionId, +1); break;
+        case 'reload': result = await reloadStr(cdp, sessionId); break;
+        case 'closetab': result = await closetabStr(cdp, targetId); break;
+        case 'netlog': result = netlogStr(netReqBuf, args[0]); break;
         case 'evalraw': result = await evalRawStr(cdp, sessionId, args[0], args[1]); break;
         case 'batch': {
           let commands;
@@ -1642,7 +2004,15 @@ async function runDaemon(targetId) {
       }
       return { ok: true, result: result ?? '' };
     } catch (e) {
-      return { ok: false, error: e.message };
+      let error = e.message;
+      // Enhance common errors with actionable hints
+      if (error.includes('No node with given id') || error.includes('Could not find node'))
+        error += ' — element may have been removed from DOM. Run "perceive" to refresh refs.';
+      else if (error.includes('Cannot find context'))
+        error += ' — page may have navigated. Run "perceive" on the current page.';
+      else if (error.includes('Element not found'))
+        error += ' — check your selector or run "perceive" to see available elements.';
+      return { ok: false, error };
     }
   }
 
@@ -1719,10 +2089,14 @@ async function getOrStartTabDaemon(targetId) {
   throw new Error('Daemon failed to start — did you click Allow in Chrome?');
 }
 
+const IPC_TIMEOUT = 120000; // 2 minutes — generous for slow commands like scanshot
+
 function sendCommand(conn, req) {
   return new Promise((resolve, reject) => {
     let buf = '';
     let settled = false;
+
+    const settle = (fn) => { if (settled) return; settled = true; cleanup(); clearTimeout(timer); fn(); };
 
     const cleanup = () => {
       conn.off('data', onData);
@@ -1735,32 +2109,16 @@ function sendCommand(conn, req) {
       buf += chunk.toString();
       const idx = buf.indexOf('\n');
       if (idx === -1) return;
-      settled = true;
-      cleanup();
-      resolve(JSON.parse(buf.slice(0, idx)));
-      conn.end();
+      settle(() => { resolve(JSON.parse(buf.slice(0, idx))); conn.end(); });
     };
 
-    const onError = (error) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      reject(error);
-    };
+    const onError = (error) => settle(() => reject(error));
+    const onEnd = () => settle(() => reject(new Error('Connection closed before response')));
+    const onClose = () => settle(() => reject(new Error('Connection closed before response')));
 
-    const onEnd = () => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      reject(new Error('Connection closed before response'));
-    };
-
-    const onClose = () => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      reject(new Error('Connection closed before response'));
-    };
+    const timer = setTimeout(() => {
+      settle(() => { conn.destroy(); reject(new Error(`IPC timeout: command "${req.cmd}" took longer than ${IPC_TIMEOUT / 1000}s`)); });
+    }, IPC_TIMEOUT);
 
     conn.on('data', onData);
     conn.on('error', onError);
@@ -1814,8 +2172,12 @@ const USAGE = `cdp - lightweight Chrome DevTools Protocol CLI (no Puppeteer)
 Usage: cdp <command> [args]
 
   list                              List open pages (shows unique target prefixes)
-  perceive <target> [--diff]         Full page perception with @ref indices on interactive elements
+  perceive <target> [flags]          Full page perception with @ref indices + coordinates
                                     --diff: show only changes since last perceive
+                                    -s <sel> / --selector: scope to CSS selector subtree
+                                    -i / --interactive: only show interactive elements
+                                    -d N / --depth N: limit tree depth
+                                    -C / --cursor-interactive: include non-ARIA clickable elements (@c refs)
   snap  <target> [--full]           Accessibility tree snapshot (compact by default, --full for complete)
   eval  <target> <expr>             Evaluate JS expression
   elshot <target> <sel|@ref>        Element screenshot: captures element by CSS selector or @ref
@@ -1842,6 +2204,18 @@ Usage: cdp <command> [args]
   scanshot <target>                 Segmented full-page capture (viewport-sized images, readable)
   styles  <target> <selector>       Get computed styles for element (filtered to meaningful props)
   cookies <target>                  List cookies for current page
+  cookieset <target> <cookie>       Set a cookie: "name=value" or "name=value; domain=.example.com; secure"
+  cookiedel <target> <name>         Delete a cookie by name
+  dialog  <target> [accept|dismiss] Show dialog history; set auto-accept (default) or auto-dismiss
+  viewport <target> [WxH]           Show or set viewport size (e.g. 375x812, 1280x720)
+  upload  <target> <selector> <paths>  Upload file(s) to <input type="file"> (comma-separated paths)
+  text    <target>                  Clean text content (strips scripts/styles/SVG)
+  table   <target> [selector]       Full table data extraction (tab-separated, no row limit)
+  back    <target>                  Navigate back in browser history
+  forward <target>                  Navigate forward in browser history
+  reload  <target>                  Reload current page
+  closetab <target>                 Close a browser tab
+  netlog  <target> [--clear]        Network request log (XHR/Fetch/Document with status + timing)
   evalraw <target> <method> [json]  Send a raw CDP command; returns JSON result
                                     e.g. evalraw <t> "DOM.getDocument" '{}'
   batch <target> <json>             Execute multiple commands in one call (reduces IPC overhead)
@@ -1849,6 +2223,11 @@ Usage: cdp <command> [args]
   open  [url]                       Open a new tab (default: about:blank)
                                     Note: each new tab triggers a fresh "Allow debugging?" prompt
   stop  [target]                    Stop daemon(s)
+
+ACTION FEEDBACK
+  click, clickxy, press (Enter/Escape/Tab), and select automatically wait for DOM
+  to settle and return a perceive diff showing what changed. No need to manually
+  run perceive --diff after these actions.
 
 <target> is a unique targetId prefix from "cdp list". If a prefix is ambiguous,
 use more characters.
@@ -1878,13 +2257,15 @@ DAEMON IPC (for advanced use / scripting)
            or {"id":<number>, "ok":false, "error":"<message>"}
   Commands mirror the CLI: perceive, status, summary, console, snap, eval, shot, elshot,
   fullshot, scanshot, html, nav, net, click, clickxy, hover, type, press, scroll, fill,
-  select, waitfor, loadall, styles, cookies, evalraw, batch, stop. Use evalraw to send arbitrary CDP methods.
+  select, waitfor, loadall, styles, cookies, cookieset, cookiedel, dialog, viewport,
+  upload, text, table, back, forward, reload, closetab, netlog, evalraw, batch, stop.
   The socket disappears after 20 min of inactivity or when the tab closes.
 `;
 
 const NEEDS_TARGET = new Set([
   'snap','snapshot','eval','shot','screenshot','html','nav','navigate',
-  'net','network','click','clickxy','type','press','scroll','hover','waitfor','loadall','fill','select','fullshot','scanshot','styles','cookies','evalraw','status','console','summary','perceive','elshot','batch',
+  'net','network','click','clickxy','type','press','scroll','hover','waitfor','loadall','fill','select','fullshot','scanshot','styles','cookies','cookieset','cookiedel','evalraw','status','console','summary','perceive','elshot','batch','dialog','viewport','upload',
+  'text','table','back','forward','reload','closetab','netlog',
 ]);
 
 async function main() {
@@ -1997,6 +2378,14 @@ async function main() {
     // args: [method, ...jsonParts] — join json parts in case of spaces
     if (!cmdArgs[0]) { console.error('Error: CDP method required'); process.exit(1); }
     if (cmdArgs.length > 2) cmdArgs[1] = cmdArgs.slice(1).join(' ');
+  } else if (cmd === 'cookieset') {
+    if (!cmdArgs[0]) { console.error('Error: cookie string required (e.g. "name=value; domain=.example.com")'); process.exit(1); }
+    cmdArgs[0] = cmdArgs.join(' '); // join in case of spaces in cookie string
+  } else if (cmd === 'cookiedel') {
+    if (!cmdArgs[0]) { console.error('Error: cookie name required'); process.exit(1); }
+  } else if (cmd === 'upload') {
+    if (!cmdArgs[0] || !cmdArgs[1]) { console.error('Error: selector and file path(s) required'); process.exit(1); }
+    // args[0] = selector, args[1] = comma-separated file paths (no join needed)
   } else if (cmd === 'batch') {
     if (!cmdArgs[0]) { console.error('Error: JSON array required'); process.exit(1); }
     cmdArgs[0] = cmdArgs.join(' '); // join in case of spaces in JSON

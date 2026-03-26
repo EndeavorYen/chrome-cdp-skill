@@ -115,14 +115,20 @@ All commands use `scripts/cdp.mjs`. The `<target>` is a **unique** targetId pref
 ### Perceive page (recommended starting point)
 
 ```bash
-scripts/cdp.mjs perceive <target>    # summary + accessibility tree + visual layout metadata
+scripts/cdp.mjs perceive <target>              # full page perception with @ref indices + coordinates
+scripts/cdp.mjs perceive <target> --diff       # show only changes since last perceive
+scripts/cdp.mjs perceive <target> -s "#main"   # scope to CSS selector subtree
+scripts/cdp.mjs perceive <target> -i           # interactive elements only (compact)
+scripts/cdp.mjs perceive <target> -d 3         # limit tree depth to 3
+scripts/cdp.mjs perceive <target> -C           # include non-ARIA clickable elements (@c refs)
 ```
 
 Returns a single **enriched accessibility tree** that combines semantic structure with inline visual annotations:
 - **Page header**: title, URL, viewport size, scroll position, console health, interactive element counts
-- **Enriched AX tree**: semantic roles and labels (from accessibility tree) with **inline layout annotations** on landmark/structural nodes — height, background color, font size, display mode, and viewport visibility (↑above fold / ↓below fold)
-- **Style anomaly hints**: on table cells, annotates non-default background colors, bold text, and unusual text colors compared to column siblings — e.g., `[cell] 70.0%  bg:rgb(255,200,200)  bold`
-- **@ref indices**: every interactive element (link, button, input, etc.) gets an `@1`, `@2`... ref that can be used directly in `click`, `fill`, `hover`, and `elshot` — no CSS selector guessing needed
+- **Enriched AX tree**: semantic roles and labels with **inline layout annotations** — height, background color, font size, display mode, and viewport visibility (↑above fold / ↓below fold)
+- **Style anomaly hints**: on table cells, annotates non-default background colors, bold text, and unusual text colors — e.g., `[cell] 70.0%  bg:rgb(255,200,200)  bold`
+- **@ref indices with coordinates**: every interactive element gets `@1`, `@2`... with bounding rect `(x,y w×h)` — enables spatial understanding without screenshots
+- **Scope/filter flags**: `-s` scopes to a subtree, `-i` shows only interactive elements, `-d N` limits depth — essential for large pages to avoid token bloat
 
 Example output:
 ```
@@ -134,15 +140,15 @@ Console: 2 errors, 1 warning
 [WebArea] Example Store
   [banner]  ↕80px  bg:rgb(26, 26, 46)  ↑above fold
     [navigation] Main Menu
-      [link] Home  @1
-      [link] Products  @2
+      [link] Home  @1  (20,25 60×20)
+      [link] Products  @2  (100,25 80×20)
   [main]  ↕2920px
     [heading] Welcome to Our Store  36px 700
     [img] Hero Banner  ↕400px
     [region] Product Grid  grid  gap:20px
-      [link] Product 1 — $29.99  @3
-      [link] Product 2 — $49.99  @4
-    [button] Add to Cart  @5
+      [link] Product 1 — $29.99  @3  (50,500 200×30)
+      [link] Product 2 — $49.99  @4  (270,500 200×30)
+    [button] Add to Cart  @5  (50,550 120×36)
     [table] Department Health  ↕400px
       [row] header
         [columnheader] Department
@@ -152,12 +158,14 @@ Console: 2 errors, 1 warning
         [cell] 33.3%  bg:rgb(255,235,200)
       ... more rows truncated
   [contentinfo]  ↕160px  bg:rgb(26, 26, 46)  ↓below fold
-    [link] Privacy Policy  @6
+    [link] Privacy Policy  @6  (600,3000 100×16)
 ```
 
-**@refs** are stable within a single perceive session. After navigation or DOM changes, run `perceive` again to refresh refs. Use `perceive --diff` to see only what changed.
+**@refs** are stable within a single perceive session. After navigation or DOM changes, run `perceive` again to refresh refs. The `(x,y w×h)` coordinates give spatial layout without needing a screenshot.
 
-Hierarchy comes from the accessibility tree (always correct). Layout annotations are added to landmark/structural nodes (banner, navigation, main, heading, img, etc.). **Style anomaly hints** are added to table cells that deviate from their column's baseline style — showing background colors, bold text, and text color differences. This is **the most efficient way** to understand a page. Use it before any screenshots.
+**@ref coordinates** enable spatial reasoning: "the Submit button is at (820,450) — bottom-right of the form" without taking a screenshot.
+
+Hierarchy comes from the accessibility tree (always correct). Layout annotations are added to landmark/structural nodes. **Style anomaly hints** are added to table cells that deviate from their column's baseline. This is **the most efficient way** to understand a page. Use it before any screenshots.
 
 ### Perceive diff (track changes)
 
@@ -240,27 +248,149 @@ scripts/cdp.mjs batch <target> '[{"cmd":"click","args":["@3"]},{"cmd":"perceive"
 
 Executes multiple commands in a single IPC call. Returns a JSON array of results. Useful for form-filling workflows where you need to fill multiple fields and verify the result in one round trip.
 
+### Action feedback (automatic)
+
+`click`, `clickxy`, `press` (Enter/Escape/Tab), and `select` **automatically wait for DOM to settle and return a perceive diff**. No need to manually run `perceive --diff` after these actions. Example:
+
+```
+$ cdp click <target> @3
+Clicked <BUTTON> "Submit" (@3)
+---
+Page: Example — https://example.com
+... (perceive diff showing what changed)
+```
+
+This eliminates the observe-act-observe loop and makes agents ~2x more efficient.
+
 ### Other commands
 
 ```bash
 scripts/cdp.mjs html    <target> [selector]   # full page or element HTML
 scripts/cdp.mjs nav     <target> <url>         # navigate and wait for load
 scripts/cdp.mjs net     <target>               # resource timing entries
-scripts/cdp.mjs click   <target> <sel|@ref>    # click element by CSS selector or @ref
-scripts/cdp.mjs clickxy <target> <x> <y>       # click at CSS pixel coords
-scripts/cdp.mjs type    <target> <text>         # Input.insertText at current focus; works in cross-origin iframes unlike eval
-scripts/cdp.mjs press   <target> <key>         # press key (Enter, Tab, Escape, Backspace, Space, Arrow*)
+scripts/cdp.mjs click   <target> <sel|@ref>    # click (auto-returns perceive diff)
+scripts/cdp.mjs clickxy <target> <x> <y>       # click at CSS pixel coords (auto-returns perceive diff)
+scripts/cdp.mjs type    <target> <text>         # Input.insertText at current focus; works in cross-origin iframes
+scripts/cdp.mjs press   <target> <key>         # press key (Enter/Escape/Tab auto-return perceive diff)
 scripts/cdp.mjs scroll  <target> <dir|x,y> [px]  # scroll page (down/up/left/right; default 500px)
 scripts/cdp.mjs loadall <target> <selector> [ms]  # click "load more" until gone (default 1500ms between clicks)
 scripts/cdp.mjs hover   <target> <sel|@ref>          # hover element (triggers :hover, tooltips)
 scripts/cdp.mjs waitfor <target> <selector> [ms]      # wait for element to appear (default 10s)
 scripts/cdp.mjs fill    <target> <sel|@ref> <text>     # clear field + type text (form filling)
-scripts/cdp.mjs select  <target> <selector> <value>    # select <select> option by value
+scripts/cdp.mjs select  <target> <selector> <value>    # select option (auto-returns perceive diff)
 scripts/cdp.mjs styles  <target> <selector>            # computed styles (meaningful props only)
+scripts/cdp.mjs text    <target>                       # clean text content (strips scripts/styles/SVG)
+scripts/cdp.mjs table   <target> [selector]            # full table data (tab-separated, no row limit)
 scripts/cdp.mjs cookies <target>                       # list cookies for current page
+scripts/cdp.mjs cookieset <target> <cookie>            # set cookie: "name=value; domain=.example.com; secure"
+scripts/cdp.mjs cookiedel <target> <name>              # delete cookie by name
+scripts/cdp.mjs dialog  <target> [accept|dismiss]      # show dialog history; set auto-accept or auto-dismiss
+scripts/cdp.mjs viewport <target> [WxH]               # show or set viewport (e.g. 375x812)
+scripts/cdp.mjs upload  <target> <selector> <paths>    # upload file(s) to input[type=file]
+scripts/cdp.mjs back    <target>                       # navigate back in browser history
+scripts/cdp.mjs forward <target>                       # navigate forward in browser history
+scripts/cdp.mjs reload  <target>                       # reload current page
+scripts/cdp.mjs closetab <target>                      # close a browser tab
+scripts/cdp.mjs netlog  <target> [--clear]             # network request log (XHR/Fetch with status + timing)
 scripts/cdp.mjs evalraw <target> <method> [json]  # raw CDP command passthrough
 scripts/cdp.mjs open    [url]                  # open new tab (each triggers Allow prompt)
 scripts/cdp.mjs stop    [target]               # stop daemon(s)
+```
+
+### Dialog handling
+
+The daemon auto-accepts JavaScript dialogs (alert, confirm, prompt) in the background so they don't block automation. Use `dialog` to check history or change behavior.
+
+```bash
+scripts/cdp.mjs dialog <target>              # show recent dialog history
+scripts/cdp.mjs dialog <target> accept       # set auto-accept mode (default)
+scripts/cdp.mjs dialog <target> dismiss      # set auto-dismiss mode
+```
+
+### Viewport emulation
+
+Show or change the viewport size. Useful for testing responsive layouts.
+
+```bash
+scripts/cdp.mjs viewport <target>            # show current viewport size
+scripts/cdp.mjs viewport <target> 375x812    # emulate iPhone viewport
+scripts/cdp.mjs viewport <target> 1280x720   # desktop viewport
+```
+
+Widths ≤ 768px automatically enable mobile emulation mode.
+
+### Cookie management
+
+```bash
+scripts/cdp.mjs cookies   <target>                                    # list all cookies
+scripts/cdp.mjs cookieset <target> "name=value"                       # set simple cookie
+scripts/cdp.mjs cookieset <target> "name=value; domain=.example.com; secure; httponly"  # with attributes
+scripts/cdp.mjs cookiedel <target> session_id                          # delete by name
+```
+
+### File upload
+
+Upload files to `<input type="file">` elements.
+
+```bash
+scripts/cdp.mjs upload <target> "#file-input" /path/to/file.pdf
+scripts/cdp.mjs upload <target> "#file-input" /path/a.jpg,/path/b.jpg   # multiple files (comma-separated)
+```
+
+### Text extraction
+
+```bash
+scripts/cdp.mjs text <target>                 # clean readable text (strips scripts/styles/SVG)
+```
+
+Returns page content as plain text — useful for reading articles, searching for text, or comparing content without AX tree overhead.
+
+### Table data extraction
+
+```bash
+scripts/cdp.mjs table <target>                # all tables on page (tab-separated, no row limit)
+scripts/cdp.mjs table <target> "#data-table"   # specific table by CSS selector
+```
+
+Returns full table data with no row truncation (unlike perceive which caps at 5 rows). Output is tab-separated for easy parsing.
+
+### Browser history navigation
+
+```bash
+scripts/cdp.mjs back    <target>              # go back
+scripts/cdp.mjs forward <target>              # go forward
+scripts/cdp.mjs reload  <target>              # reload current page
+```
+
+### Tab management
+
+```bash
+scripts/cdp.mjs closetab <target>             # close a tab (daemon auto-shuts down)
+```
+
+### Network request log
+
+```bash
+scripts/cdp.mjs netlog <target>               # show captured XHR/Fetch/Document requests
+scripts/cdp.mjs netlog <target> --clear        # clear the log
+```
+
+Tracks XHR, Fetch, and Document requests in the background with status codes, timing, and response sizes. Use for debugging API calls.
+
+### Cursor-interactive elements (`perceive -C`)
+
+```bash
+scripts/cdp.mjs perceive <target> -C          # include non-ARIA clickable elements
+```
+
+Finds elements that are clickable but not exposed via ARIA (e.g., `<div>` with `cursor: pointer`, `onclick` handlers, or `tabindex`). These get `@c1`, `@c2` refs. Modern SPAs often use custom clickable divs that are invisible to the standard AX tree.
+
+### Evaluate JavaScript — async support
+
+`eval` auto-detects `await` and wraps the expression in an async IIFE:
+
+```bash
+scripts/cdp.mjs eval <target> "await fetch('/api/data').then(r => r.json())"
 ```
 
 ## Coordinates
@@ -307,14 +437,30 @@ CSS px = screenshot image px / DPR
 
 ### Form automation
 1. `perceive <target>` — understand form structure and get @refs for fields
-2. `fill <target> @3 "user@example.com"` — fill input by @ref (or CSS selector)
-3. `select <target> "#country" "US"` — select dropdown
-4. `press <target> Enter` — submit
-5. `perceive <target> --diff` — see what changed after submission
-6. Or use `batch` for a single round trip:
+2. `fill <target> @3 "user@example.com"` — fill input by @ref
+3. `fill <target> @5 "password123"` — fill another field
+4. `click <target> @7` — submit (auto-returns perceive diff showing result!)
+5. No need for manual `perceive --diff` — click already includes it
+6. For bulk operations, use `batch`:
    ```bash
-   batch <target> '[{"cmd":"fill","args":["@3","user@example.com"]},{"cmd":"fill","args":["@4","password123"]},{"cmd":"click","args":["@5"]}]'
+   batch <target> '[{"cmd":"fill","args":["@3","user@example.com"]},{"cmd":"fill","args":["@5","pass"]},{"cmd":"click","args":["@7"]}]'
    ```
+
+### Data extraction
+1. `text <target>` — get all readable text (for search or comparison)
+2. `table <target>` — get full table data (no 5-row truncation)
+3. `table <target> "#specific-table"` — extract specific table
+
+### Debugging API calls
+1. `perceive <target>` — check page state
+2. `netlog <target>` — see recent XHR/Fetch requests with status codes
+3. `console <target> --errors` — check for errors
+
+### Responsive testing
+1. `perceive <target>` — baseline at current viewport
+2. `viewport <target> 375x812` — switch to mobile
+3. `perceive <target> --diff` — see what changed in layout
+4. `viewport <target> 1280x720` — switch back to desktop
 
 ### Visual bug investigation
 1. `perceive <target>` — structure + layout positions + style hints
