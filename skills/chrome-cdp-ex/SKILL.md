@@ -30,11 +30,13 @@ Connects to the user's **existing Chrome browser** via CDP WebSocket. No Puppete
 
 ### Observation workflow
 
+> **CRITICAL: Never use `snap`/`snapshot` as your first observation command. Always use `perceive`.**
+
 ```
-1. perceive <target>          ← ALWAYS start here
-   ↓ understand structure, content, layout
-2. snap <target> --full       ← if you need deeper AX tree detail
-   OR elshot <target> <sel>   ← if you need visual verification of ONE element
+1. perceive <target>          ← ALWAYS start here (NOT snap/snapshot!)
+   ↓ understand structure, content, layout, @refs, console health
+2. elshot <target> <sel>      ← if you need visual verification of ONE element
+   OR snap <target> --full    ← ONLY if perceive wasn't enough for AX detail
 3. scanshot <target>          ← ONLY if you need full-page visual verification
 ```
 
@@ -59,6 +61,10 @@ After modifying code or interacting with a page, choose your verification tool b
 - Node.js 22+ (uses built-in WebSocket)
 - **Electron apps**: set `CDP_PORT=<port>` (the app must be launched with `--remote-debugging-port=<port>` or `app.commandLine.appendSwitch('remote-debugging-port', '<port>')`)
 - If your browser's `DevToolsActivePort` is in a non-standard location, set `CDP_PORT_FILE` to its full path
+
+### Electron screenshot notes
+
+Some Electron builds do not respond to `Page.captureScreenshot` (CDP times out). When this happens, the tool automatically tries fallback methods in order: `fromSurface:false` capture, then screencast single-frame grab. You will see `(screenshot fallback)` or `(fallback)` in the output. Once a fallback is established, subsequent screenshots in the same session skip the failing tier — so `scanshot` (multi-segment) won't waste time retrying. If all screenshot methods fail, the error message will suggest using `perceive` instead. For Electron apps, `perceive` always works regardless of screenshot support.
 
 ## Agent Instructions
 
@@ -192,14 +198,18 @@ scripts/cdp.mjs perceive <target> --diff  # show only changes since last perceiv
 
 After performing an action (click, fill, etc.), use `perceive --diff` to see exactly what changed in the page structure. Shows added and removed AX tree lines. Much more token-efficient than a full re-perceive when verifying an action's effect.
 
-### Accessibility tree snapshot
+### Accessibility tree snapshot (advanced — rarely needed)
+
+> **WARNING: Do NOT use `snap`/`snapshot` as your first command.** Always use `perceive` first.
+> `snap` gives only the raw AX tree — no layout, no @refs, no coordinates, no console health, no style hints.
+> Using `snap` instead of `perceive` means you lose 80% of page understanding and cannot use @ref-based interactions.
 
 ```bash
 scripts/cdp.mjs snap <target>          # compact (default) — filters noise
 scripts/cdp.mjs snap <target> --full   # complete AX tree with all nodes
 ```
 
-Use `snap` when you need just the accessibility tree without layout metadata (e.g., when `perceive` has already given you layout context and you need deeper AX detail).
+Use `snap` **only** after `perceive` has already given you layout context and you need deeper AX tree detail for a specific debugging scenario.
 
 ### Element screenshot (targeted visual verification)
 

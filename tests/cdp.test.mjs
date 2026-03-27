@@ -3,13 +3,15 @@
 
 import { describe, it, expect, beforeEach } from 'vitest';
 
-const { __test__: T } = await import('../skills/chrome-cdp/scripts/cdp.mjs');
+const { __test__: T } = await import('../skills/chrome-cdp-ex/scripts/cdp.mjs');
 const {
   RingBuffer, resolvePrefix, getDisplayPrefixLength, sockPath,
   shouldShowAxNode, formatAxNode, orderedAxChildren, isRef,
   validateUrl, parsePerceiveArgs, dialogStr, netlogStr,
   formatPageList, buildPerceiveTree, evalStr, navStr, clickStr, fillStr, waitForStr,
   KEY_MAP, ENRICHED_ROLES, INTERACTIVE_ROLES,
+  captureScreenshot, screencastFallback, snapshotStr,
+  resetScreenshotTier, getScreenshotTier, SCREENSHOT_TIMEOUT,
 } = T;
 
 // =========================================================================
@@ -1631,5 +1633,213 @@ describe('waitForStr --gone', () => {
     const refMap = new Map([[7, 77777]]);
     await expect(waitForStr(cdp, 'sid1', ['--gone', '@7', '500'], refMap))
       .rejects.toThrow(/@7.*still present/);
+  });
+});
+
+// =========================================================================
+// captureScreenshot — multi-tier fallback
+// =========================================================================
+
+describe('captureScreenshot', () => {
+  beforeEach(() => {
+    resetScreenshotTier();
+  });
+
+  it('should return data from Tier 1 (standard captureScreenshot) on success', async () => {
+    const cdp = createMockCDP({
+      'Page.captureScreenshot': () => ({ data: 'base64png-tier1' }),
+    });
+    const result = await captureScreenshot(cdp, 'sid1', { format: 'png' });
+    expect(result.data).toBe('base64png-tier1');
+    expect(result.fallback).toBe(false);
+    expect(getScreenshotTier()).toBe(1); // tier not advanced
+  });
+
+  it('should fall to Tier 2 (fromSurface:false) when Tier 1 times out', async () => {
+    let callCount = 0;
+    const cdp = createMockCDP({
+      'Page.captureScreenshot': (params) => {
+        callCount++;
+        if (!params.fromSurface && params.fromSurface !== undefined) {
+          // Tier 2: fromSurface:false — succeeds
+          return { data: 'base64png-tier2' };
+        }
+        // Tier 1: standard — timeout
+        throw new Error('Timeout: Page.captureScreenshot');
+      },
+    });
+    const result = await captureScreenshot(cdp, 'sid1', { format: 'png' });
+    expect(result.data).toBe('base64png-tier2');
+    expect(result.fallback).toBe(true);
+    expect(getScreenshotTier()).toBe(2); // advanced to tier 2
+    expect(callCount).toBe(2);
+  });
+
+  it('should fall to Tier 3 (screencast) when Tier 1 and 2 both time out', async () => {
+    const cdp = createMockCDP({
+      'Page.captureScreenshot': () => {
+        throw new Error('Timeout: Page.captureScreenshot');
+      },
+      'event:Page.screencastFrame': () => ({ data: 'base64png-tier3', sessionId: 42 }),
+    });
+    const result = await captureScreenshot(cdp, 'sid1', { format: 'png' });
+    expect(result.data).toBe('base64png-tier3');
+    expect(result.fallback).toBe(true);
+    expect(getScreenshotTier()).toBe(3);
+  });
+
+  it('should throw descriptive error when all tiers fail', async () => {
+    const cdp = createMockCDP({
+      'Page.captureScreenshot': () => {
+        throw new Error('Timeout: Page.captureScreenshot');
+      },
+      // No screencast event handler → waitForEvent will reject with timeout
+    });
+    await expect(captureScreenshot(cdp, 'sid1', { format: 'png' }))
+      .rejects.toThrow(/all methods timed out/);
+    expect(getScreenshotTier()).toBe(3);
+  });
+
+  it('should re-throw non-timeout errors from Tier 1 without advancing tier', async () => {
+    const cdp = createMockCDP({
+      'Page.captureScreenshot': () => {
+        throw new Error('Protocol error: Target closed');
+      },
+    });
+    await expect(captureScreenshot(cdp, 'sid1', { format: 'png' }))
+      .rejects.toThrow(/Target closed/);
+    expect(getScreenshotTier()).toBe(1); // not advanced — it was not a timeout
+  });
+
+  it('should pass params (including clip) through to CDP', async () => {
+    const cdp = createMockCDP({
+      'Page.captureScreenshot': (params) => {
+        return { data: JSON.stringify(params) };
+      },
+    });
+    const clip = { x: 10, y: 20, width: 100, height: 50, scale: 1 };
+    const result = await captureScreenshot(cdp, 'sid1', { format: 'png', clip });
+    const passedParams = JSON.parse(result.data);
+    expect(passedParams.clip).toEqual(clip);
+    expect(passedParams.format).toBe('png');
+  });
+
+  // --- Tier caching ---
+
+  it('should skip Tier 1 on second call after Tier 1 timeout (caching)', async () => {
+    let tier1Calls = 0;
+    const cdp = createMockCDP({
+      'Page.captureScreenshot': (params) => {
+        if (params.fromSurface === false) return { data: 'tier2-ok' };
+        tier1Calls++;
+        throw new Error('Timeout: Page.captureScreenshot');
+      },
+    });
+
+    // First call: tries Tier 1, fails, falls to Tier 2
+    await captureScreenshot(cdp, 'sid1', { format: 'png' });
+    expect(tier1Calls).toBe(1);
+
+    // Second call: should skip Tier 1 entirely
+    tier1Calls = 0;
+    await captureScreenshot(cdp, 'sid1', { format: 'png' });
+    expect(tier1Calls).toBe(0); // Tier 1 was NOT attempted
+    expect(getScreenshotTier()).toBe(2);
+  });
+
+  it('should skip Tier 1 and 2 on second call after both timeout (caching)', async () => {
+    let cdpCalls = 0;
+    const cdp = createMockCDP({
+      'Page.captureScreenshot': () => {
+        cdpCalls++;
+        throw new Error('Timeout: Page.captureScreenshot');
+      },
+      'event:Page.screencastFrame': () => ({ data: 'tier3-ok', sessionId: 1 }),
+    });
+
+    // First call: tries Tier 1, 2, then falls to Tier 3
+    await captureScreenshot(cdp, 'sid1', { format: 'png' });
+    expect(cdpCalls).toBe(2); // Tier 1 + Tier 2
+
+    // Second call: should skip directly to Tier 3
+    cdpCalls = 0;
+    await captureScreenshot(cdp, 'sid1', { format: 'png' });
+    expect(cdpCalls).toBe(0); // no captureScreenshot calls at all
+    expect(getScreenshotTier()).toBe(3);
+  });
+});
+
+// =========================================================================
+// screencastFallback
+// =========================================================================
+
+describe('screencastFallback', () => {
+  it('should return frame data on successful screencast', async () => {
+    const cdp = createMockCDP({
+      'event:Page.screencastFrame': () => ({ data: 'screencast-b64', sessionId: 7 }),
+    });
+    const data = await screencastFallback(cdp, 'sid1');
+    expect(data).toBe('screencast-b64');
+    // Verify startScreencast was called
+    expect(cdp.calls.some(c => c.method === 'Page.startScreencast')).toBe(true);
+  });
+
+  it('should call stopScreencast in finally (even on success)', async () => {
+    const cdp = createMockCDP({
+      'event:Page.screencastFrame': () => ({ data: 'ok', sessionId: 1 }),
+    });
+    await screencastFallback(cdp, 'sid1');
+    // stopScreencast is fire-and-forget so it may appear after a microtask
+    await new Promise(r => setTimeout(r, 10));
+    expect(cdp.calls.some(c => c.method === 'Page.stopScreencast')).toBe(true);
+  });
+
+  it('should reject when no screencast frame arrives (timeout)', async () => {
+    const cdp = createMockCDP({
+      // No event:Page.screencastFrame → waitForEvent rejects
+    });
+    await expect(screencastFallback(cdp, 'sid1')).rejects.toThrow();
+  });
+
+  it('should acknowledge frame to prevent screencast stall', async () => {
+    const cdp = createMockCDP({
+      'event:Page.screencastFrame': () => ({ data: 'ok', sessionId: 99 }),
+    });
+    await screencastFallback(cdp, 'sid1');
+    await new Promise(r => setTimeout(r, 10));
+    const ackCall = cdp.calls.find(c => c.method === 'Page.screencastFrameAck');
+    expect(ackCall).toBeDefined();
+    expect(ackCall.params.sessionId).toBe(99);
+  });
+});
+
+// =========================================================================
+// snapshotStr — perceive hint
+// =========================================================================
+
+describe('snapshotStr', () => {
+  it('should append perceive recommendation hint', async () => {
+    const cdp = createMockCDP({
+      'Accessibility.getFullAXTree': () => ({
+        nodes: [
+          { nodeId: '1', role: { value: 'RootWebArea' }, name: { value: 'Test Page' } },
+          { nodeId: '2', parentId: '1', role: { value: 'heading' }, name: { value: 'Hello' } },
+        ],
+      }),
+    });
+    const result = await snapshotStr(cdp, 'sid1', true);
+    expect(result).toContain('[RootWebArea]');
+    expect(result).toContain('[heading] Hello');
+    // Critical: the hint must be present
+    expect(result).toMatch(/perceive/i);
+    expect(result).toMatch(/recommended/i);
+  });
+
+  it('should include hint even for empty AX tree', async () => {
+    const cdp = createMockCDP({
+      'Accessibility.getFullAXTree': () => ({ nodes: [] }),
+    });
+    const result = await snapshotStr(cdp, 'sid1', true);
+    expect(result).toMatch(/perceive/i);
   });
 });

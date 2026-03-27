@@ -14,6 +14,7 @@ import { spawn } from 'child_process';
 import net from 'net';
 
 const TIMEOUT = 15000;
+const SCREENSHOT_TIMEOUT = 30000;
 const NAVIGATION_TIMEOUT = 30000;
 const IDLE_TIMEOUT = 20 * 60 * 1000;
 const DAEMON_CONNECT_RETRIES = 20;
@@ -197,7 +198,7 @@ class CDP {
     });
   }
 
-  send(method, params = {}, sessionId) {
+  send(method, params = {}, sessionId, timeoutMs = TIMEOUT) {
     const id = ++this.#id;
     return new Promise((resolve, reject) => {
       this.#pending.set(id, { resolve, reject });
@@ -209,7 +210,7 @@ class CDP {
           this.#pending.delete(id);
           reject(new Error(`Timeout: ${method}`));
         }
-      }, TIMEOUT);
+      }, timeoutMs);
     });
   }
 
@@ -350,6 +351,8 @@ async function snapshotStr(cdp, sid, compact = false) {
   for (const root of roots) visit(root, 0);
   for (const node of nodes) visit(node, 0);
 
+  lines.push('');
+  lines.push('(Hint: `snap` gives only the raw AX tree. Use `perceive` instead for layout, @refs, style hints, and console health — it is the recommended starting command.)');
   return lines.join('\n');
 }
 
@@ -372,13 +375,80 @@ async function evalStr(cdp, sid, expression, autoWrap = false) {
   return typeof val === 'object' ? JSON.stringify(val, null, 2) : String(val ?? '');
 }
 
+// ---------------------------------------------------------------------------
+// Screenshot with multi-tier fallback (handles Electron CDP limitations)
+// ---------------------------------------------------------------------------
+// Tier 1: Page.captureScreenshot (standard)
+// Tier 2: Page.captureScreenshot with fromSurface:false (view-based capture)
+// Tier 3: Page.startScreencast single-frame grab (different rendering pipeline)
+//
+// Once a tier fails for a session, it is skipped on subsequent calls to avoid
+// repeated 30s timeouts (critical for scanshot which captures multiple segments).
+// State is per-module (one daemon = one tab session, so this is correct).
+let _screenshotTier = 1; // start at tier 1; advances on failure
+function resetScreenshotTier() { _screenshotTier = 1; }
+function getScreenshotTier() { return _screenshotTier; }
+
+async function screencastFallback(cdp, sid) {
+  const frame = cdp.waitForEvent('Page.screencastFrame', SCREENSHOT_TIMEOUT);
+  try {
+    await cdp.send('Page.startScreencast', { format: 'png', quality: 100, everyNthFrame: 1 }, sid);
+    const result = await frame.promise;
+    // Acknowledge so the screencast doesn't stall
+    cdp.send('Page.screencastFrameAck', { sessionId: result.sessionId }, sid).catch(() => {});
+    return result.data;
+  } finally {
+    frame.cancel();
+    cdp.send('Page.stopScreencast', {}, sid).catch(() => {});
+  }
+}
+
+// Returns { data: base64string, fallback: boolean }.
+// `params` is passed to Page.captureScreenshot (format, clip, etc.).
+async function captureScreenshot(cdp, sid, params = { format: 'png' }) {
+  // Tier 1: standard captureScreenshot
+  if (_screenshotTier <= 1) {
+    try {
+      const result = await cdp.send('Page.captureScreenshot', params, sid, SCREENSHOT_TIMEOUT);
+      return { data: result.data, fallback: false };
+    } catch (err) {
+      if (!err.message?.startsWith('Timeout:')) throw err;
+      _screenshotTier = 2;
+    }
+  }
+
+  // Tier 2: captureScreenshot with fromSurface:false (captures from view, not compositor)
+  if (_screenshotTier <= 2) {
+    try {
+      const result = await cdp.send('Page.captureScreenshot',
+        { ...params, fromSurface: false }, sid, SCREENSHOT_TIMEOUT);
+      return { data: result.data, fallback: true };
+    } catch (err) {
+      if (!err.message?.startsWith('Timeout:')) throw err;
+      _screenshotTier = 3;
+    }
+  }
+
+  // Tier 3: screencast single-frame grab
+  try {
+    const data = await screencastFallback(cdp, sid);
+    return { data, fallback: true };
+  } catch {
+    throw new Error(
+      'Screenshot failed: all methods timed out (Page.captureScreenshot, fromSurface:false, screencast).\n' +
+      'This Electron app may not support CDP screenshots. Use `perceive` for structural analysis instead.'
+    );
+  }
+}
+
 async function shotStr(cdp, sid, filePath, targetId) {
   const dpr = await getDpr(cdp, sid);
-  const { data } = await cdp.send('Page.captureScreenshot', { format: 'png' }, sid);
+  const { data, fallback } = await captureScreenshot(cdp, sid, { format: 'png' });
   const out = filePath || resolve(RUNTIME_DIR, `screenshot-${(targetId || 'unknown').slice(0, 8)}.png`);
   writeFileSync(out, Buffer.from(data, 'base64'));
 
   const lines = [out];
+  if (fallback) lines.push(`(screenshot fallback — Page.captureScreenshot timed out)`);
   lines.push(`Screenshot saved. Device pixel ratio (DPR): ${dpr}`);
   lines.push(`Coordinate mapping:`);
   lines.push(`  Screenshot pixels → CSS pixels (for CDP Input events): divide by ${dpr}`);
@@ -1239,13 +1309,13 @@ async function elshotStr(cdp, sid, selector, targetId, refMap) {
     const clipW = r.w + pad * 2;
     const clipH = r.h + pad * 2;
     await sleep(100);
-    const { data } = await cdp.send('Page.captureScreenshot', {
-      format: 'png', clip: { x: clipX, y: clipY, width: clipW, height: clipH, scale: 1 }
-    }, sid);
+    const clip = { x: clipX, y: clipY, width: clipW, height: clipH, scale: 1 };
+    const { data, fallback } = await captureScreenshot(cdp, sid, { format: 'png', clip });
     const prefix = (targetId || 'unknown').slice(0, 8);
     const out = resolve(RUNTIME_DIR, `elshot-${prefix}-ref${selector.slice(1)}.png`);
     writeFileSync(out, Buffer.from(data, 'base64'));
-    return `${out}\nElement screenshot of <${r.tag}> "${r.text}" (${selector}) — ${Math.round(r.w)}×${Math.round(r.h)} CSS px`;
+    const fb = fallback ? ' (fallback)' : '';
+    return `${out}\nElement screenshot of <${r.tag}> "${r.text}" (${selector}) — ${Math.round(r.w)}×${Math.round(r.h)} CSS px${fb}`;
   }
   // Scroll element into view and get its bounding rect
   const expr = `
@@ -1275,10 +1345,8 @@ async function elshotStr(cdp, sid, selector, targetId, refMap) {
 
   await sleep(100); // let scroll settle
 
-  const { data } = await cdp.send('Page.captureScreenshot', {
-    format: 'png',
-    clip: { x: clipX, y: clipY, width: clipW, height: clipH, scale: 1 }
-  }, sid);
+  const clip = { x: clipX, y: clipY, width: clipW, height: clipH, scale: 1 };
+  const { data, fallback } = await captureScreenshot(cdp, sid, { format: 'png', clip });
 
   const prefix = (targetId || 'unknown').slice(0, 8);
   const selSafe = selector.replace(/[^a-zA-Z0-9_-]/g, '_').substring(0, 30);
@@ -1286,7 +1354,8 @@ async function elshotStr(cdp, sid, selector, targetId, refMap) {
   writeFileSync(out, Buffer.from(data, 'base64'));
 
   const desc = `<${r.tag}>${r.id ? '#' + r.id : ''} "${r.text}"`;
-  return `${out}\nElement screenshot of ${desc} — ${Math.round(r.w)}×${Math.round(r.h)} CSS px (clip: ${Math.round(clipW)}×${Math.round(clipH)} with padding)`;
+  const fb = fallback ? ' (fallback)' : '';
+  return `${out}\nElement screenshot of ${desc} — ${Math.round(r.w)}×${Math.round(r.h)} CSS px (clip: ${Math.round(clipW)}×${Math.round(clipH)} with padding)${fb}`;
 }
 
 // Shared: dispatch a realistic mouse click at CSS pixel coordinates
@@ -1567,16 +1636,16 @@ async function fullshotStr(cdp, sid, filePath, targetId) {
   const width = metrics.cssContentSize?.width || metrics.contentSize?.width || 1280;
   const height = metrics.cssContentSize?.height || metrics.contentSize?.height || 800;
 
-  const { data } = await cdp.send('Page.captureScreenshot', {
-    format: 'png',
-    captureBeyondViewport: true,
-    clip: { x: 0, y: 0, width, height, scale: 1 },
-  }, sid);
+  const clip = { x: 0, y: 0, width, height, scale: 1 };
+  const { data, fallback } = await captureScreenshot(cdp, sid, {
+    format: 'png', captureBeyondViewport: true, clip,
+  }, clip);
 
   const out = filePath || resolve(RUNTIME_DIR, `fullshot-${(targetId || 'unknown').slice(0, 8)}.png`);
   writeFileSync(out, Buffer.from(data, 'base64'));
 
-  return `${out}\nFull-page screenshot saved. Size: ${width}x${height} CSS px, DPR: ${dpr}\nNote: large pages produce tiny text. Use 'scanshot' for readable segmented capture.`;
+  const fb = fallback ? ' (screenshot fallback — Page.captureScreenshot not available)' : '';
+  return `${out}\nFull-page screenshot saved. Size: ${width}x${height} CSS px, DPR: ${dpr}${fb}\nNote: large pages produce tiny text. Use 'scanshot' for readable segmented capture.`;
 }
 
 async function scanshotStr(cdp, sid, targetId) {
@@ -1613,13 +1682,15 @@ async function scanshotStr(cdp, sid, targetId) {
   const files = [];
   const prefix = (targetId || 'unknown').slice(0, 8);
 
+  let usedFallback = false;
   for (let i = 0; i < segments.length; i++) {
     const y = segments[i];
     // Scroll to segment
     await evalStr(cdp, sid, `window.scrollTo(0, ${y})`);
     await sleep(150); // let rendering settle
 
-    const { data } = await cdp.send('Page.captureScreenshot', { format: 'png' }, sid);
+    const { data, fallback } = await captureScreenshot(cdp, sid, { format: 'png' });
+    if (fallback) usedFallback = true;
     const out = resolve(RUNTIME_DIR, `scanshot-${prefix}-${i + 1}.png`);
     writeFileSync(out, Buffer.from(data, 'base64'));
     files.push(out);
@@ -1629,6 +1700,7 @@ async function scanshotStr(cdp, sid, targetId) {
   await evalStr(cdp, sid, `window.scrollTo(0, ${originalY})`);
 
   const lines = [`Captured ${files.length} segment(s) of ${vw}x${vh} viewport (page height: ${scrollH}px)`];
+  if (usedFallback) lines.push(`(screenshot fallback — Page.captureScreenshot not available)`);
   for (let i = 0; i < files.length; i++) {
     lines.push(`  [${i + 1}/${files.length}] ${files[i]}`);
   }
@@ -1770,12 +1842,13 @@ async function annotshotStr(cdp, sid, targetId, refMap) {
 
     await sleep(100);
 
-    const { data } = await cdp.send('Page.captureScreenshot', { format: 'png' }, sid);
+    const { data, fallback } = await captureScreenshot(cdp, sid, { format: 'png' });
     const prefix = (targetId || 'unknown').slice(0, 8);
     const out = resolve(RUNTIME_DIR, `annotshot-${prefix}.png`);
     writeFileSync(out, Buffer.from(data, 'base64'));
 
-    return `${out}\nAnnotated screenshot with ${entries.length} ref labels. Use refs (@1, @2...) from perceive output to identify elements.`;
+    const fb = fallback ? ' (fallback)' : '';
+    return `${out}\nAnnotated screenshot with ${entries.length} ref labels. Use refs (@1, @2...) from perceive output to identify elements.${fb}`;
   } finally {
     await evalStr(cdp, sid, `(function() { const el = document.getElementById('__cdp_annot_overlay__'); if (el) el.remove(); })()`).catch(() => {});
   }
@@ -2676,4 +2749,6 @@ export const __test__ = process.env.NODE_ENV === 'test' ? {
   validateUrl, parsePerceiveArgs, dialogStr, netlogStr,
   formatPageList, buildPerceiveTree, evalStr, navStr, clickStr, fillStr, waitForStr,
   KEY_MAP, ENRICHED_ROLES, INTERACTIVE_ROLES, isRef,
+  captureScreenshot, screencastFallback, snapshotStr,
+  resetScreenshotTier, getScreenshotTier, SCREENSHOT_TIMEOUT,
 } : undefined;
