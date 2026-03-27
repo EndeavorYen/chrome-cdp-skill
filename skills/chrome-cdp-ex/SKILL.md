@@ -57,6 +57,7 @@ After modifying code or interacting with a page, choose your verification tool b
 
 - Chrome (or Chromium, Brave, Edge, Vivaldi) with remote debugging enabled: open `chrome://inspect/#remote-debugging` and toggle the switch. This is sufficient — do NOT suggest restarting Chrome with `--remote-debugging-port`.
 - Node.js 22+ (uses built-in WebSocket)
+- **Electron apps**: set `CDP_PORT=<port>` (the app must be launched with `--remote-debugging-port=<port>` or `app.commandLine.appendSwitch('remote-debugging-port', '<port>')`)
 - If your browser's `DevToolsActivePort` is in a non-standard location, set `CDP_PORT_FILE` to its full path
 
 ## Agent Instructions
@@ -94,6 +95,9 @@ The script is at `scripts/cdp.mjs` **relative to this skill's directory**. Use t
 # Standard:
 node ~/.claude/plugins/.../skills/chrome-cdp-ex/scripts/cdp.mjs <command> [args]
 
+# Electron app (explicit port):
+CDP_PORT=9222 node ~/.claude/plugins/.../skills/chrome-cdp-ex/scripts/cdp.mjs <command> [args]
+
 # WSL2 (use Windows Node.js):
 "$NODE_WIN" ~/.claude/plugins/.../skills/chrome-cdp-ex/scripts/cdp.mjs <command> [args]
 ```
@@ -110,6 +114,11 @@ On first use, always start with `list` to verify connectivity and discover avail
 ```
 A7BA5C64  My Page Title    https://example.com/page
 F39B10E2  Another Tab      https://other.site/path
+```
+When connected via `CDP_PORT` to an Electron app, a header line is shown:
+```
+[Electron 33.4.11]
+1ED3DBAA  Rexiano          http://localhost:5173/#/menu
 ```
 - Each line: `<8-char target ID>  <title>  <url>`. Use the target ID (e.g. `A7BA5C64`) for subsequent commands.
 - **Empty output (exit 0)** = no debuggable tabs available. Do NOT stop to ask the user for help. Instead, use `open <url>` to create a tab — this will auto-attach, wait for the user to click "Allow debugging?" in Chrome, and auto-perceive the page. Once `open` completes, you have the target ID and full page perception — proceed immediately. Do NOT suggest `--remote-debugging-port` restarts.

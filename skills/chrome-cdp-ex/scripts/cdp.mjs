@@ -46,7 +46,31 @@ function sockPath(targetId) {
   return `${SOCK_PREFIX}${targetId}.sock`;
 }
 
-function getWsUrl() {
+// Browser metadata from /json/version — set when connecting via CDP_PORT
+let _browserInfo = null;
+
+async function getWsUrl() {
+  const host = process.env.CDP_HOST || '127.0.0.1';
+
+  // CDP_PORT: explicit port (e.g. Electron with --remote-debugging-port=9222)
+  if (process.env.CDP_PORT) {
+    const port = process.env.CDP_PORT;
+    let res;
+    try {
+      res = await fetch(`http://${host}:${port}/json/version`, { signal: AbortSignal.timeout(3000) });
+    } catch {
+      throw new Error(`Cannot reach CDP on ${host}:${port} — is the app running with --remote-debugging-port=${port}?`);
+    }
+    const info = await res.json();
+    if (!info.webSocketDebuggerUrl) throw new Error(`CDP on port ${port}: /json/version has no webSocketDebuggerUrl`);
+    _browserInfo = info;
+    // Extract path only — don't trust the hostname in the response (may be "localhost"
+    // while CDP_HOST points elsewhere, e.g. WSL2→Windows)
+    const wsPath = new URL(info.webSocketDebuggerUrl).pathname;
+    return `ws://${host}:${port}${wsPath}`;
+  }
+
+  // DevToolsActivePort file discovery (Chrome, Edge, Brave, etc.)
   const home = homedir();
   // macOS: ~/Library/Application Support/<name>/DevToolsActivePort
   const macBrowsers = [
@@ -92,10 +116,9 @@ function getWsUrl() {
     ]),
   ].filter(Boolean);
   const portFile = candidates.find(p => existsSync(p));
-  if (!portFile) throw new Error('No DevToolsActivePort found. Enable remote debugging at chrome://inspect/#remote-debugging');
+  if (!portFile) throw new Error('No DevToolsActivePort found and no CDP_PORT set.\n  Chrome: enable at chrome://inspect/#remote-debugging\n  Electron: set CDP_PORT=<port> (app must use --remote-debugging-port)');
   const lines = readFileSync(portFile, 'utf8').trim().split('\n');
   if (lines.length < 2 || !lines[0] || !lines[1]) throw new Error(`Invalid DevToolsActivePort file: ${portFile}`);
-  const host = process.env.CDP_HOST || '127.0.0.1';
   return `ws://${host}:${lines[0]}${lines[1]}`;
 }
 
@@ -243,13 +266,20 @@ async function getPages(cdp) {
   return targetInfos.filter(t => t.type === 'page' && !t.url.startsWith('chrome://') && !t.url.startsWith('edge://'));
 }
 
-function formatPageList(pages) {
+function formatPageList(pages, browserInfo = null) {
+  const lines = [];
+  if (browserInfo) {
+    const ua = browserInfo['User-Agent'] || '';
+    const m = ua.match(/Electron\/([\d.]+)/);
+    if (m) lines.push(`[Electron ${m[1]}]`);
+  }
   const prefixLen = getDisplayPrefixLength(pages.map(p => p.targetId));
-  return pages.map(p => {
+  lines.push(...pages.map(p => {
     const id = p.targetId.slice(0, prefixLen).padEnd(prefixLen);
     const title = p.title.substring(0, 54).padEnd(54);
     return `${id}  ${title}  ${p.url}`;
-  }).join('\n');
+  }));
+  return lines.join('\n');
 }
 
 function shouldShowAxNode(node, compact = false, parentNode = null) {
@@ -1933,7 +1963,7 @@ async function runDaemon(targetId) {
 
   const cdp = new CDP();
   try {
-    await cdp.connect(getWsUrl());
+    await cdp.connect(await getWsUrl());
   } catch (e) {
     process.stderr.write(`Daemon: cannot connect to Chrome: ${e.message}\n`);
     process.exit(1);
@@ -2081,7 +2111,7 @@ async function runDaemon(targetId) {
       switch (cmd) {
         case 'list': {
           const pages = await getPages(cdp);
-          result = formatPageList(pages);
+          result = formatPageList(pages, _browserInfo);
           break;
         }
         case 'list_raw': {
@@ -2141,7 +2171,7 @@ async function runDaemon(targetId) {
         case 'cookies': result = await cookiesStr(cdp, sessionId); break;
         case 'cookieset': result = await cookieSetStr(cdp, sessionId, args[0]); break;
         case 'cookiedel': result = await cookieDelStr(cdp, sessionId, args[0]); break;
-        case 'dialog': result = await dialogStr(dialogBuf, dialogAutoAcceptRef, args[0]); break;
+        case 'dialog': result = dialogStr(dialogBuf, dialogAutoAcceptRef, args[0]); break;
         case 'viewport': {
           result = await viewportStr(cdp, sessionId, args[0]);
           if (args[0]) result = await actionFeedback(result); // auto-diff when resizing
@@ -2488,12 +2518,12 @@ async function main() {
     if (!pages) {
       // No daemon running — connect directly (will trigger one Allow)
       const cdp = new CDP();
-      await cdp.connect(getWsUrl());
+      await cdp.connect(await getWsUrl());
       pages = await getPages(cdp);
       cdp.close();
     }
     writeFileSync(PAGES_CACHE, JSON.stringify(pages), { mode: 0o600 });
-    console.log(formatPageList(pages));
+    console.log(formatPageList(pages, _browserInfo));
     process.stdout.write('', () => process.exit(0));
     return;
   }
@@ -2503,7 +2533,7 @@ async function main() {
     const url = args[0] || 'about:blank';
     if (url !== 'about:blank') validateUrl(url);
     const cdp = new CDP();
-    await cdp.connect(getWsUrl());
+    await cdp.connect(await getWsUrl());
     const { targetId } = await cdp.send('Target.createTarget', { url });
     // Refresh cache; new tab may not appear in getTargets immediately, so add it manually
     const pages = await getPages(cdp);
