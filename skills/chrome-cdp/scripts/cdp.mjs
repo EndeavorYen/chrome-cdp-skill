@@ -18,6 +18,8 @@ const NAVIGATION_TIMEOUT = 30000;
 const IDLE_TIMEOUT = 20 * 60 * 1000;
 const DAEMON_CONNECT_RETRIES = 20;
 const DAEMON_CONNECT_DELAY = 300;
+const DAEMON_ALLOW_RETRIES = 200;  // For open --attach: 200 * 300ms = 60s
+const DAEMON_ALLOW_DELAY = 300;
 const MIN_TARGET_PREFIX_LEN = 8;
 const IS_WINDOWS = process.platform === 'win32';
 if (!IS_WINDOWS) process.umask(0o077);
@@ -2366,7 +2368,39 @@ async function main() {
     cdp.close();
     writeFileSync(PAGES_CACHE, JSON.stringify(pages), { mode: 0o600 });
     console.log(`Opened new tab: ${targetId.slice(0, 8)}  ${url}`);
-    console.log('Note: this tab will need "Allow debugging?" approval on first access.');
+
+    // Auto-attach: start daemon and wait for user to click "Allow debugging?"
+    console.log('Waiting for "Allow debugging?" approval in Chrome... (up to 60s)');
+    const sp = sockPath(targetId);
+    if (!IS_WINDOWS) try { unlinkSync(sp); } catch {}
+    const child = spawn(process.execPath, [process.argv[1], '_daemon', targetId], {
+      detached: true,
+      stdio: 'ignore',
+    });
+    child.unref();
+    let attached = false;
+    for (let i = 0; i < DAEMON_ALLOW_RETRIES; i++) {
+      await sleep(DAEMON_ALLOW_DELAY);
+      try {
+        const conn = await connectToSocket(sp);
+        conn.end();
+        attached = true;
+        break;
+      } catch {}
+    }
+    if (attached) {
+      console.log('Tab ready — debugging approved.');
+      // Auto-perceive: give agent immediate page understanding (matches nav behavior)
+      try {
+        const conn = await connectToSocket(sp);
+        const resp = await sendCommand(conn, { cmd: 'perceive', args: [] });
+        conn.end();
+        if (resp.ok && resp.result) console.log('---\n' + resp.result);
+      } catch {}
+    } else {
+      console.log('Timeout waiting for debugging approval. Tab created but daemon not connected.');
+      console.log('Run a command against this tab to retry.');
+    }
     return;
   }
 

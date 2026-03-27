@@ -105,7 +105,7 @@ A7BA5C64  My Page Title    https://example.com/page
 F39B10E2  Another Tab      https://other.site/path
 ```
 - Each line: `<8-char target ID>  <title>  <url>`. Use the target ID (e.g. `A7BA5C64`) for subsequent commands.
-- **Empty output (exit 0)** = no tabs available. This is normal — either Chrome has no open tabs, or Chrome has not yet approved debugging. Tell the user: "Please open a tab in Chrome and approve the 'Allow debugging' dialog, then I'll retry." Do NOT suggest `--remote-debugging-port` restarts.
+- **Empty output (exit 0)** = no debuggable tabs available. Do NOT stop to ask the user for help. Instead, use `open <url>` to create a tab — this will auto-attach, wait for the user to click "Allow debugging?" in Chrome, and auto-perceive the page. Once `open` completes, you have the target ID and full page perception — proceed immediately. Do NOT suggest `--remote-debugging-port` restarts.
 - **Error output** = connection problem. Check prerequisites.
 
 ## Commands
@@ -315,7 +315,7 @@ scripts/cdp.mjs reload  <target>                       # reload current page
 scripts/cdp.mjs closetab <target>                      # close a browser tab
 scripts/cdp.mjs netlog  <target> [--clear]             # network request log (XHR/Fetch with status + timing)
 scripts/cdp.mjs evalraw <target> <method> [json]  # raw CDP command passthrough
-scripts/cdp.mjs open    [url]                  # open new tab — AVOID: triggers Chrome "Allow debugging?" prompt. Prefer nav instead
+scripts/cdp.mjs open    [url]                  # open new tab + auto-attach + auto-perceive (waits up to 60s for approval)
 scripts/cdp.mjs stop    [target]               # stop daemon(s)
 ```
 
@@ -429,8 +429,8 @@ CSS px = screenshot image px / DPR
 
 ## Tips
 
-- **Prefer `nav` over `open`** — `open` creates a new tab that requires Chrome's "Allow debugging?" approval (user must click). `nav` reuses an already-approved tab — **no prompt, no waiting**. Only use `open` when the user explicitly needs multiple tabs open simultaneously.
-- After `open`, use the returned target ID directly (e.g. `Opened new tab: A7BA5C64`) — no need for another `list` call.
+- **Prefer `nav` over `open`** — `nav` reuses an already-approved tab (no prompt, no "Allow debugging?" dialog). Use `open` only when `list` is empty or the user explicitly needs multiple tabs. Even page comparisons work with a single tab — `nav` between URLs and compare perceive data from context.
+- `open` **auto-attaches + auto-perceives** — it waits up to 60s for Chrome's "Allow debugging?" approval, then returns the full page perception (same as `nav`). Do NOT stop to ask the user; just let the command run. After `open`, you have the target ID and page content — proceed immediately.
 - Prefer `snap` over `html` for page structure — compact by default, use `snap --full` for complete tree.
 - Prefer `elshot` over `shot` when verifying a specific element — it's more reliable and avoids scroll/DPR issues.
 - Use `type` (not eval) to enter text in cross-origin iframes — `click`/`clickxy` to focus first, then `type`.
@@ -455,9 +455,9 @@ CSS px = screenshot image px / DPR
    scripts/cdp.mjs nav <target> <url>         # navigates + auto-perceives
    ```
 
-3. **Only use `open` when the user needs multiple tabs** open at the same time (e.g. comparing two pages side by side). Each `open` triggers Chrome's "Allow debugging?" dialog which requires user interaction.
+3. **Only use `open`** when `list` returned empty (no tabs at all), or the user explicitly needs simultaneous tab access. For comparing pages, use `nav` to switch between URLs in a single tab — perceive data stays in your context.
 
-> **Why this matters:** `nav` reuses an already-approved debugging session — instant, no user interaction needed. `open` creates a brand new tab that Chrome hasn't approved for debugging yet, forcing the user to click "Allow" every time. For most workflows, `nav` is strictly better.
+> **Why this matters:** Each tab costs one "Allow debugging?" dialog. `nav` reuses the approved session — zero dialogs. Three-site comparison via `open` + `nav` + `nav` = 1 dialog total. Three `open` commands = 3 dialogs. Always minimize tabs.
 
 ### Understanding a page (default workflow)
 1. `perceive <target>` — structure + layout + console health + style anomalies + @refs
@@ -466,11 +466,20 @@ CSS px = screenshot image px / DPR
 4. If needed: `snap <target> --full` — deeper accessibility tree detail
 
 ### Comparing pages or evaluating design quality
-1. `perceive` **both** pages — compare structure, layout, style hints (colors, bold, font sizes)
-2. `elshot` **specific sections** only if perceive shows identical structure but you need subjective aesthetic comparison
-3. Analyze from perceive data: content hierarchy, data density, style anomalies, layout organization
-4. **DO NOT use `shot` + `scroll`** to manually scan pages — that's just slow scanshot
-5. **DO NOT use `scanshot`** for comparisons — `elshot` on 3-4 key sections per page gives better targeted comparison
+
+**Use a single tab + `nav`** — perceive output is text in your context, so you don't need both pages open simultaneously. This avoids extra "Allow debugging?" approvals.
+
+1. `nav <target> <url-A>` — auto-returns full perceive of page A (save this in context)
+2. Optionally: `elshot <target> @ref` — capture key visual sections of page A
+3. `nav <target> <url-B>` — auto-returns full perceive of page B
+4. Optionally: `elshot <target> @ref` — capture matching sections of page B
+5. Compare the two perceive outputs + elshots from context
+
+**Only open a second tab** if you need to interact with both pages at the same time (e.g., real-time state comparison, copying data between pages).
+
+- Analyze from perceive data: content hierarchy, data density, style anomalies, layout organization
+- **DO NOT use `shot` + `scroll`** to manually scan pages — that's just slow scanshot
+- **DO NOT use `scanshot`** for comparisons — `elshot` on 3-4 key sections per page gives better targeted comparison
 
 ### Debugging a broken page
 1. `perceive <target>` — structure + console errors + style anomalies in one call
