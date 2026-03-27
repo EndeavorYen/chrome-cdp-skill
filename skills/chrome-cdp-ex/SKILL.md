@@ -1,11 +1,11 @@
 ---
-name: chrome-cdp
+name: chrome-cdp-ex
 description: "Your EYES into the user's live Chrome browser. This skill lets you SEE and INTERACT with the user's actual browser — their open tabs, logged-in sessions, and live page state. You MUST use this whenever the user's request involves browser content in ANY way.\n\nTRIGGER THIS SKILL when the user:\n- References pages they have open: '我開了頁面', 'I have X open', '瀏覽器上的', 'my tabs'\n- Asks you to look at, compare, or analyze anything in their browser: '比較頁面', '哪個比較好', '看看這個頁面', 'compare these pages', 'which looks better'\n- Mentions UI/visual analysis of live pages: 'dashboard', '設計品質', 'UI', 'layout', '好不好看', 'design quality'\n- Asks for screenshots or page inspection: 截圖, screenshot, inspect, debug, check the page\n- Refers to 'the page', 'the browser', 'my tab', '網頁', '頁面' in any context\n- Mentions console errors, page state, or anything requiring browser access\n\nCRITICAL: NEVER say '我無法看到你的瀏覽器' or ask users to paste screenshots. You CAN see their browser through this skill. Use `list` to discover open tabs, then `perceive` or `shot`/`scanshot` to see page content.\n\nDo NOT use Playwright — it launches an isolated browser without the user's login state, cookies, or open tabs."
 ---
 
 # Chrome CDP
 
-## When invoked directly (`/chrome-cdp`)
+## When invoked directly (`/chrome-cdp-ex`)
 
 **Take action immediately — do not just read this document.**
 
@@ -92,10 +92,10 @@ When running inside WSL2 and controlling a browser on the Windows host:
 The script is at `scripts/cdp.mjs` **relative to this skill's directory**. Use the full absolute path when invoking:
 ```bash
 # Standard:
-node ~/.claude/plugins/.../skills/chrome-cdp/scripts/cdp.mjs <command> [args]
+node ~/.claude/plugins/.../skills/chrome-cdp-ex/scripts/cdp.mjs <command> [args]
 
 # WSL2 (use Windows Node.js):
-"$NODE_WIN" ~/.claude/plugins/.../skills/chrome-cdp/scripts/cdp.mjs <command> [args]
+"$NODE_WIN" ~/.claude/plugins/.../skills/chrome-cdp-ex/scripts/cdp.mjs <command> [args]
 ```
 
 **WSL2 efficiency tip**: Shell state doesn't persist between Bash calls. To avoid redefining `NODE_WIN` and `CDP` every time, **chain commands with `&&`** in a single Bash call:

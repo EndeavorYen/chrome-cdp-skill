@@ -1,5 +1,5 @@
 {
-  "name": "chrome-cdp",
+  "name": "chrome-cdp-ex",
   "version": "2.1.0",
   "description": "Give your AI agent eyes and hands on your live Chrome browser — screenshots, DOM inspection, form automation, console monitoring, all via CDP",
   "author": {
