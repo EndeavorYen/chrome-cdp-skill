@@ -1,5 +1,28 @@
 # Changelog
 
+## v2.2.0
+
+Two new commands: **Operational** (`inject`) and **Cognitive** (`cascade`). 44 commands total.
+
+### New commands
+
+- **`inject <target> --css|--css-file|--js-file|--remove`** — Live CSS/JS injection with tracking and removal. Each injection gets a `data-cdp-inject` ID for targeted cleanup. Validates URLs via `validateUrl` to prevent SSRF. Eliminates the repetitive `eval` boilerplate for frontend development.
+- **`cascade <target> <selector|@ref> [property]`** — CSS origin tracing via `CSS.getMatchedStylesForNode`. Shows the full cascade: which rule won, which were overridden, source file + line number, and inherited properties. Includes inline `style=""` attributes (highest specificity). Answers "which file do I edit to change this style?" in one command.
+
+### Improvements
+
+- **Extracted `perceivePageScript()`** — the 190-line browser-side JS for `perceive` is now a named, testable function instead of an inline template literal.
+- **Optimized cursor-interactive scan** — `perceive -C` uses targeted CSS selectors instead of `querySelectorAll('*')`, reducing `getComputedStyle` calls on large pages.
+- **`_screenshotTier` reset** — screenshot fallback tier now resets per daemon session, preventing cross-target state leaks.
+- **Organized `__test__` exports** — grouped by category with comments; removed duplicate `isRef` export.
+- **`CSS.enable`** added to daemon initialization for `cascade` support.
+- **SKILL.md** — four-tier perception model (added Temporal tier for future `record` command), decision tables for when to use `record` vs `perceive --diff`.
+
+### Tests
+
+- 163 → 195 tests (+32)
+- New: `perceivePageScript` (5), `buildPerceiveTree` integration (6), `injectStr` (9+3 security), `cascadeStr` (8+1 inline style)
+
 ## v2.1.0
 
 This release consolidates all enhancements since the fork merge into a single version. 42 commands total (14 from upstream, 28 added).

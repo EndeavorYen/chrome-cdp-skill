@@ -2028,6 +2028,219 @@ async function reloadStr(cdp, sid) {
   return 'Page reloaded';
 }
 
+// --- Inject: live CSS/JS injection with tracking ---
+async function injectStr(cdp, sid, args) {
+  const type = args[0];
+  const content = args.slice(1).join(' ');
+
+  if (type === '--remove') {
+    const selector = content
+      ? `[data-cdp-inject="${content}"]`
+      : '[data-cdp-inject]';
+    return evalStr(cdp, sid, `(() => {
+      const els = document.querySelectorAll(${JSON.stringify(selector)});
+      els.forEach(el => el.remove());
+      return els.length + ' element(s) removed';
+    })()`);
+  }
+
+  if (type === '--css') {
+    if (!content) throw new Error('CSS text required: inject --css "body { background: red }"');
+    return evalStr(cdp, sid, `(() => {
+      const id = 'inject-' + (document.querySelectorAll('[data-cdp-inject]').length + 1);
+      const s = document.createElement('style');
+      s.setAttribute('data-cdp-inject', id);
+      s.textContent = ${JSON.stringify(content)};
+      document.head.appendChild(s);
+      return id;
+    })()`);
+  }
+
+  if (type === '--css-file') {
+    if (!content) throw new Error('URL required: inject --css-file https://example.com/style.css');
+    validateUrl(content);
+    return evalStr(cdp, sid, `new Promise((resolve, reject) => {
+      const id = 'inject-' + (document.querySelectorAll('[data-cdp-inject]').length + 1);
+      const link = document.createElement('link');
+      link.rel = 'stylesheet';
+      link.href = ${JSON.stringify(content)};
+      link.setAttribute('data-cdp-inject', id);
+      link.onload = () => resolve(id);
+      link.onerror = () => reject(new Error('Failed to load stylesheet: ' + ${JSON.stringify(content)}));
+      document.head.appendChild(link);
+    })`);
+  }
+
+  if (type === '--js-file') {
+    if (!content) throw new Error('URL required: inject --js-file https://example.com/lib.js');
+    validateUrl(content);
+    return evalStr(cdp, sid, `new Promise((resolve, reject) => {
+      const id = 'inject-' + (document.querySelectorAll('[data-cdp-inject]').length + 1);
+      const s = document.createElement('script');
+      s.src = ${JSON.stringify(content)};
+      s.setAttribute('data-cdp-inject', id);
+      s.onload = () => resolve(id);
+      s.onerror = () => reject(new Error('Failed to load script: ' + ${JSON.stringify(content)}));
+      document.head.appendChild(s);
+    })`);
+  }
+
+  throw new Error('inject requires --css, --css-file, --js-file, or --remove\n  inject --css "body { color: red }"   inject inline CSS\n  inject --css-file <url>              load external stylesheet\n  inject --js-file <url>               load external script\n  inject --remove [id]                 remove injected element(s)');
+}
+
+// --- Cascade: CSS origin tracing via CSS.getMatchedStylesForNode ---
+const INHERITABLE_PROPS = new Set([
+  'color', 'font-family', 'font-size', 'font-weight', 'font-style',
+  'line-height', 'letter-spacing', 'text-align', 'text-indent',
+  'text-transform', 'white-space', 'word-spacing', 'visibility',
+  'cursor', 'direction', 'list-style',
+]);
+
+async function cascadeStr(cdp, sid, selector, property, refMap) {
+  if (!selector) throw new Error('CSS selector or @ref required');
+
+  // Resolve element to DOM nodeId
+  let nodeId;
+  if (isRef(selector)) {
+    const num = parseInt(selector.slice(1));
+    const backendNodeId = refMap.get(num);
+    if (!backendNodeId) throw new Error(`Unknown ref: ${selector}. Run "perceive" first.`);
+    const { nodeIds } = await cdp.send('DOM.pushNodesByBackendIdsToFrontend',
+      { backendNodeIds: [backendNodeId] }, sid);
+    nodeId = nodeIds[0];
+  } else {
+    const { root } = await cdp.send('DOM.getDocument', {}, sid);
+    const result = await cdp.send('DOM.querySelector',
+      { nodeId: root.nodeId, selector }, sid);
+    if (!result.nodeId) throw new Error('Element not found: ' + selector);
+    nodeId = result.nodeId;
+  }
+
+  // Get matched styles + computed style in parallel
+  const [matched, computed] = await Promise.all([
+    cdp.send('CSS.getMatchedStylesForNode', { nodeId }, sid),
+    cdp.send('CSS.getComputedStyleForNode', { nodeId }, sid),
+  ]);
+
+  // Build computed value lookup
+  const computedMap = new Map();
+  for (const c of computed.computedStyle || []) {
+    computedMap.set(c.name, c.value);
+  }
+
+  // Collect rules by property
+  const propRules = new Map();
+  for (const match of matched.matchedCSSRules || []) {
+    const rule = match.rule;
+    const selectorText = rule.selectorList?.text || '?';
+    const origin = rule.origin; // 'regular', 'user-agent', 'injected', 'inspector'
+    // Source location — styleSheetId lives on style object in CDP
+    let source = 'user-agent stylesheet';
+    const sheetId = rule.style?.styleSheetId;
+    if (origin !== 'user-agent' && sheetId) {
+      const range = rule.style.range;
+      const line = range ? `:${range.startLine + 1}` : '';
+      source = sheetId + line;
+    } else if (origin === 'regular' && !sheetId) {
+      source = 'inline style';
+    }
+
+    for (const prop of rule.style?.cssProperties || []) {
+      if (prop.disabled || !prop.value) continue;
+      if (prop.name.startsWith('-webkit-') || prop.name.startsWith('-moz-')) continue;
+      if (property && prop.name !== property) continue;
+      if (!propRules.has(prop.name)) propRules.set(prop.name, []);
+      propRules.get(prop.name).push({
+        value: prop.value,
+        selector: selectorText,
+        source,
+        origin,
+      });
+    }
+  }
+
+  // Inline styles (highest specificity — style="" attribute)
+  for (const prop of matched.inlineStyle?.cssProperties || []) {
+    if (prop.disabled || !prop.value) continue;
+    if (prop.name.startsWith('-webkit-') || prop.name.startsWith('-moz-')) continue;
+    if (property && prop.name !== property) continue;
+    if (!propRules.has(prop.name)) propRules.set(prop.name, []);
+    // Insert at the beginning — inline styles win over everything
+    propRules.get(prop.name).unshift({
+      value: prop.value,
+      selector: '[inline]',
+      source: 'inline style attribute',
+      origin: 'inline',
+    });
+  }
+
+  const hasInherited = (matched.inherited || []).some(inh =>
+    inh.matchedCSSRules?.some(m =>
+      m.rule.style?.cssProperties?.some(p => !p.disabled && p.value && INHERITABLE_PROPS.has(p.name))));
+
+  if (propRules.size === 0 && !hasInherited && !property) {
+    return 'No matching CSS rules found for this element';
+  }
+  if (propRules.size === 0 && !hasInherited && property) {
+    const computed = computedMap.get(property);
+    return computed
+      ? `${property}: ${computed} (computed, no explicit rule found)`
+      : `Property "${property}" not found on this element`;
+  }
+
+  // Format output
+  const lines = [];
+  for (const [prop, rules] of propRules) {
+    const computedVal = computedMap.get(prop);
+    if (!computedVal) continue;
+
+    lines.push(`${prop}: ${computedVal}`);
+    for (const r of rules) {
+      const isWinner = r.value.trim() === computedVal.trim();
+      const mark = isWinner ? '✓' : '✗';
+      const note = isWinner ? '' : '  [overridden]';
+      lines.push(`  ${mark} ${r.selector} { ${prop}: ${r.value} }${note}`);
+      lines.push(`    → ${r.source}`);
+    }
+    lines.push('');
+  }
+
+  // Inherited properties
+  const inherited = matched.inherited || [];
+  const inheritedLines = [];
+  for (const inh of inherited) {
+    for (const match of inh.matchedCSSRules || []) {
+      const rule = match.rule;
+      for (const prop of rule.style?.cssProperties || []) {
+        if (prop.disabled || !prop.value) continue;
+        if (!INHERITABLE_PROPS.has(prop.name)) continue;
+        if (property && prop.name !== property) continue;
+        const selectorText = rule.selectorList?.text || '?';
+        let source = 'user-agent stylesheet';
+        const inhSheetId = rule.style?.styleSheetId;
+        if (rule.origin !== 'user-agent' && inhSheetId) {
+          const range = rule.style.range;
+          source = inhSheetId + (range ? `:${range.startLine + 1}` : '');
+        }
+        inheritedLines.push(`  ${prop.name}: ${prop.value}  ← ${selectorText}  → ${source}`);
+      }
+    }
+  }
+  if (inheritedLines.length > 0) {
+    lines.push('Inherited:');
+    // Deduplicate (same property may appear from multiple ancestors)
+    const seen = new Set();
+    for (const l of inheritedLines) {
+      const key = l.split('←')[0].trim();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      lines.push(l);
+    }
+  }
+
+  return lines.join('\n').trim() || 'No matching CSS rules found';
+}
+
 // --- Tab close ---
 async function closetabStr(cdp, targetId) {
   await cdp.send('Target.closeTarget', { targetId });
@@ -2076,6 +2289,7 @@ async function runDaemon(targetId) {
   try { await cdp.send('Runtime.enable', {}, sessionId); } catch {}
   try { await cdp.send('Page.enable', {}, sessionId); } catch {}
   try { await cdp.send('DOM.enable', {}, sessionId); } catch {}
+  try { await cdp.send('CSS.enable', {}, sessionId); } catch {}
   try { await cdp.send('Network.enable', {}, sessionId); } catch {}
 
   cdp.onEvent('Runtime.consoleAPICalled', (params) => {
@@ -2266,6 +2480,8 @@ async function runDaemon(targetId) {
         case 'reload': result = await reloadStr(cdp, sessionId); break;
         case 'closetab': result = await closetabStr(cdp, targetId); break;
         case 'netlog': result = netlogStr(netReqBuf, args[0]); break;
+        case 'inject': result = await injectStr(cdp, sessionId, args); break;
+        case 'cascade': result = await cascadeStr(cdp, sessionId, args[0], args[1], refMap); break;
         case 'evalraw': result = await evalRawStr(cdp, sessionId, args[0], args[1]); break;
         case 'batch': {
           let commands;
@@ -2520,6 +2736,13 @@ Usage: cdp <command> [args]
   reload  <target>                  Reload current page
   closetab <target>                 Close a browser tab
   netlog  <target> [--clear]        Network request log (XHR/Fetch/Document with status + timing)
+  inject <target> <flag> [content]   Live CSS/JS injection with tracking and removal
+                                    --css "<text>"   Inject inline <style>
+                                    --css-file <url> Inject <link rel="stylesheet">
+                                    --js-file <url>  Inject <script src> and wait for load
+                                    --remove [id]    Remove injected element(s) (all, or by id)
+  cascade <target> <sel|@ref> [prop] CSS origin tracing — shows which rules apply, source file + line
+                                    Optional: filter to one property (e.g. "background-color")
   evalraw <target> <method> [json]  Send a raw CDP command; returns JSON result
                                     e.g. evalraw <t> "DOM.getDocument" '{}'
   batch <target> <cmds> [--parallel] Execute multiple commands in one call (reduces IPC overhead)
@@ -2565,7 +2788,8 @@ DAEMON IPC (for advanced use / scripting)
   Commands mirror the CLI: perceive, status, summary, console, snap, eval, shot, elshot,
   fullshot, scanshot, html, nav, net, click, clickxy, hover, type, press, scroll, fill,
   select, waitfor, loadall, styles, cookies, cookieset, cookiedel, dialog, viewport,
-  upload, text, table, back, forward, reload, closetab, netlog, evalraw, batch, stop.
+  upload, text, table, back, forward, reload, closetab, netlog, inject, cascade,
+  evalraw, batch, stop.
   The socket disappears after 20 min of inactivity or when the tab closes.
 `;
 
@@ -2573,6 +2797,7 @@ const NEEDS_TARGET = new Set([
   'snap','snapshot','eval','shot','screenshot','html','nav','navigate',
   'net','network','click','clickxy','type','press','scroll','hover','waitfor','loadall','fill','select','fullshot','scanshot','styles','cookies','cookieset','cookiedel','evalraw','status','console','summary','perceive','elshot','batch','dialog','viewport','upload',
   'text','table','back','forward','reload','closetab','netlog',
+  'inject','cascade',
 ]);
 
 async function main() {
@@ -2761,7 +2986,7 @@ export const __test__ = process.env.NODE_ENV === 'test' ? {
   // Perceive & snapshot
   parsePerceiveArgs, buildPerceiveTree, perceivePageScript,
   // Command implementations
-  formatPageList, dialogStr, netlogStr,
+  formatPageList, dialogStr, netlogStr, injectStr, cascadeStr,
   evalStr, navStr, clickStr, fillStr, waitForStr, snapshotStr,
   // Screenshot
   captureScreenshot, screencastFallback,

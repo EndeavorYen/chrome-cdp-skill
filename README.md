@@ -1,6 +1,6 @@
 # chrome-cdp-ex
 
-[![42 Commands](https://img.shields.io/badge/commands-42-orange)](skills/chrome-cdp-ex/scripts/cdp.mjs)
+[![44 Commands](https://img.shields.io/badge/commands-44-orange)](skills/chrome-cdp-ex/scripts/cdp.mjs)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0-blue)](skills/chrome-cdp-ex/scripts/cdp.mjs)
 [![Node 22+](https://img.shields.io/badge/node-22%2B-brightgreen)](https://nodejs.org)
 [![MIT License](https://img.shields.io/badge/license-MIT-gray)](LICENSE)
@@ -11,7 +11,9 @@
 ## Why this exists
 
 - **Perceive-first workflow:** one call gives structure, layout, styles, coordinates, and console health.
+- **CSS origin tracing:** `cascade` tells the agent exactly which file and line to edit — not just what the style is, but where it comes from.
 - **Low round-trip cost:** understand in 1 call, act in 1 call, verify automatically.
+- **Live prototyping:** `inject` CSS/JS into the page, test changes visually, remove when done — no dev server restart.
 - **Real-session automation:** no separate Chromium profile unless you want one.
 - **Production-ready ergonomics:** daemon-per-tab, background event collection, WSL2-to-Windows support, Electron support.
 
@@ -20,7 +22,7 @@
 - [The Redesign Experiment](#the-redesign-experiment)
 - [Quick Start](#quick-start)
 - [How It Works](#how-it-works)
-- [Commands (42 total)](#commands-42-total)
+- [Commands (44 total)](#commands-44-total)
 - [WSL2 -> Windows Browser Control](#wsl2---windows-browser-control)
 - [Credits](#credits)
 - [License](#license)
@@ -46,11 +48,13 @@ The agent using `perceive` (layout + colors + spacing + coordinates) produced th
 | **Calls to act and verify** | **1** (auto feedback) | 2+ (act + re-snapshot) | 2+ (act + re-snapshot) |
 | **`@ref` with coordinates** | **Yes** - `@3 (200,350 200x30)` | No - `ref=e376` (ID only) | No |
 | **Your real browser session** | **Yes** - tabs, cookies, logins | No - isolated Chromium | Varies |
+| **CSS origin tracing** | **Yes** - `cascade` shows file:line | No | No |
+| **Live CSS/JS injection** | **Yes** - `inject` with tracking + removal | No (page.evaluate only) | No |
 | **Background event collection** | **Yes** - console, errors, navigations | Only while connected | No |
 | **Electron app support** | **Yes** - `CDP_PORT=9222` | No | No |
 | **WSL2 -> Windows** | **Yes** - built-in | No | No |
 | **Dependencies** | **0** | Playwright + Chromium binary | Varies |
-| **Commands** | **42** | N/A (programmatic API) | ~14 |
+| **Commands** | **44** | N/A (programmatic API) | ~14 |
 
 ## One command, complete page understanding
 
@@ -74,6 +78,31 @@ Console: 2 errors | Interactive: 12 a, 3 button, 2 input
 Structure. Layout. Styles. Scroll position. Console health. Interactive counts.
 Each `@ref` includes bounding coordinates, all in about **~800 tokens**.
 
+## "Which file do I edit to change this blue?"
+
+Other tools can tell an agent *what* the page looks like. Only `cascade` tells it *why*:
+
+```text
+$ cdp cascade abc1 @4 background-color
+
+background-color: #2563eb
+  ✓ .btn-primary { background-color: #2563eb }
+    → src/styles/components.css:142
+  ✗ button { background-color: #e5e7eb }  [overridden]
+    → src/styles/base.css:28
+```
+
+One command. Source file. Line number. Full cascade. The agent can now go directly to `components.css:142` and make the change — no guessing, no grepping through stylesheets.
+
+Pair it with `inject` for live prototyping:
+
+```text
+$ cdp inject abc1 --css ".btn-primary { background: #dc2626 }"
+inject-1
+
+$ cdp inject abc1 --remove inject-1    # undo when done
+```
+
 ## Why agents choose this
 
 ```mermaid
@@ -82,13 +111,16 @@ sequenceDiagram
     participant Chrome
 
     Agent->>Chrome: perceive
-    Chrome-->>Agent: AX tree + layout + styles + @refs with coordinates<br/>+ console health + interactive counts
+    Chrome-->>Agent: AX tree + layout + @refs with coordinates<br/>+ console health + interactive counts
+
+    Agent->>Chrome: cascade @4 background-color
+    Chrome-->>Agent: ✓ .btn-primary → components.css:142<br/>✗ button → base.css:28 [overridden]
 
     Agent->>Chrome: click @4
     Chrome-->>Agent: △ [dialog] "Submitted successfully"<br/>△ @4 [button] → disabled
 ```
 
-**One call to understand. One call to act. Zero extra calls to verify.**
+**One call to understand. One call to trace CSS origin. One call to act. Zero extra calls to verify.**
 Action feedback is automatic.
 
 ## Quick start
@@ -153,7 +185,7 @@ Output:
 1ED3DBAA  My App                                                  http://localhost:5173/#/menu
 ```
 
-All 42 commands work: `perceive`, `click`, `fill`, `shot`, and more.
+All 44 commands work: `perceive`, `click`, `fill`, `cascade`, `inject`, and more.
 
 </details>
 
@@ -196,7 +228,7 @@ Each tab gets its own daemon process that keeps the CDP session open.
 Chrome's "Allow debugging" dialog appears **once per tab**, not once per command.
 Daemons auto-exit after 20 minutes of inactivity and passively collect console/exception/navigation events into ring buffers.
 
-## Commands (42 total)
+## Commands (44 total)
 
 Tip: start with `perceive`, then use `click`/`fill`/`select`; use `status` or `console` when you need debugging context.
 
@@ -290,6 +322,24 @@ forward  <target>                   # navigate forward
 reload   <target>                   # reload current page
 viewport <target> [WxH]             # show or set viewport size (e.g. 375x812)
 ```
+
+</details>
+
+<details>
+<summary><strong>Frontend Development</strong> (v2.2.0)</summary>
+
+```bash
+inject  <target> --css "<text>"     # inject inline <style> with tracking
+inject  <target> --css-file <url>   # inject <link rel="stylesheet">
+inject  <target> --js-file <url>    # inject <script src> and wait for load
+inject  <target> --remove [id]      # remove injected element(s) — all or by id
+cascade <target> <sel|@ref>         # CSS origin tracing: full cascade with source file + line
+cascade <target> <sel|@ref> <prop>  # filter to one property (e.g. "background-color")
+```
+
+`inject` returns an ID (`inject-1`, `inject-2`...) for targeted removal. URLs are validated (blocks `data:`, `file:`, cloud metadata).
+
+`cascade` shows which CSS rule won, which were overridden, inline styles, and inherited properties — with source locations. Answers "which file do I edit?" in one call.
 
 </details>
 

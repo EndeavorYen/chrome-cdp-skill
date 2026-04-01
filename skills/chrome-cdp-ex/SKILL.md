@@ -18,15 +18,16 @@ Connects to the user's **existing Chrome browser** via CDP WebSocket. No Puppete
 
 ## Observation Strategy — Perceive First, Screenshot Last
 
-> **Three-tier perception model:**
+> **Four-tier perception model:**
 >
 > | Tier | Command | When to use | Output |
 > |------|---------|-------------|--------|
 > | 1. **Perceive** | `perceive` | **Default starting point** for any page inspection | AX tree + layout + style hints (~200-400 tokens) |
 > | 2. **Targeted visual** | `elshot <selector>` | Verify visual rendering of a **specific element** | Clipped PNG of one element |
 > | 3. **Full visual** | `scanshot` | Last resort — pixel-level audit of **entire page** | Multiple viewport-sized PNGs (expensive!) |
+> | 4. **Temporal** | `record` | Understand **what happened over time** — causality, sequence, settling | Timeline of DOM/network/console events |
 >
-> Always start with `perceive`. See **"Verifying changes after actions"** below for when to use each tier.
+> Always start with `perceive`. Use `record` when you need to understand **cause and effect** (e.g., "what happens after I click Submit?") rather than just the current state. See **"Verifying changes after actions"** and **"Temporal observation"** below.
 
 ### Observation workflow
 
@@ -52,6 +53,9 @@ After modifying code or interacting with a page, choose your verification tool b
 | Layout/spacing correct | `perceive` — `↕height`, `display`, `gap` on landmarks | Exact px values |
 | Visual polish/aesthetics | `elshot <selector>` on the specific component | Only for **subjective** visual quality that can't be expressed as structured data |
 | Animation/transition | `elshot <selector>` before and after | Only case truly needing pixel capture |
+| What sequence of events an action causes | `record --action click @5` | Captures DOM mutations, network requests, console logs in chronological order |
+| When the page becomes stable after action | `record --until "dom stable"` | Reports exact settle time + what happened before settling |
+| Why something is slow or broken after navigation | `record <target> 5000` after `nav` | Correlates API calls → DOM updates → errors in a single timeline |
 
 **Key insight:** `perceive` now includes **style anomaly detection** on table cells. If a cell has a non-default background color, bold text, or unusual text color compared to its column siblings, perceive annotates it directly (e.g., `[cell] 70.0%  bg:rgb(255,200,200)  bold`). You don't need a screenshot to verify conditional styling.
 
@@ -311,6 +315,42 @@ Viewport: 1280×720 | Scroll: 0/3000 (0%) | ...
 
 This eliminates the observe-act-observe loop and makes agents ~2x more efficient.
 
+### Live injection (frontend development)
+
+```bash
+scripts/cdp.mjs inject <target> --css "body { background: #f0f0f0 }"   # inject inline CSS
+scripts/cdp.mjs inject <target> --css-file https://cdn.example.com/s.css  # load external stylesheet
+scripts/cdp.mjs inject <target> --js-file https://cdn.example.com/lib.js  # load external script
+scripts/cdp.mjs inject <target> --remove                                  # remove all injected elements
+scripts/cdp.mjs inject <target> --remove inject-2                         # remove specific injection
+```
+
+Returns an injection ID (e.g., `inject-1`) for later removal. URLs are validated — `data:`, `file:`, and cloud metadata URLs are blocked.
+Use for live CSS prototyping, theme testing, or loading external libraries.
+
+### CSS origin tracing (understand WHY it looks this way)
+
+```bash
+scripts/cdp.mjs cascade <target> ".btn-primary"                  # full cascade for element
+scripts/cdp.mjs cascade <target> @3                               # cascade for @ref element
+scripts/cdp.mjs cascade <target> ".btn-primary" background-color  # filter to one property
+```
+
+Shows the full CSS cascade with source file + line number:
+```
+background-color: #2563eb
+
+  ✓ .btn-primary { background-color: #2563eb }
+    → components.css:142
+  ✗ button { background-color: #e5e7eb }  [overridden]
+    → base.css:28
+
+Inherited:
+  color: #1f2937  ← body  → base.css:12
+```
+
+Use `cascade` when you need to answer "which file do I edit to change this style?" — the source location tells you exactly where to go. Inline `style=""` attributes are shown with highest priority.
+
 ### Other commands
 
 ```bash
@@ -345,6 +385,10 @@ scripts/cdp.mjs reload  <target>                       # reload current page
 scripts/cdp.mjs closetab <target>                      # close a browser tab
 scripts/cdp.mjs netlog  <target> [--clear]             # network request log (XHR/Fetch with status + timing)
 scripts/cdp.mjs evalraw <target> <method> [json]  # raw CDP command passthrough
+scripts/cdp.mjs record  <target> <ms>                    # record timeline for N ms (DOM + network + console events)
+scripts/cdp.mjs record  <target> --until "dom stable"    # record until DOM settles (max 30s)
+scripts/cdp.mjs record  <target> --until "network idle"  # record until no pending requests (max 30s)
+scripts/cdp.mjs record  <target> --action click @5       # record while performing an action (cause → effect)
 scripts/cdp.mjs open    [url]                  # open new tab + auto-attach + auto-perceive (waits up to 60s for approval)
 scripts/cdp.mjs stop    [target]               # stop daemon(s)
 ```
@@ -512,11 +556,41 @@ CSS px = screenshot image px / DPR
 - **DO NOT use `shot` + `scroll`** to manually scan pages — that's just slow scanshot
 - **DO NOT use `scanshot`** for comparisons — `elshot` on 3-4 key sections per page gives better targeted comparison
 
+### Temporal observation (understanding cause and effect)
+
+> **When to use `record` instead of `perceive --diff`:**
+>
+> `perceive --diff` shows WHAT changed. `record` shows **WHEN things changed, in what order, and what caused what.**
+>
+> | Situation | Use `perceive --diff` | Use `record` |
+> |-----------|----------------------|--------------|
+> | Clicked a button, need to see result | ✅ auto-returned by `click` | Not needed |
+> | Clicked Submit, page loads for 3s, need to know what happened during those 3s | ❌ only shows final state | ✅ `record --action click @5` |
+> | Page is slow after navigation, need to know why | ❌ snapshot after the fact | ✅ `record <target> 5000` |
+> | Need to know when page became stable after SPA route change | ❌ | ✅ `record --until "dom stable"` |
+> | Debugging intermittent console errors | ❌ console buffer loses timing context | ✅ `record <target> 10000` — correlated timeline |
+> | Verifying that API call triggers correct DOM update | ❌ can't see network+DOM correlation | ✅ `record --action click @ref` — shows POST → DOM update sequence |
+
+```
+# See cause and effect of clicking Submit:
+scripts/cdp.mjs record <target> --action click @5
+
+# Watch what happens during page load:
+scripts/cdp.mjs nav <target> <url>
+scripts/cdp.mjs record <target> --until "dom stable"
+
+# Passive: what's happening on this page right now?
+scripts/cdp.mjs record <target> 5000
+```
+
+**Rule of thumb:** If you need to answer "what happened?" or "why did that take so long?", use `record`. If you need to answer "what does it look like now?", use `perceive`.
+
 ### Debugging a broken page
 1. `perceive <target>` — structure + console errors + style anomalies in one call
 2. `console <target> --errors` — detailed error messages + stack traces if needed
-3. Check perceive style hints for visual issues first; `elshot` only for subjective visual quality
-4. `styles <target> ".broken-element"` — full computed styles if needed
+3. If the problem involves timing (slow load, delayed render, intermittent error): `record <target> 5000` to capture a timeline
+4. Check perceive style hints for visual issues first; `elshot` only for subjective visual quality
+5. `styles <target> ".broken-element"` — full computed styles if needed
 
 ### Form automation
 1. `perceive <target>` — understand form structure and get @refs for fields
@@ -589,6 +663,13 @@ scripts/cdp.mjs text <target> "main"              # scope to main content area
 1. `perceive <target>` — check page state
 2. `netlog <target>` — see recent XHR/Fetch requests with status codes
 3. `console <target> --errors` — check for errors
+4. If you need to see the full request→response→DOM update chain: `record <target> --action click @submitBtn` — captures the API call, its response, and resulting DOM mutations in one timeline
+
+### Performance investigation
+1. `nav <target> <url>` — navigate to the page
+2. `record <target> --until "dom stable"` — capture the full load lifecycle
+3. Read the timeline: which API calls are slow? When do DOM mutations peak? When does the page settle?
+4. For specific interactions: `record <target> --action click @ref` — measure cause-to-effect latency
 
 ### Responsive testing
 1. `perceive <target>` — baseline at current viewport
@@ -598,8 +679,26 @@ scripts/cdp.mjs text <target> "main"              # scope to main content area
 ### Visual bug investigation
 1. `perceive <target>` — structure + layout positions + style hints
 2. Check perceive for style anomalies (`bg:`, `bold`, `color:` annotations)
-3. `styles <target> ".suspect"` — full computed CSS if perceive hints aren't enough
-4. `elshot <target> ".suspect"` — only if you need to see the actual rendered pixels
+3. `cascade <target> ".suspect" background-color` — trace WHERE the style comes from (file + line)
+4. `styles <target> ".suspect"` — full computed CSS if perceive hints aren't enough
+5. `elshot <target> ".suspect"` — only if you need to see the actual rendered pixels
+
+### CSS debugging ("why does this look wrong?")
+1. `perceive <target>` — identify the element with the issue
+2. `cascade <target> @ref` — see the full cascade: which rule won, which are overridden, source locations
+3. `cascade <target> @ref background-color` — focus on one property if the cascade is large
+4. Read the source file at the line number shown → make the fix
+5. `inject <target> --css ".fix { background: red }"` — test the fix live before editing the file
+6. `inject <target> --remove` — clean up when done
+
+> **Key insight:** `cascade` answers "which file, which line" — the single most common CSS debugging question. `styles` shows computed values but not origin. `cascade` shows origin.
+
+### Live CSS prototyping
+1. `perceive <target>` — understand the page structure
+2. `inject <target> --css "body { --primary: #2563eb }"` — inject design token changes
+3. `perceive <target> --diff` or `elshot <target> @ref` — verify the visual effect
+4. Iterate: `inject <target> --remove` → `inject <target> --css "..."` for each revision
+5. Once satisfied, apply the CSS to the actual source file
 
 ## Source
 

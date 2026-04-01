@@ -8,7 +8,7 @@ const {
   RingBuffer, resolvePrefix, getDisplayPrefixLength, sockPath,
   shouldShowAxNode, formatAxNode, orderedAxChildren, isRef,
   validateUrl, parsePerceiveArgs, dialogStr, netlogStr,
-  formatPageList, buildPerceiveTree, perceivePageScript,
+  formatPageList, buildPerceiveTree, perceivePageScript, injectStr, cascadeStr,
   evalStr, navStr, clickStr, fillStr, waitForStr,
   KEY_MAP, ENRICHED_ROLES, INTERACTIVE_ROLES,
   captureScreenshot, screencastFallback, snapshotStr,
@@ -2026,5 +2026,297 @@ describe('perceiveStr integration', () => {
     const added = currTree.filter(l => !prevSet.has(l));
     expect(removed.length).toBe(0);
     expect(added.length).toBe(0);
+  });
+});
+
+// =========================================================================
+// injectStr — live CSS/JS injection
+// =========================================================================
+
+describe('injectStr', () => {
+  it('--css should inject a style element with data-cdp-inject attribute', async () => {
+    let evalledExpr = '';
+    const cdp = createMockCDP({
+      'Runtime.evaluate': (params) => {
+        evalledExpr = params.expression;
+        return { result: { value: 'inject-1' } };
+      },
+    });
+    const result = await injectStr(cdp, 'sid1', ['--css', 'body { color: red }']);
+    expect(result).toBe('inject-1');
+    expect(evalledExpr).toContain('createElement');
+    expect(evalledExpr).toContain('data-cdp-inject');
+    expect(evalledExpr).toContain('body { color: red }');
+  });
+
+  it('--css-file should inject a link element', async () => {
+    let evalledExpr = '';
+    const cdp = createMockCDP({
+      'Runtime.evaluate': (params) => {
+        evalledExpr = params.expression;
+        return { result: { value: 'inject-1' } };
+      },
+    });
+    const result = await injectStr(cdp, 'sid1', ['--css-file', 'https://cdn.example.com/style.css']);
+    expect(result).toBe('inject-1');
+    expect(evalledExpr).toContain('link');
+    expect(evalledExpr).toContain('stylesheet');
+    expect(evalledExpr).toContain('https://cdn.example.com/style.css');
+  });
+
+  it('--js-file should inject a script element with onload', async () => {
+    let evalledExpr = '';
+    const cdp = createMockCDP({
+      'Runtime.evaluate': (params) => {
+        evalledExpr = params.expression;
+        return { result: { value: 'inject-2' } };
+      },
+    });
+    const result = await injectStr(cdp, 'sid1', ['--js-file', 'https://cdn.example.com/lib.js']);
+    expect(result).toBe('inject-2');
+    expect(evalledExpr).toContain('script');
+    expect(evalledExpr).toContain('.src');
+    expect(evalledExpr).toContain('onload');
+  });
+
+  it('--remove should remove elements with data-cdp-inject', async () => {
+    let evalledExpr = '';
+    const cdp = createMockCDP({
+      'Runtime.evaluate': (params) => {
+        evalledExpr = params.expression;
+        return { result: { value: '3 element(s) removed' } };
+      },
+    });
+    const result = await injectStr(cdp, 'sid1', ['--remove']);
+    expect(result).toBe('3 element(s) removed');
+    expect(evalledExpr).toContain('[data-cdp-inject]');
+  });
+
+  it('--remove with specific id should target that injection', async () => {
+    let evalledExpr = '';
+    const cdp = createMockCDP({
+      'Runtime.evaluate': (params) => {
+        evalledExpr = params.expression;
+        return { result: { value: '1 element(s) removed' } };
+      },
+    });
+    const result = await injectStr(cdp, 'sid1', ['--remove', 'inject-2']);
+    expect(result).toBe('1 element(s) removed');
+    expect(evalledExpr).toContain('inject-2');
+  });
+
+  it('--css with empty content should throw', async () => {
+    const cdp = createMockCDP({});
+    await expect(injectStr(cdp, 'sid1', ['--css'])).rejects.toThrow(/CSS text required/);
+  });
+
+  it('--css-file with no URL should throw', async () => {
+    const cdp = createMockCDP({});
+    await expect(injectStr(cdp, 'sid1', ['--css-file'])).rejects.toThrow(/URL required/);
+  });
+
+  it('--js-file with no URL should throw', async () => {
+    const cdp = createMockCDP({});
+    await expect(injectStr(cdp, 'sid1', ['--js-file'])).rejects.toThrow(/URL required/);
+  });
+
+  it('unknown flag should throw with usage', async () => {
+    const cdp = createMockCDP({});
+    await expect(injectStr(cdp, 'sid1', ['--html', '<div>'])).rejects.toThrow(/--css.*--css-file.*--js-file.*--remove/);
+  });
+
+  it('--css-file should reject non-http URLs', async () => {
+    const cdp = createMockCDP({});
+    await expect(injectStr(cdp, 'sid1', ['--css-file', 'data:text/css,body{color:red}'])).rejects.toThrow(/Only http/);
+    await expect(injectStr(cdp, 'sid1', ['--css-file', 'file:///etc/passwd'])).rejects.toThrow(/Only http/);
+  });
+
+  it('--js-file should reject non-http URLs', async () => {
+    const cdp = createMockCDP({});
+    await expect(injectStr(cdp, 'sid1', ['--js-file', 'data:text/javascript,alert(1)'])).rejects.toThrow(/Only http/);
+    await expect(injectStr(cdp, 'sid1', ['--js-file', 'javascript:void(0)'])).rejects.toThrow(/Only http|Invalid URL/);
+  });
+
+  it('--css-file should reject cloud metadata URLs', async () => {
+    const cdp = createMockCDP({});
+    await expect(injectStr(cdp, 'sid1', ['--css-file', 'http://169.254.169.254/latest/'])).rejects.toThrow(/metadata/i);
+  });
+});
+
+// =========================================================================
+// cascadeStr — CSS origin tracing
+// =========================================================================
+
+describe('cascadeStr', () => {
+  function makeCascadeCDP(matchedRules = [], computedStyle = [], inherited = []) {
+    return createMockCDP({
+      'DOM.getDocument': () => ({ root: { nodeId: 1 } }),
+      'DOM.querySelector': () => ({ nodeId: 10 }),
+      'DOM.pushNodesByBackendIdsToFrontend': () => ({ nodeIds: [10] }),
+      'CSS.getMatchedStylesForNode': () => ({
+        matchedCSSRules: matchedRules,
+        inherited,
+      }),
+      'CSS.getComputedStyleForNode': () => ({ computedStyle }),
+    });
+  }
+
+  it('should show winning and overridden rules for a property', async () => {
+    const cdp = makeCascadeCDP(
+      [
+        {
+          rule: {
+            selectorList: { text: '.btn-primary' },
+            origin: 'regular',
+            style: {
+              styleSheetId: 'components.css',
+              range: { startLine: 141 },
+              cssProperties: [{ name: 'background-color', value: '#2563eb' }],
+            },
+          },
+        },
+        {
+          rule: {
+            selectorList: { text: 'button' },
+            origin: 'regular',
+            style: {
+              styleSheetId: 'base.css',
+              range: { startLine: 27 },
+              cssProperties: [{ name: 'background-color', value: '#e5e7eb' }],
+            },
+          },
+        },
+      ],
+      [{ name: 'background-color', value: '#2563eb' }],
+    );
+    const result = await cascadeStr(cdp, 'sid1', '.btn', 'background-color', new Map());
+    expect(result).toContain('background-color: #2563eb');
+    expect(result).toContain('✓ .btn-primary');
+    expect(result).toContain('✗ button');
+    expect(result).toContain('[overridden]');
+    expect(result).toContain('components.css:142');
+    expect(result).toContain('base.css:28');
+  });
+
+  it('should show inherited properties', async () => {
+    const cdp = makeCascadeCDP(
+      [],
+      [{ name: 'color', value: 'rgb(31, 41, 55)' }],
+      [
+        {
+          matchedCSSRules: [{
+            rule: {
+              selectorList: { text: 'body' },
+              origin: 'regular',
+              style: {
+                styleSheetId: 'base.css',
+                range: { startLine: 11 },
+                cssProperties: [{ name: 'color', value: '#1f2937' }],
+              },
+            },
+          }],
+        },
+      ],
+    );
+    const result = await cascadeStr(cdp, 'sid1', '.text', null, new Map());
+    expect(result).toContain('Inherited:');
+    expect(result).toContain('color: #1f2937');
+    expect(result).toContain('body');
+    expect(result).toContain('base.css:12');
+  });
+
+  it('should return descriptive message when no rules match', async () => {
+    const cdp = makeCascadeCDP([], []);
+    const result = await cascadeStr(cdp, 'sid1', '.empty', null, new Map());
+    expect(result).toContain('No matching CSS rules');
+  });
+
+  it('should filter to a single property', async () => {
+    const cdp = makeCascadeCDP(
+      [
+        {
+          rule: {
+            selectorList: { text: '.box' },
+            origin: 'regular',
+            style: {
+              styleSheetId: 'style.css',
+              range: { startLine: 0 },
+              cssProperties: [
+                { name: 'color', value: 'red' },
+                { name: 'margin', value: '10px' },
+              ],
+            },
+          },
+        },
+      ],
+      [
+        { name: 'color', value: 'red' },
+        { name: 'margin', value: '10px' },
+      ],
+    );
+    const result = await cascadeStr(cdp, 'sid1', '.box', 'color', new Map());
+    expect(result).toContain('color: red');
+    expect(result).not.toContain('margin');
+  });
+
+  it('should resolve @ref to nodeId', async () => {
+    const refMap = new Map([[3, 42]]);
+    const cdp = makeCascadeCDP([], [{ name: 'display', value: 'block' }]);
+    const result = await cascadeStr(cdp, 'sid1', '@3', null, refMap);
+    // Should not throw — ref resolved successfully
+    expect(typeof result).toBe('string');
+  });
+
+  it('should throw on unknown @ref', async () => {
+    const cdp = makeCascadeCDP([], []);
+    await expect(cascadeStr(cdp, 'sid1', '@99', null, new Map())).rejects.toThrow(/Unknown ref/);
+  });
+
+  it('should throw when no selector provided', async () => {
+    const cdp = makeCascadeCDP([], []);
+    await expect(cascadeStr(cdp, 'sid1', undefined, null, new Map())).rejects.toThrow(/selector.*required/i);
+  });
+
+  it('should show computed value when property has no explicit rule', async () => {
+    const cdp = makeCascadeCDP(
+      [],
+      [{ name: 'display', value: 'flex' }],
+    );
+    const result = await cascadeStr(cdp, 'sid1', '.box', 'display', new Map());
+    expect(result).toContain('display: flex');
+    expect(result).toContain('no explicit rule');
+  });
+
+  it('should report inline styles with highest priority', async () => {
+    const cdp = createMockCDP({
+      'DOM.getDocument': () => ({ root: { nodeId: 1 } }),
+      'DOM.querySelector': () => ({ nodeId: 10 }),
+      'CSS.getMatchedStylesForNode': () => ({
+        matchedCSSRules: [{
+          rule: {
+            selectorList: { text: '.box' },
+            origin: 'regular',
+            style: {
+              styleSheetId: 'style.css',
+              range: { startLine: 9 },
+              cssProperties: [{ name: 'color', value: 'blue' }],
+            },
+          },
+        }],
+        inlineStyle: {
+          cssProperties: [{ name: 'color', value: 'red' }],
+        },
+        inherited: [],
+      }),
+      'CSS.getComputedStyleForNode': () => ({
+        computedStyle: [{ name: 'color', value: 'red' }],
+      }),
+    });
+    const result = await cascadeStr(cdp, 'sid1', '.box', 'color', new Map());
+    expect(result).toContain('color: red');
+    expect(result).toContain('✓ [inline]');
+    expect(result).toContain('inline style attribute');
+    expect(result).toContain('✗ .box');
+    expect(result).toContain('[overridden]');
   });
 });
