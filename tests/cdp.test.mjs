@@ -8,7 +8,7 @@ const {
   RingBuffer, resolvePrefix, getDisplayPrefixLength, sockPath,
   shouldShowAxNode, formatAxNode, orderedAxChildren, isRef,
   validateUrl, parsePerceiveArgs, dialogStr, netlogStr,
-  formatPageList, buildPerceiveTree, perceivePageScript, injectStr, cascadeStr,
+  formatPageList, buildPerceiveTree, perceivePageScript, injectStr, cascadeStr, recordStr, parseRecordArgs,
   evalStr, navStr, clickStr, fillStr, waitForStr,
   KEY_MAP, ENRICHED_ROLES, INTERACTIVE_ROLES,
   captureScreenshot, screencastFallback, snapshotStr,
@@ -2153,6 +2153,7 @@ describe('cascadeStr', () => {
       'DOM.getDocument': () => ({ root: { nodeId: 1 } }),
       'DOM.querySelector': () => ({ nodeId: 10 }),
       'DOM.pushNodesByBackendIdsToFrontend': () => ({ nodeIds: [10] }),
+      'CSS.getStyleSheetText': ({ styleSheetId }) => ({ text: `/* ${styleSheetId} */` }),
       'CSS.getMatchedStylesForNode': () => ({
         matchedCSSRules: matchedRules,
         inherited,
@@ -2291,6 +2292,7 @@ describe('cascadeStr', () => {
     const cdp = createMockCDP({
       'DOM.getDocument': () => ({ root: { nodeId: 1 } }),
       'DOM.querySelector': () => ({ nodeId: 10 }),
+      'CSS.getStyleSheetText': ({ styleSheetId }) => ({ text: `/* ${styleSheetId} */` }),
       'CSS.getMatchedStylesForNode': () => ({
         matchedCSSRules: [{
           rule: {
@@ -2318,5 +2320,151 @@ describe('cascadeStr', () => {
     expect(result).toContain('inline style attribute');
     expect(result).toContain('✗ .box');
     expect(result).toContain('[overridden]');
+  });
+
+  it('should enable DOM/CSS and request document before first style lookup', async () => {
+    const cdp = makeCascadeCDP(
+      [{
+        rule: { selectorList: { text: '.box' }, origin: 'regular', style: {
+          styleSheetId: 'style.css', range: { startLine: 0 }, cssProperties: [{ name: 'display', value: 'block' }],
+        } },
+      }],
+      [{ name: 'display', value: 'block' }],
+    );
+    await cascadeStr(cdp, 'sid1', '.box', 'display', new Map());
+    expect(cdp.calls.map(c => c.method)).toEqual(expect.arrayContaining(['DOM.enable', 'CSS.enable', 'DOM.getDocument']));
+    expect(cdp.calls.findIndex(c => c.method === 'DOM.getDocument')).toBeLessThan(
+      cdp.calls.findIndex(c => c.method === 'CSS.getMatchedStylesForNode')
+    );
+  });
+
+  it('should use sourceURL from stylesheet text when available', async () => {
+    const cdp = createMockCDP({
+      'DOM.getDocument': () => ({ root: { nodeId: 1 } }),
+      'DOM.querySelector': () => ({ nodeId: 10 }),
+      'CSS.getStyleSheetText': () => ({ text: '.box{color:red}\n/*# sourceURL=/src/Button.module.css */' }),
+      'CSS.getMatchedStylesForNode': () => ({
+        matchedCSSRules: [{
+          rule: { selectorList: { text: '.box' }, origin: 'regular', style: {
+            styleSheetId: 'style-sheet-123', range: { startLine: 4 }, cssProperties: [{ name: 'color', value: 'red' }],
+          } },
+        }],
+        inherited: [],
+      }),
+      'CSS.getComputedStyleForNode': () => ({ computedStyle: [{ name: 'color', value: 'red' }] }),
+    });
+    const result = await cascadeStr(cdp, 'sid1', '.box', 'color', new Map());
+    expect(result).toContain('/src/Button.module.css:5');
+    expect(result).not.toContain('style-sheet-123:5');
+  });
+});
+
+// =========================================================================
+// recordStr — timeline capture
+// =========================================================================
+
+describe('recordStr', () => {
+  it('should parse duration, action, and until arguments', () => {
+    expect(parseRecordArgs(['500']).durationMs).toBe(500);
+    expect(parseRecordArgs(['--until', 'dom stable']).until).toBe('dom stable');
+    const action = parseRecordArgs(['--action', 'click', '@1']);
+    expect(action.action).toBe('click');
+    expect(action.actionArgs).toEqual(['@1']);
+    expect(() => parseRecordArgs(['--until', 'paint stable'])).toThrow(/dom stable|network idle/);
+  });
+
+  function makeRecordCDP(extraHandlers = {}) {
+    const calls = [];
+    const listeners = new Map();
+    const cdp = {
+      calls,
+      listeners,
+      onEvent(method, cb) {
+        if (!listeners.has(method)) listeners.set(method, new Set());
+        listeners.get(method).add(cb);
+        return () => listeners.get(method)?.delete(cb);
+      },
+      emit(method, params) { for (const cb of listeners.get(method) || []) cb(params); },
+      send(method, params = {}, sessionId) {
+        calls.push({ method, params, sessionId });
+        if (extraHandlers[method]) return Promise.resolve(extraHandlers[method](params, sessionId, cdp));
+        if (method === 'Runtime.evaluate') return Promise.resolve({ result: { value: JSON.stringify({ totals: {}, labels: [], count: 0 }) } });
+        return Promise.resolve({});
+      },
+    };
+    return cdp;
+  }
+
+  it('should record passive duration mode and report no events', async () => {
+    const cdp = makeRecordCDP();
+    const result = await recordStr(cdp, 'sid1', ['100'], new Map());
+    expect(result).toContain('Record timeline');
+    expect(result).toContain('no DOM, console');
+    expect(cdp.calls.map(c => c.method)).toEqual(expect.arrayContaining(['Runtime.enable', 'Page.enable', 'DOM.enable', 'Network.enable']));
+  });
+
+  it('should record --until dom stable and include DOM mutation summary', async () => {
+    let drained = false;
+    const cdp = makeRecordCDP({
+      'Runtime.evaluate': (params) => {
+        if (params.expression.includes('__cdp_record_observer')) return { result: { value: 'installed' } };
+        if (!drained) {
+          drained = true;
+          return { result: { value: JSON.stringify({ totals: { added: 2, removed: 1, attributes: 0, characterData: 0 }, labels: ['<div#app>'], count: 2 }) } };
+        }
+        return { result: { value: JSON.stringify({ totals: {}, labels: [], count: 0 }) } };
+      },
+    });
+    const result = await recordStr(cdp, 'sid1', ['--until', 'dom stable'], new Map());
+    expect(result).toContain('until: dom stable');
+    expect(result).toContain('DOM 2 added, 1 removed');
+  });
+
+  it('should record --until network idle and include network timeline output', async () => {
+    const cdp = makeRecordCDP({
+      'Runtime.evaluate': () => ({ result: { value: JSON.stringify({ totals: {}, labels: [], count: 0 }) } }),
+      'Network.enable': (params, sid, cdp) => {
+        queueMicrotask(() => {
+          cdp.emit('Network.requestWillBeSent', { requestId: 'r1', type: 'Fetch', request: { method: 'GET', url: 'https://example.com/api' } });
+          cdp.emit('Network.responseReceived', { requestId: 'r1', type: 'Fetch', response: { status: 200 } });
+        });
+        return {};
+      },
+    });
+    const result = await recordStr(cdp, 'sid1', ['--until', 'network idle'], new Map());
+    expect(result).toContain('until: network idle');
+    expect(result).toContain('GET https://example.com/api → 200');
+  });
+
+  it('should execute record --action click @ref and include action output', async () => {
+    const cdp = makeRecordCDP({
+      'Runtime.evaluate': (params) => {
+        if (params.expression.includes('__cdp_record_observer')) return { result: { value: 'installed' } };
+        return { result: { value: JSON.stringify({ totals: {}, labels: [], count: 0 }) } };
+      },
+      'DOM.resolveNode': () => ({ object: { objectId: 'obj-1' } }),
+      'Runtime.callFunctionOn': () => ({ result: { value: { x: 10, y: 20 } } }),
+      'Input.dispatchMouseEvent': () => ({}),
+    });
+    const result = await recordStr(cdp, 'sid1', ['--action', 'click', '@1'], new Map([[1, 123]]));
+    expect(result).toContain('action: click');
+    expect(result).toContain('Clicked');
+    expect(cdp.calls.some(c => c.method === 'Input.dispatchMouseEvent')).toBe(true);
+  });
+
+  it('should include console and exception events in timeline output', async () => {
+    const cdp = makeRecordCDP({
+      'Runtime.evaluate': () => ({ result: { value: JSON.stringify({ totals: {}, labels: [], count: 0 }) } }),
+      'Runtime.enable': (params, sid, cdp) => {
+        queueMicrotask(() => {
+          cdp.emit('Runtime.consoleAPICalled', { type: 'error', args: [{ value: 'boom' }] });
+          cdp.emit('Runtime.exceptionThrown', { exceptionDetails: { text: 'Uncaught', exception: { description: 'Error: bad' } } });
+        });
+        return {};
+      },
+    });
+    const result = await recordStr(cdp, 'sid1', ['100'], new Map());
+    expect(result).toContain('console.error: boom');
+    expect(result).toContain('exception: Error: bad');
   });
 });

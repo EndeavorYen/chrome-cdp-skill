@@ -2088,6 +2088,166 @@ async function injectStr(cdp, sid, args) {
   throw new Error('inject requires --css, --css-file, --js-file, or --remove\n  inject --css "body { color: red }"   inject inline CSS\n  inject --css-file <url>              load external stylesheet\n  inject --js-file <url>               load external script\n  inject --remove [id]                 remove injected element(s)');
 }
 
+// --- Record: short timeline capture around actions / waits ---
+function formatRecordEvent(e, startTs) {
+  const rel = Math.max(0, e.ts - startTs).toString().padStart(5, ' ');
+  if (e.kind === 'dom') return `  +${rel}ms DOM ${e.summary}`;
+  if (e.kind === 'console') return `  +${rel}ms console.${e.level}: ${e.text}${e.loc ? ' (' + e.loc + ')' : ''}`;
+  if (e.kind === 'exception') return `  +${rel}ms exception: ${e.msg}${e.loc ? ' (' + e.loc + ')' : ''}`;
+  if (e.kind === 'network') return `  +${rel}ms ${e.method} ${e.url} → ${e.status} (${e.duration}ms)`;
+  if (e.kind === 'navigation') return `  +${rel}ms navigation ${e.url}`;
+  if (e.kind === 'action') return `  +${rel}ms action ${e.summary}`;
+  return `  +${rel}ms ${e.kind || 'event'} ${e.summary || ''}`.trimEnd();
+}
+
+function parseRecordArgs(args) {
+  const opts = { durationMs: 1000, until: null, action: null, actionArgs: [] };
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--action') {
+      opts.action = args[++i];
+      if (!opts.action) throw new Error('record --action requires an action command (click, press, fill, select, type, scroll, nav)');
+      opts.actionArgs = args.slice(i + 1);
+      break;
+    }
+    if (arg === '--until') {
+      opts.until = (args[++i] || '').toLowerCase();
+      if (!['dom stable', 'network idle'].includes(opts.until)) throw new Error('record --until supports "dom stable" or "network idle"');
+      continue;
+    }
+    if (/^\d+$/.test(arg)) {
+      opts.durationMs = Math.min(Math.max(parseInt(arg), 100), 30000);
+      continue;
+    }
+    throw new Error(`Unknown record argument: ${arg}`);
+  }
+  if (opts.until) opts.durationMs = 30000;
+  return opts;
+}
+
+async function collectDomMutationSummary(cdp, sid) {
+  const raw = await evalStr(cdp, sid, `(function() {
+    const bucket = window.__cdp_record_mutations || [];
+    window.__cdp_record_mutations = [];
+    const totals = { added: 0, removed: 0, attributes: 0, characterData: 0 };
+    const labels = [];
+    for (const m of bucket) {
+      if (m.type === 'childList') { totals.added += m.added || 0; totals.removed += m.removed || 0; }
+      else if (m.type === 'attributes') totals.attributes += 1;
+      else if (m.type === 'characterData') totals.characterData += 1;
+      if (m.label && labels.length < 4) labels.push(m.label);
+    }
+    return JSON.stringify({ totals, labels, count: bucket.length });
+  })()`);
+  const parsed = JSON.parse(raw || '{}');
+  if (!parsed.count) return null;
+  const parts = [];
+  if (parsed.totals.added) parts.push(`${parsed.totals.added} added`);
+  if (parsed.totals.removed) parts.push(`${parsed.totals.removed} removed`);
+  if (parsed.totals.attributes) parts.push(`${parsed.totals.attributes} attr`);
+  if (parsed.totals.characterData) parts.push(`${parsed.totals.characterData} text`);
+  const labelText = parsed.labels?.length ? ` [${parsed.labels.join('; ')}]` : '';
+  return `${parts.join(', ') || parsed.count + ' mutation(s)'}${labelText}`;
+}
+
+async function installRecordMutationObserver(cdp, sid) {
+  await evalStr(cdp, sid, `(function() {
+    if (window.__cdp_record_observer) { window.__cdp_record_mutations = []; return 'already'; }
+    window.__cdp_record_mutations = [];
+    const label = (node) => {
+      if (!node || node.nodeType !== 1) return '';
+      const el = node;
+      const id = el.id ? '#' + el.id : '';
+      const cls = typeof el.className === 'string' && el.className ? '.' + el.className.trim().split(/\s+/).slice(0,2).join('.') : '';
+      const text = (el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 40);
+      return '<' + el.tagName.toLowerCase() + id + cls + '>' + (text ? ' "' + text + '"' : '');
+    };
+    window.__cdp_record_observer = new MutationObserver((mutations) => {
+      const out = window.__cdp_record_mutations || (window.__cdp_record_mutations = []);
+      for (const m of mutations) {
+        out.push({
+          type: m.type,
+          added: m.addedNodes ? m.addedNodes.length : 0,
+          removed: m.removedNodes ? m.removedNodes.length : 0,
+          attr: m.attributeName || '',
+          label: label(m.target) || label(m.addedNodes && m.addedNodes[0]) || label(m.removedNodes && m.removedNodes[0]),
+        });
+      }
+      if (out.length > 200) out.splice(0, out.length - 200);
+    });
+    window.__cdp_record_observer.observe(document.documentElement || document, { subtree: true, childList: true, attributes: true, characterData: true });
+    return 'installed';
+  })()`);
+}
+
+async function recordStr(cdp, sid, args, refs) {
+  const opts = parseRecordArgs(args);
+  const startTs = Date.now();
+  const events = [];
+  const offConsole = cdp.onEvent?.('Runtime.consoleAPICalled', (params) => {
+    const text = (params.args || []).map(a => a.value ?? a.description ?? JSON.stringify(a)).join(' ');
+    events.push({ kind: 'console', level: params.type || 'log', text, ts: Date.now() });
+  });
+  const offException = cdp.onEvent?.('Runtime.exceptionThrown', (params) => {
+    events.push({ kind: 'exception', msg: params.exceptionDetails?.exception?.description || params.exceptionDetails?.text || 'Unknown error', ts: Date.now() });
+  });
+  const pending = new Map();
+  const offReq = cdp.onEvent?.('Network.requestWillBeSent', (params) => {
+    if (['XHR','Fetch','Document'].includes(params.type)) pending.set(params.requestId, { method: params.request.method, url: params.request.url.substring(0, 160), ts: Date.now() });
+  });
+  const offRes = cdp.onEvent?.('Network.responseReceived', (params) => {
+    const req = pending.get(params.requestId);
+    if (!req) return;
+    pending.delete(params.requestId);
+    events.push({ kind: 'network', ...req, status: params.response.status, duration: Date.now() - req.ts, ts: Date.now() });
+  });
+  const offNav = cdp.onEvent?.('Page.frameNavigated', (params) => {
+    if (!params.frame?.parentId) events.push({ kind: 'navigation', url: params.frame?.url || '', ts: Date.now() });
+  });
+
+  try { await cdp.send('Runtime.enable', {}, sid); } catch {}
+  try { await cdp.send('Page.enable', {}, sid); } catch {}
+  try { await cdp.send('DOM.enable', {}, sid); } catch {}
+  try { await cdp.send('Network.enable', {}, sid); } catch {}
+  await installRecordMutationObserver(cdp, sid);
+
+  let actionText = null;
+  if (opts.action) {
+    if (opts.action === 'click') actionText = await clickStr(cdp, sid, opts.actionArgs[0], refs);
+    else if (opts.action === 'press') actionText = await pressStr(cdp, sid, opts.actionArgs[0]);
+    else if (opts.action === 'fill') actionText = await fillStr(cdp, sid, opts.actionArgs[0], opts.actionArgs.slice(1).join(' '), refs);
+    else if (opts.action === 'select') actionText = await selectStr(cdp, sid, opts.actionArgs[0], opts.actionArgs[1]);
+    else if (opts.action === 'type') actionText = await typeStr(cdp, sid, opts.actionArgs.join(' '));
+    else if (opts.action === 'scroll') actionText = await scrollStr(cdp, sid, opts.actionArgs[0], opts.actionArgs[1]);
+    else if (opts.action === 'nav' || opts.action === 'navigate') actionText = await navStr(cdp, sid, opts.actionArgs[0]);
+    else throw new Error(`record --action does not support: ${opts.action}`);
+    events.push({ kind: 'action', summary: actionText.split('\n')[0], ts: Date.now() });
+  }
+
+  let quietSince = Date.now();
+  const deadline = Date.now() + opts.durationMs;
+  while (Date.now() < deadline) {
+    await sleep(Math.min(100, deadline - Date.now()));
+    const domSummary = await collectDomMutationSummary(cdp, sid);
+    if (domSummary) { events.push({ kind: 'dom', summary: domSummary, ts: Date.now() }); quietSince = Date.now(); }
+    if (opts.until === 'network idle' && pending.size === 0 && Date.now() - quietSince >= 500) break;
+    if (opts.until === 'dom stable' && Date.now() - quietSince >= 500) break;
+    if (!opts.until && Date.now() >= deadline) break;
+  }
+
+  offConsole?.();
+  offException?.();
+  offReq?.();
+  offRes?.();
+  offNav?.();
+
+  const lines = [`Record timeline (${Date.now() - startTs}ms${opts.action ? `, action: ${opts.action}` : ''}${opts.until ? `, until: ${opts.until}` : ''})`];
+  if (actionText) lines.push(`Action: ${actionText.split('\n')[0]}`);
+  if (events.length === 0) lines.push('  (no DOM, console, exception, navigation, or XHR/Fetch/Document network events observed)');
+  else for (const e of events.sort((a,b) => a.ts - b.ts)) lines.push(formatRecordEvent(e, startTs));
+  return lines.join('\n');
+}
+
 // --- Cascade: CSS origin tracing via CSS.getMatchedStylesForNode ---
 const INHERITABLE_PROPS = new Set([
   'color', 'font-family', 'font-size', 'font-weight', 'font-style',
@@ -2096,8 +2256,31 @@ const INHERITABLE_PROPS = new Set([
   'cursor', 'direction', 'list-style',
 ]);
 
+async function resolveStyleSource(cdp, sid, rule) {
+  const origin = rule.origin;
+  if (origin === 'user-agent') return 'user-agent stylesheet';
+  const sheetId = rule.style?.styleSheetId;
+  if (!sheetId) return origin === 'regular' ? 'inline style' : (origin || 'unknown stylesheet');
+  const range = rule.style.range;
+  const line = range ? `:${range.startLine + 1}` : '';
+  let header;
+  try { header = await cdp.send('CSS.getStyleSheetText', { styleSheetId: sheetId }, sid); } catch {}
+  const text = header?.text || '';
+  const sourceUrl = text.match(/\/\*#?\s*sourceURL=([^*\n]+)\s*\*\//)?.[1]
+    || text.match(/\/\/# sourceURL=([^\n]+)/)?.[1]
+    || text.match(/sourceMappingURL=([^\s*]+)/)?.[1];
+  if (sourceUrl) return `${sourceUrl.trim()}${line}`;
+  return `${sheetId}${line}`;
+}
+
 async function cascadeStr(cdp, sid, selector, property, refMap) {
   if (!selector) throw new Error('CSS selector or @ref required');
+
+  // CSS.getMatchedStylesForNode requires these domains/document state. Enable
+  // them inside cascade so the first call works even before evalraw/perceive.
+  try { await cdp.send('DOM.enable', {}, sid); } catch {}
+  try { await cdp.send('CSS.enable', {}, sid); } catch {}
+  const { root } = await cdp.send('DOM.getDocument', {}, sid);
 
   // Resolve element to DOM nodeId
   let nodeId;
@@ -2109,7 +2292,6 @@ async function cascadeStr(cdp, sid, selector, property, refMap) {
       { backendNodeIds: [backendNodeId] }, sid);
     nodeId = nodeIds[0];
   } else {
-    const { root } = await cdp.send('DOM.getDocument', {}, sid);
     const result = await cdp.send('DOM.querySelector',
       { nodeId: root.nodeId, selector }, sid);
     if (!result.nodeId) throw new Error('Element not found: ' + selector);
@@ -2134,16 +2316,7 @@ async function cascadeStr(cdp, sid, selector, property, refMap) {
     const rule = match.rule;
     const selectorText = rule.selectorList?.text || '?';
     const origin = rule.origin; // 'regular', 'user-agent', 'injected', 'inspector'
-    // Source location — styleSheetId lives on style object in CDP
-    let source = 'user-agent stylesheet';
-    const sheetId = rule.style?.styleSheetId;
-    if (origin !== 'user-agent' && sheetId) {
-      const range = rule.style.range;
-      const line = range ? `:${range.startLine + 1}` : '';
-      source = sheetId + line;
-    } else if (origin === 'regular' && !sheetId) {
-      source = 'inline style';
-    }
+    const source = await resolveStyleSource(cdp, sid, rule);
 
     for (const prop of rule.style?.cssProperties || []) {
       if (prop.disabled || !prop.value) continue;
@@ -2216,12 +2389,7 @@ async function cascadeStr(cdp, sid, selector, property, refMap) {
         if (!INHERITABLE_PROPS.has(prop.name)) continue;
         if (property && prop.name !== property) continue;
         const selectorText = rule.selectorList?.text || '?';
-        let source = 'user-agent stylesheet';
-        const inhSheetId = rule.style?.styleSheetId;
-        if (rule.origin !== 'user-agent' && inhSheetId) {
-          const range = rule.style.range;
-          source = inhSheetId + (range ? `:${range.startLine + 1}` : '');
-        }
+        const source = await resolveStyleSource(cdp, sid, rule);
         inheritedLines.push(`  ${prop.name}: ${prop.value}  ← ${selectorText}  → ${source}`);
       }
     }
@@ -2481,6 +2649,7 @@ async function runDaemon(targetId) {
         case 'closetab': result = await closetabStr(cdp, targetId); break;
         case 'netlog': result = netlogStr(netReqBuf, args[0]); break;
         case 'inject': result = await injectStr(cdp, sessionId, args); break;
+        case 'record': result = await recordStr(cdp, sessionId, args, refMap); break;
         case 'cascade': result = await cascadeStr(cdp, sessionId, args[0], args[1], refMap); break;
         case 'evalraw': result = await evalRawStr(cdp, sessionId, args[0], args[1]); break;
         case 'batch': {
@@ -2743,6 +2912,9 @@ Usage: cdp <command> [args]
                                     --remove [id]    Remove injected element(s) (all, or by id)
   cascade <target> <sel|@ref> [prop] CSS origin tracing — shows which rules apply, source file + line
                                     Optional: filter to one property (e.g. "background-color")
+  record <target> [ms]              Record a short timeline of DOM/console/network/navigation events
+  record <target> --action click @5 Record events around an action (click/press/fill/select/type/scroll/nav)
+  record <target> --until "dom stable"|"network idle"  Record until page quiets (max 30s)
   evalraw <target> <method> [json]  Send a raw CDP command; returns JSON result
                                     e.g. evalraw <t> "DOM.getDocument" '{}'
   batch <target> <cmds> [--parallel] Execute multiple commands in one call (reduces IPC overhead)
@@ -2789,7 +2961,7 @@ DAEMON IPC (for advanced use / scripting)
   fullshot, scanshot, html, nav, net, click, clickxy, hover, type, press, scroll, fill,
   select, waitfor, loadall, styles, cookies, cookieset, cookiedel, dialog, viewport,
   upload, text, table, back, forward, reload, closetab, netlog, inject, cascade,
-  evalraw, batch, stop.
+  record, evalraw, batch, stop.
   The socket disappears after 20 min of inactivity or when the tab closes.
 `;
 
@@ -2797,7 +2969,7 @@ const NEEDS_TARGET = new Set([
   'snap','snapshot','eval','shot','screenshot','html','nav','navigate',
   'net','network','click','clickxy','type','press','scroll','hover','waitfor','loadall','fill','select','fullshot','scanshot','styles','cookies','cookieset','cookiedel','evalraw','status','console','summary','perceive','elshot','batch','dialog','viewport','upload',
   'text','table','back','forward','reload','closetab','netlog',
-  'inject','cascade',
+  'inject','cascade','record',
 ]);
 
 async function main() {
@@ -2986,7 +3158,7 @@ export const __test__ = process.env.NODE_ENV === 'test' ? {
   // Perceive & snapshot
   parsePerceiveArgs, buildPerceiveTree, perceivePageScript,
   // Command implementations
-  formatPageList, dialogStr, netlogStr, injectStr, cascadeStr,
+  formatPageList, dialogStr, netlogStr, injectStr, cascadeStr, recordStr, parseRecordArgs,
   evalStr, navStr, clickStr, fillStr, waitForStr, snapshotStr,
   // Screenshot
   captureScreenshot, screencastFallback,

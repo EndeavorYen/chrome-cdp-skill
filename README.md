@@ -1,6 +1,6 @@
 # chrome-cdp-ex
 
-[![44 Commands](https://img.shields.io/badge/commands-44-orange)](skills/chrome-cdp-ex/scripts/cdp.mjs)
+[![45 Commands](https://img.shields.io/badge/commands-45-orange)](skills/chrome-cdp-ex/scripts/cdp.mjs)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0-blue)](skills/chrome-cdp-ex/scripts/cdp.mjs)
 [![Node 22+](https://img.shields.io/badge/node-22%2B-brightgreen)](https://nodejs.org)
 [![MIT License](https://img.shields.io/badge/license-MIT-gray)](LICENSE)
@@ -22,7 +22,7 @@
 - [The Redesign Experiment](#the-redesign-experiment)
 - [Quick Start](#quick-start)
 - [How It Works](#how-it-works)
-- [Commands (44 total)](#commands-44-total)
+- [Commands (45 total)](#commands-45-total)
 - [WSL2 -> Windows Browser Control](#wsl2---windows-browser-control)
 - [Credits](#credits)
 - [License](#license)
@@ -54,7 +54,7 @@ The agent using `perceive` (layout + colors + spacing + coordinates) produced th
 | **Electron app support** | **Yes** - `CDP_PORT=9222` | No | No |
 | **WSL2 -> Windows** | **Yes** - built-in | No | No |
 | **Dependencies** | **0** | Playwright + Chromium binary | Varies |
-| **Commands** | **44** | N/A (programmatic API) | ~14 |
+| **Commands** | **45** | N/A (programmatic API) | ~14 |
 
 ## One command, complete page understanding
 
@@ -185,7 +185,7 @@ Output:
 1ED3DBAA  My App                                                  http://localhost:5173/#/menu
 ```
 
-All 44 commands work: `perceive`, `click`, `fill`, `cascade`, `inject`, and more.
+All 45 commands work: `perceive`, `click`, `fill`, `cascade`, `record`, `inject`, and more.
 
 </details>
 
@@ -228,7 +228,7 @@ Each tab gets its own daemon process that keeps the CDP session open.
 Chrome's "Allow debugging" dialog appears **once per tab**, not once per command.
 Daemons auto-exit after 20 minutes of inactivity and passively collect console/exception/navigation events into ring buffers.
 
-## Commands (44 total)
+## Commands (45 total)
 
 Tip: start with `perceive`, then use `click`/`fill`/`select`; use `status` or `console` when you need debugging context.
 
@@ -335,6 +335,9 @@ inject  <target> --js-file <url>    # inject <script src> and wait for load
 inject  <target> --remove [id]      # remove injected element(s) — all or by id
 cascade <target> <sel|@ref>         # CSS origin tracing: full cascade with source file + line
 cascade <target> <sel|@ref> <prop>  # filter to one property (e.g. "background-color")
+record  <target> [ms]               # timeline of DOM/console/network/navigation events
+record  <target> --action click @5  # record cause → effect around an action
+record  <target> --until "dom stable"|"network idle"  # record until quiet (max 30s)
 ```
 
 `inject` returns an ID (`inject-1`, `inject-2`...) for targeted removal. URLs are validated (blocks `data:`, `file:`, cloud metadata).
