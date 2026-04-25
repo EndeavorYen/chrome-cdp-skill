@@ -2357,6 +2357,81 @@ describe('cascadeStr', () => {
     expect(result).toContain('/src/Button.module.css:5');
     expect(result).not.toContain('style-sheet-123:5');
   });
+
+  // Regression: dogfood report showed identical winner / overridden lines
+  // appearing twice when CDP returned the same matchedCSSRule twice.
+  it('should dedupe identical matchedCSSRules entries before formatting', async () => {
+    const dupRule = {
+      rule: {
+        selectorList: { text: '.primary' },
+        origin: 'regular',
+        style: {
+          styleSheetId: 'base.css',
+          range: { startLine: 4 },
+          cssProperties: [{ name: 'background-color', value: 'rgb(37, 99, 235)' }],
+        },
+      },
+    };
+    const cdp = makeCascadeCDP(
+      [dupRule, dupRule],
+      [{ name: 'background-color', value: 'rgb(37, 99, 235)' }],
+    );
+    const result = await cascadeStr(cdp, 'sid1', '.btn', 'background-color', new Map());
+    // The .primary rule should appear exactly once, not twice.
+    const matches = result.match(/\.primary \{ background-color: rgb\(37, 99, 235\) \}/g) || [];
+    expect(matches).toHaveLength(1);
+  });
+
+  // Regression: same property listed twice within a single rule's
+  // cssProperties (e.g. fallback declarations) should also dedupe.
+  it('should dedupe duplicate cssProperties within a single rule', async () => {
+    const cdp = makeCascadeCDP(
+      [{
+        rule: {
+          selectorList: { text: '.box' },
+          origin: 'regular',
+          style: {
+            styleSheetId: 'style.css',
+            range: { startLine: 0 },
+            cssProperties: [
+              { name: 'color', value: 'rgb(255, 255, 255)' },
+              { name: 'color', value: 'rgb(255, 255, 255)' },
+            ],
+          },
+        },
+      }],
+      [{ name: 'color', value: 'rgb(255, 255, 255)' }],
+    );
+    const result = await cascadeStr(cdp, 'sid1', '.box', 'color', new Map());
+    const matches = result.match(/\.box \{ color: rgb\(255, 255, 255\) \}/g) || [];
+    expect(matches).toHaveLength(1);
+  });
+
+  // Regression: duplicate inherited rules (same selector + value + source)
+  // should dedupe in the Inherited: section as well.
+  it('should dedupe identical inherited rule lines', async () => {
+    const dupInheritedRule = {
+      rule: {
+        selectorList: { text: 'body' },
+        origin: 'regular',
+        style: {
+          styleSheetId: 'base.css',
+          range: { startLine: 11 },
+          cssProperties: [{ name: 'color', value: '#1f2937' }],
+        },
+      },
+    };
+    const cdp = makeCascadeCDP(
+      [],
+      [{ name: 'color', value: '#1f2937' }],
+      [{ matchedCSSRules: [dupInheritedRule, dupInheritedRule] }],
+    );
+    const result = await cascadeStr(cdp, 'sid1', '.text', null, new Map());
+    expect(result).toContain('Inherited:');
+    const inheritedSection = result.split('Inherited:')[1] || '';
+    const matches = inheritedSection.match(/color: #1f2937/g) || [];
+    expect(matches).toHaveLength(1);
+  });
 });
 
 // =========================================================================
@@ -2466,5 +2541,65 @@ describe('recordStr', () => {
     const result = await recordStr(cdp, 'sid1', ['100'], new Map());
     expect(result).toContain('console.error: boom');
     expect(result).toContain('exception: Error: bad');
+  });
+
+  // Regression: previous code only removed temporary listeners after the
+  // happy-path loop, so any throw in the action path leaked listeners onto
+  // the long-lived daemon. Use try/finally to guarantee cleanup.
+  function listenerCount(cdp) {
+    let total = 0;
+    for (const set of cdp.listeners.values()) total += set.size;
+    return total;
+  }
+
+  it('should remove temporary listeners when an unsupported action throws', async () => {
+    const cdp = makeRecordCDP({
+      'Runtime.evaluate': (params) => {
+        if (params.expression.includes('__cdp_record_observer')) return { result: { value: 'installed' } };
+        return { result: { value: JSON.stringify({ totals: {}, labels: [], count: 0 }) } };
+      },
+    });
+    await expect(
+      recordStr(cdp, 'sid1', ['--action', 'wiggle', '@1'], new Map([[1, 123]]))
+    ).rejects.toThrow(/does not support: wiggle/);
+    expect(listenerCount(cdp)).toBe(0);
+  });
+
+  it('should remove temporary listeners when the action implementation throws', async () => {
+    const cdp = makeRecordCDP({
+      'Runtime.evaluate': (params) => {
+        if (params.expression.includes('__cdp_record_observer')) return { result: { value: 'installed' } };
+        return { result: { value: JSON.stringify({ totals: {}, labels: [], count: 0 }) } };
+      },
+      // clickStr starts by resolving the @ref via DOM.resolveNode; force a
+      // throw there to exercise the action error path.
+      'DOM.resolveNode': () => { throw new Error('node detached'); },
+    });
+    await expect(
+      recordStr(cdp, 'sid1', ['--action', 'click', '@1'], new Map([[1, 123]]))
+    ).rejects.toThrow();
+    expect(listenerCount(cdp)).toBe(0);
+  });
+
+  // Parser ergonomics: --until should work whether it appears before OR after
+  // --action. Previously everything after --action was eaten as actionArgs.
+  it('parseRecordArgs should accept --until after --action', () => {
+    const opts = parseRecordArgs(['--action', 'click', '@5', '--until', 'network idle']);
+    expect(opts.action).toBe('click');
+    expect(opts.actionArgs).toEqual(['@5']);
+    expect(opts.until).toBe('network idle');
+    expect(opts.durationMs).toBe(30000);
+  });
+
+  it('parseRecordArgs should still accept --until before --action', () => {
+    const opts = parseRecordArgs(['--until', 'dom stable', '--action', 'click', '@5']);
+    expect(opts.action).toBe('click');
+    expect(opts.actionArgs).toEqual(['@5']);
+    expect(opts.until).toBe('dom stable');
+  });
+
+  it('parseRecordArgs should reject invalid --until value when supplied after --action', () => {
+    expect(() => parseRecordArgs(['--action', 'click', '@5', '--until', 'paint stable']))
+      .toThrow(/dom stable|network idle/);
   });
 });

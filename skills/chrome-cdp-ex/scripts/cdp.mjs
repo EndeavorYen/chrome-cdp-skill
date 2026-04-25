@@ -2102,17 +2102,35 @@ function formatRecordEvent(e, startTs) {
 
 function parseRecordArgs(args) {
   const opts = { durationMs: 1000, until: null, action: null, actionArgs: [] };
+  const setUntil = (val) => {
+    const v = (val || '').toLowerCase();
+    if (!['dom stable', 'network idle'].includes(v)) throw new Error('record --until supports "dom stable" or "network idle"');
+    opts.until = v;
+  };
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     if (arg === '--action') {
       opts.action = args[++i];
       if (!opts.action) throw new Error('record --action requires an action command (click, press, fill, select, type, scroll, nav)');
-      opts.actionArgs = args.slice(i + 1);
+      // Trailing args are passed to the action, but pull out a trailing
+      // --until so flag ordering (`--action click @5 --until "dom stable"`)
+      // works the same as the leading form. Anything not recognized as a
+      // known record flag is forwarded to the action verbatim.
+      const rest = args.slice(i + 1);
+      const actionArgs = [];
+      for (let j = 0; j < rest.length; j++) {
+        const a = rest[j];
+        if (a === '--until') {
+          setUntil(rest[++j]);
+          continue;
+        }
+        actionArgs.push(a);
+      }
+      opts.actionArgs = actionArgs;
       break;
     }
     if (arg === '--until') {
-      opts.until = (args[++i] || '').toLowerCase();
-      if (!['dom stable', 'network idle'].includes(opts.until)) throw new Error('record --until supports "dom stable" or "network idle"');
+      setUntil(args[++i]);
       continue;
     }
     if (/^\d+$/.test(arg)) {
@@ -2205,47 +2223,53 @@ async function recordStr(cdp, sid, args, refs) {
     if (!params.frame?.parentId) events.push({ kind: 'navigation', url: params.frame?.url || '', ts: Date.now() });
   });
 
-  try { await cdp.send('Runtime.enable', {}, sid); } catch {}
-  try { await cdp.send('Page.enable', {}, sid); } catch {}
-  try { await cdp.send('DOM.enable', {}, sid); } catch {}
-  try { await cdp.send('Network.enable', {}, sid); } catch {}
-  await installRecordMutationObserver(cdp, sid);
+  // Wrap setup/action/loop in try/finally so the temporary listeners are
+  // always detached — including when an action throws (unsupported action,
+  // click/fill failure, CDP error). Leaking listeners would pollute future
+  // record/timeline runs on the same daemon.
+  try {
+    try { await cdp.send('Runtime.enable', {}, sid); } catch {}
+    try { await cdp.send('Page.enable', {}, sid); } catch {}
+    try { await cdp.send('DOM.enable', {}, sid); } catch {}
+    try { await cdp.send('Network.enable', {}, sid); } catch {}
+    await installRecordMutationObserver(cdp, sid);
 
-  let actionText = null;
-  if (opts.action) {
-    if (opts.action === 'click') actionText = await clickStr(cdp, sid, opts.actionArgs[0], refs);
-    else if (opts.action === 'press') actionText = await pressStr(cdp, sid, opts.actionArgs[0]);
-    else if (opts.action === 'fill') actionText = await fillStr(cdp, sid, opts.actionArgs[0], opts.actionArgs.slice(1).join(' '), refs);
-    else if (opts.action === 'select') actionText = await selectStr(cdp, sid, opts.actionArgs[0], opts.actionArgs[1]);
-    else if (opts.action === 'type') actionText = await typeStr(cdp, sid, opts.actionArgs.join(' '));
-    else if (opts.action === 'scroll') actionText = await scrollStr(cdp, sid, opts.actionArgs[0], opts.actionArgs[1]);
-    else if (opts.action === 'nav' || opts.action === 'navigate') actionText = await navStr(cdp, sid, opts.actionArgs[0]);
-    else throw new Error(`record --action does not support: ${opts.action}`);
-    events.push({ kind: 'action', summary: actionText.split('\n')[0], ts: Date.now() });
+    let actionText = null;
+    if (opts.action) {
+      if (opts.action === 'click') actionText = await clickStr(cdp, sid, opts.actionArgs[0], refs);
+      else if (opts.action === 'press') actionText = await pressStr(cdp, sid, opts.actionArgs[0]);
+      else if (opts.action === 'fill') actionText = await fillStr(cdp, sid, opts.actionArgs[0], opts.actionArgs.slice(1).join(' '), refs);
+      else if (opts.action === 'select') actionText = await selectStr(cdp, sid, opts.actionArgs[0], opts.actionArgs[1]);
+      else if (opts.action === 'type') actionText = await typeStr(cdp, sid, opts.actionArgs.join(' '));
+      else if (opts.action === 'scroll') actionText = await scrollStr(cdp, sid, opts.actionArgs[0], opts.actionArgs[1]);
+      else if (opts.action === 'nav' || opts.action === 'navigate') actionText = await navStr(cdp, sid, opts.actionArgs[0]);
+      else throw new Error(`record --action does not support: ${opts.action}`);
+      events.push({ kind: 'action', summary: actionText.split('\n')[0], ts: Date.now() });
+    }
+
+    let quietSince = Date.now();
+    const deadline = Date.now() + opts.durationMs;
+    while (Date.now() < deadline) {
+      await sleep(Math.min(100, deadline - Date.now()));
+      const domSummary = await collectDomMutationSummary(cdp, sid);
+      if (domSummary) { events.push({ kind: 'dom', summary: domSummary, ts: Date.now() }); quietSince = Date.now(); }
+      if (opts.until === 'network idle' && pending.size === 0 && Date.now() - quietSince >= 500) break;
+      if (opts.until === 'dom stable' && Date.now() - quietSince >= 500) break;
+      if (!opts.until && Date.now() >= deadline) break;
+    }
+
+    const lines = [`Record timeline (${Date.now() - startTs}ms${opts.action ? `, action: ${opts.action}` : ''}${opts.until ? `, until: ${opts.until}` : ''})`];
+    if (actionText) lines.push(`Action: ${actionText.split('\n')[0]}`);
+    if (events.length === 0) lines.push('  (no DOM, console, exception, navigation, or XHR/Fetch/Document network events observed)');
+    else for (const e of events.sort((a,b) => a.ts - b.ts)) lines.push(formatRecordEvent(e, startTs));
+    return lines.join('\n');
+  } finally {
+    offConsole?.();
+    offException?.();
+    offReq?.();
+    offRes?.();
+    offNav?.();
   }
-
-  let quietSince = Date.now();
-  const deadline = Date.now() + opts.durationMs;
-  while (Date.now() < deadline) {
-    await sleep(Math.min(100, deadline - Date.now()));
-    const domSummary = await collectDomMutationSummary(cdp, sid);
-    if (domSummary) { events.push({ kind: 'dom', summary: domSummary, ts: Date.now() }); quietSince = Date.now(); }
-    if (opts.until === 'network idle' && pending.size === 0 && Date.now() - quietSince >= 500) break;
-    if (opts.until === 'dom stable' && Date.now() - quietSince >= 500) break;
-    if (!opts.until && Date.now() >= deadline) break;
-  }
-
-  offConsole?.();
-  offException?.();
-  offReq?.();
-  offRes?.();
-  offNav?.();
-
-  const lines = [`Record timeline (${Date.now() - startTs}ms${opts.action ? `, action: ${opts.action}` : ''}${opts.until ? `, until: ${opts.until}` : ''})`];
-  if (actionText) lines.push(`Action: ${actionText.split('\n')[0]}`);
-  if (events.length === 0) lines.push('  (no DOM, console, exception, navigation, or XHR/Fetch/Document network events observed)');
-  else for (const e of events.sort((a,b) => a.ts - b.ts)) lines.push(formatRecordEvent(e, startTs));
-  return lines.join('\n');
 }
 
 // --- Cascade: CSS origin tracing via CSS.getMatchedStylesForNode ---
@@ -2347,6 +2371,22 @@ async function cascadeStr(cdp, sid, selector, property, refMap) {
     });
   }
 
+  // Dedupe identical (selector, value, source, origin) entries per property.
+  // CDP can return repeated matchedCSSRules / cssProperties (e.g. same rule
+  // matched via multiple selectors in the selectorList); rendering them twice
+  // misleadingly implies multiple independent winning rules.
+  for (const [name, rules] of propRules) {
+    const seen = new Set();
+    const deduped = [];
+    for (const r of rules) {
+      const key = `${r.selector} ${r.value} ${r.source} ${r.origin}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      deduped.push(r);
+    }
+    propRules.set(name, deduped);
+  }
+
   const hasInherited = (matched.inherited || []).some(inh =>
     inh.matchedCSSRules?.some(m =>
       m.rule.style?.cssProperties?.some(p => !p.disabled && p.value && INHERITABLE_PROPS.has(p.name))));
@@ -2396,12 +2436,13 @@ async function cascadeStr(cdp, sid, selector, property, refMap) {
   }
   if (inheritedLines.length > 0) {
     lines.push('Inherited:');
-    // Deduplicate (same property may appear from multiple ancestors)
+    // Deduplicate identical lines (CDP can repeat the same inherited rule
+    // across multiple ancestors / selectors); distinct (selector, source)
+    // entries with the same property+value are still preserved.
     const seen = new Set();
     for (const l of inheritedLines) {
-      const key = l.split('←')[0].trim();
-      if (seen.has(key)) continue;
-      seen.add(key);
+      if (seen.has(l)) continue;
+      seen.add(l);
       lines.push(l);
     }
   }
