@@ -282,12 +282,42 @@ scripts/cdp.mjs batch <target> '[{"cmd":"fill","args":["@3","hello"]},{"cmd":"cl
 
 # Parallel execution (for independent commands like multiple screenshots):
 scripts/cdp.mjs batch <target> --parallel 'elshot @3 | elshot @5 | elshot @7'
+
+# Human-readable output (no JSON parsing needed):
+scripts/cdp.mjs batch <target> --plain   'click @7 | console --errors'
+scripts/cdp.mjs batch <target> --compact 'click @7 | console --errors'   # one line per step
 ```
 
-Executes multiple commands in a single IPC call. Returns a JSON array of results.
+Executes multiple commands in a single IPC call. Default output is a JSON array of results.
 
 - **Pipe syntax**: commands separated by `|`, args separated by spaces. Auto-detected when input doesn't start with `[`.
 - **`--parallel`**: runs all commands concurrently via `Promise.all`. Safe for: `elshot`, `fill`, `eval`, `html`, `text`, `table`, `styles`, `cookies`. Rejected for commands that auto-perceive (`click`, `scroll`, `nav`, `perceive`, etc.) since they mutate shared state.
+- **`--plain`**: human-readable per-step output. Each step gets a `[i/N] cmd args` header followed by indented result text. Use when an agent doesn't need to parse the result programmatically.
+- **`--compact`**: one line per step (`[i] cmd: <first line of result>`). Useful for quick visual scans.
+
+### Flow (sequential pipeline with halt-on-error)
+
+```bash
+scripts/cdp.mjs flow <target> "click @1; wait dom stable; summary; console --errors"
+scripts/cdp.mjs flow <target> "fill @3 hello; click @7; wait network idle; perceive --diff"
+```
+
+Runs the steps in order, halting on the first failure. Output is a readable step-by-step layout (not a JSON blob), so you can diff a failing pipeline at a glance.
+
+- Each step is either a normal command (`click @1`, `summary`, `console --errors`, …) or a wait alias.
+- Wait aliases use the same settle helper as `record --until`:
+  - `wait dom stable` — wait for DOM mutations to quiet for 500ms (max ~10s).
+  - `wait network idle` — wait until pending XHR/Fetch/Document requests drain.
+- Use `flow` for short pipelines that read top-to-bottom; use `batch` when you need parallelism or programmatic JSON.
+
+### Doctor / readiness check
+
+```bash
+scripts/cdp.mjs doctor    # one-call diagnostics (no target needed)
+scripts/cdp.mjs ready     # alias
+```
+
+Reports `[OK]` / `[WARN]` / `[FAIL]` for: Node version, skill install path, daemon socket state, and CDP reachability (CDP_PORT or auto-discovered DevToolsActivePort). Exits with code 1 if any check fails. Run this **first** when an agent is unsure whether the environment is wired up.
 
 ### Action feedback (automatic)
 
@@ -388,7 +418,15 @@ scripts/cdp.mjs evalraw <target> <method> [json]  # raw CDP command passthrough
 scripts/cdp.mjs record  <target> <ms>                    # record timeline for N ms (DOM + network + console events)
 scripts/cdp.mjs record  <target> --until "dom stable"    # record until DOM settles (max 30s)
 scripts/cdp.mjs record  <target> --until "network idle"  # record until no pending requests (max 30s)
-scripts/cdp.mjs record  <target> --action click @5       # record while performing an action (cause → effect)
+scripts/cdp.mjs record  <target> --action click @5       # record while performing an action — auto-settles
+                                                           # (DOM/network quiet, capped at 5s if no network, 10s otherwise).
+                                                           # Add an explicit duration or --until to override the auto-settle default.
+scripts/cdp.mjs flow    <target> "<steps>"               # sequential runner; semicolon-separated steps
+                                                           # e.g. flow A7BA "click @1; wait dom stable; summary; console --errors"
+                                                           # wait aliases: "wait dom stable", "wait network idle"
+                                                           # halts on the first failing step; output is readable, not JSON
+scripts/cdp.mjs doctor                          # one-call diagnostics (Node, skill install, daemon state, CDP reachability)
+scripts/cdp.mjs ready                           # alias of doctor; exits 1 if any check FAILs
 scripts/cdp.mjs open    [url]                  # open new tab + auto-attach + auto-perceive (waits up to 60s for approval)
 scripts/cdp.mjs stop    [target]               # stop daemon(s)
 ```

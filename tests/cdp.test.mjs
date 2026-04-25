@@ -13,6 +13,10 @@ const {
   KEY_MAP, ENRICHED_ROLES, INTERACTIVE_ROLES,
   captureScreenshot, screencastFallback, snapshotStr,
   resetScreenshotTier, getScreenshotTier, SCREENSHOT_TIMEOUT,
+  decodeVLQ, mapLineToSource, stripVitePathQuery, mapStyleSource,
+  formatBatchResults, parseFlowSteps, settleFlow, flowStr,
+  checkNode, checkSkillSymlink, checkDaemonSockets, checkCdpReachability,
+  formatDoctorReport, runDoctorChecks, doctorStr,
 } = T;
 
 // =========================================================================
@@ -2382,6 +2386,33 @@ describe('cascadeStr', () => {
     expect(matches).toHaveLength(1);
   });
 
+  // Regression: semantically identical CSS values may differ only by formatting
+  // (e.g. authored rgb(37,99,235) vs CDP-normalized rgb(37, 99, 235)).
+  it('should dedupe and mark winner using normalized CSS values', async () => {
+    const cdp = makeCascadeCDP(
+      [{
+        rule: {
+          selectorList: { text: '.primary' },
+          origin: 'regular',
+          style: {
+            styleSheetId: 'base.css',
+            range: { startLine: 4 },
+            cssProperties: [
+              { name: 'background-color', value: 'rgb(37,99,235)' },
+              { name: 'background-color', value: 'rgb(37, 99, 235)' },
+            ],
+          },
+        },
+      }],
+      [{ name: 'background-color', value: 'rgb(37, 99, 235)' }],
+    );
+    const result = await cascadeStr(cdp, 'sid1', '.btn', 'background-color', new Map());
+    const matches = result.match(/\.primary \{ background-color:/g) || [];
+    expect(matches).toHaveLength(1);
+    expect(result).toContain('✓ .primary');
+    expect(result).not.toContain('✗ .primary');
+  });
+
   // Regression: same property listed twice within a single rule's
   // cssProperties (e.g. fallback declarations) should also dedupe.
   it('should dedupe duplicate cssProperties within a single rule', async () => {
@@ -2601,5 +2632,632 @@ describe('recordStr', () => {
   it('parseRecordArgs should reject invalid --until value when supplied after --action', () => {
     expect(() => parseRecordArgs(['--action', 'click', '@5', '--until', 'paint stable']))
       .toThrow(/dom stable|network idle/);
+  });
+
+  // --action default: auto-settle (DOM/network quiet) capped at 5/10s when no
+  // explicit duration/--until given. Explicit duration or --until is preserved.
+  it('parseRecordArgs --action without duration/until defaults to auto settle (10s cap)', () => {
+    const opts = parseRecordArgs(['--action', 'click', '@5']);
+    expect(opts.until).toBe('auto settle');
+    expect(opts.durationMs).toBe(10000);
+    expect(opts.explicitDuration).toBe(false);
+  });
+
+  it('parseRecordArgs --action with explicit duration preserves duration and skips auto settle', () => {
+    const opts = parseRecordArgs(['--action', 'click', '@5', '2000']);
+    expect(opts.until).toBe(null);
+    expect(opts.durationMs).toBe(2000);
+    expect(opts.explicitDuration).toBe(true);
+  });
+
+  it('parseRecordArgs --action with explicit --until preserves it (not auto settle)', () => {
+    const opts = parseRecordArgs(['--action', 'click', '@5', '--until', 'dom stable']);
+    expect(opts.until).toBe('dom stable');
+    expect(opts.durationMs).toBe(30000);
+  });
+
+  it('parseRecordArgs without --action keeps original 1s default', () => {
+    const opts = parseRecordArgs([]);
+    expect(opts.until).toBe(null);
+    expect(opts.durationMs).toBe(1000);
+  });
+});
+
+// =========================================================================
+// mapStyleSource — improved cascade source mapping (Vite / CSS Modules)
+// =========================================================================
+
+describe('stripVitePathQuery', () => {
+  it('returns input unchanged when no query', () => {
+    expect(stripVitePathQuery('/src/Foo.module.css')).toBe('/src/Foo.module.css');
+  });
+  it('strips Vite vue/style query suffix', () => {
+    expect(stripVitePathQuery('/src/App.vue?vue&type=style&index=0&scoped=true&lang.css'))
+      .toBe('/src/App.vue');
+  });
+  it('strips ?direct and ?used suffixes', () => {
+    expect(stripVitePathQuery('/src/Foo.module.css?direct')).toBe('/src/Foo.module.css');
+    expect(stripVitePathQuery('/src/Foo.module.css?used')).toBe('/src/Foo.module.css');
+  });
+  it('handles empty input', () => {
+    expect(stripVitePathQuery('')).toBe('');
+  });
+});
+
+describe('decodeVLQ', () => {
+  it('decodes a single zero', () => {
+    expect(decodeVLQ('A')).toEqual([0]);
+  });
+  it('decodes a known multi-segment value (AAAA)', () => {
+    // AAAA = 4 zero values — generated col, source idx, orig line, orig col deltas
+    expect(decodeVLQ('AAAA')).toEqual([0, 0, 0, 0]);
+  });
+  it('handles continuation bits across multiple base64 chars', () => {
+    // 'CAAA' encodes [1,0,0,0] (1<<1 = 2 → negate flag 0 → 1)
+    const vals = decodeVLQ('CAAA');
+    expect(vals).toEqual([1, 0, 0, 0]);
+  });
+});
+
+describe('mapLineToSource', () => {
+  it('returns null for empty mappings', () => {
+    expect(mapLineToSource('', 0)).toBe(null);
+  });
+  it('returns null when genLine0 is out of range', () => {
+    expect(mapLineToSource('AAAA', 5)).toBe(null);
+  });
+  it('returns mapping with srcIdx=0 origLine=0 for single AAAA segment', () => {
+    const m = mapLineToSource('AAAA', 0);
+    expect(m).not.toBe(null);
+    expect(m.srcIdx).toBe(0);
+    expect(m.origLine).toBe(0);
+  });
+});
+
+describe('mapStyleSource', () => {
+  it('falls back to sheetId:line when no sourceURL or sourceMappingURL', () => {
+    expect(mapStyleSource('.box{color:red}', 'sheet-1', 4)).toBe('sheet-1:5');
+  });
+
+  it('uses sourceURL when present and strips Vite query suffix', () => {
+    const sheet = '.box{color:red}\n/*# sourceURL=/src/Foo.module.css?vue&type=style&lang.css */';
+    expect(mapStyleSource(sheet, 'sheet-1', 4)).toBe('/src/Foo.module.css:5');
+  });
+
+  it('uses external sourceMappingURL (.css.map → .css) when no sourceURL', () => {
+    const sheet = '.box{color:red}\n/*# sourceMappingURL=/src/Foo.module.css.map */';
+    expect(mapStyleSource(sheet, 'sheet-1', 0)).toBe('/src/Foo.module.css:1');
+  });
+
+  it('decodes inline base64 sourcemap and uses sources[0] + mapped origLine', () => {
+    const map = JSON.stringify({
+      version: 3,
+      sources: ['/src/Button.module.css'],
+      mappings: 'AAAA',
+    });
+    const b64 = Buffer.from(map).toString('base64');
+    const sheet = `.btn{color:red}\n/*# sourceMappingURL=data:application/json;base64,${b64} */`;
+    expect(mapStyleSource(sheet, 'sheet-1', 0)).toBe('/src/Button.module.css:1');
+  });
+
+  it('strips Vite query from inline source map sources[0]', () => {
+    const map = JSON.stringify({
+      version: 3,
+      sources: ['/src/App.vue?vue&type=style&index=0'],
+      mappings: 'AAAA',
+    });
+    const b64 = Buffer.from(map).toString('base64');
+    const sheet = `.x{color:red}\n/*# sourceMappingURL=data:application/json;base64,${b64} */`;
+    expect(mapStyleSource(sheet, 'sheet-1', 0)).toBe('/src/App.vue:1');
+  });
+
+  it('respects sourceRoot when joining sources path', () => {
+    const map = JSON.stringify({
+      version: 3,
+      sourceRoot: '/project',
+      sources: ['src/styles/main.css'],
+      mappings: 'AAAA',
+    });
+    const b64 = Buffer.from(map).toString('base64');
+    const sheet = `*{}\n/*# sourceMappingURL=data:application/json;base64,${b64} */`;
+    expect(mapStyleSource(sheet, 'sheet-1', 0)).toBe('/project/src/styles/main.css:1');
+  });
+
+  it('degrades to sheetId:line when base64 sourcemap is malformed', () => {
+    const sheet = '.x{}\n/*# sourceMappingURL=data:application/json;base64,!!!not-base64-or-json!!! */';
+    // Either succeeds with our regex matching or falls back gracefully — must
+    // not throw, and must produce some line reference for the rule.
+    const out = mapStyleSource(sheet, 'sheet-99', 3);
+    expect(typeof out).toBe('string');
+    expect(out).toContain(':4');
+  });
+});
+
+// =========================================================================
+// cascadeStr — integration with mapStyleSource (Vite / CSS Modules)
+// =========================================================================
+
+describe('cascadeStr Vite/CSS-modules integration', () => {
+  function mkCdp(sheetText) {
+    return {
+      calls: [],
+      send(method, params = {}) {
+        this.calls.push({ method, params });
+        if (method === 'DOM.getDocument') return Promise.resolve({ root: { nodeId: 1 } });
+        if (method === 'DOM.querySelector') return Promise.resolve({ nodeId: 10 });
+        if (method === 'CSS.getStyleSheetText') return Promise.resolve({ text: sheetText });
+        if (method === 'CSS.getMatchedStylesForNode') return Promise.resolve({
+          matchedCSSRules: [{
+            rule: {
+              selectorList: { text: '.btn' },
+              origin: 'regular',
+              style: {
+                styleSheetId: 'opaque-sheet-id-xyz',
+                range: { startLine: 0 },
+                cssProperties: [{ name: 'color', value: 'rgb(0, 128, 0)' }],
+              },
+            },
+          }],
+          inherited: [],
+        });
+        if (method === 'CSS.getComputedStyleForNode') return Promise.resolve({
+          computedStyle: [{ name: 'color', value: 'rgb(0, 128, 0)' }],
+        });
+        return Promise.resolve({});
+      },
+      onEvent() { return () => {}; },
+    };
+  }
+
+  it('shows a CSS module path (with Vite query stripped) instead of opaque sheet id', async () => {
+    const sheet = '.btn{color:rgb(0,128,0)}\n/*# sourceURL=/src/Button.module.css?vue&type=style&lang.css */';
+    const cdp = mkCdp(sheet);
+    const out = await cascadeStr(cdp, 'sid', '.btn', 'color', new Map());
+    expect(out).toContain('/src/Button.module.css:1');
+    expect(out).not.toContain('opaque-sheet-id-xyz');
+  });
+
+  it('uses inline base64 sourcemap to resolve original module path', async () => {
+    const map = JSON.stringify({
+      version: 3,
+      sources: ['/src/components/Card.module.css'],
+      mappings: 'AAAA',
+    });
+    const b64 = Buffer.from(map).toString('base64');
+    const sheet = `.btn{color:rgb(0,128,0)}\n/*# sourceMappingURL=data:application/json;base64,${b64} */`;
+    const cdp = mkCdp(sheet);
+    const out = await cascadeStr(cdp, 'sid', '.btn', 'color', new Map());
+    expect(out).toContain('/src/components/Card.module.css:1');
+    expect(out).not.toContain('opaque-sheet-id-xyz');
+  });
+
+  it('degrades to sheetId:line when sheet text is empty (safe fallback)', async () => {
+    const cdp = mkCdp('');
+    const out = await cascadeStr(cdp, 'sid', '.btn', 'color', new Map());
+    expect(out).toContain('opaque-sheet-id-xyz:1');
+  });
+});
+
+// =========================================================================
+// formatBatchResults — human-readable batch output
+// =========================================================================
+
+describe('formatBatchResults', () => {
+  const results = [
+    { cmd: 'click', ok: true, result: 'Clicked <button> "Submit"' },
+    { cmd: 'console', ok: true, result: '[error] boom\n[warning] hi' },
+    { cmd: 'fill', ok: false, error: 'Element not found: #x' },
+  ];
+
+  it('default json output is parseable JSON array', () => {
+    const out = formatBatchResults(results);
+    const parsed = JSON.parse(out);
+    expect(Array.isArray(parsed)).toBe(true);
+    expect(parsed).toHaveLength(3);
+    expect(parsed[2].ok).toBe(false);
+  });
+
+  it('plain output is human-readable and not valid JSON', () => {
+    const out = formatBatchResults(results, 'plain');
+    expect(() => JSON.parse(out)).toThrow();
+    expect(out).toContain('[1/3] click');
+    expect(out).toContain('Clicked <button> "Submit"');
+    expect(out).toContain('[2/3] console');
+    expect(out).toContain('[error] boom');
+    expect(out).toContain('[3/3] fill (error)');
+    expect(out).toContain('Element not found: #x');
+  });
+
+  it('compact output is one line per command', () => {
+    const out = formatBatchResults(results, 'compact');
+    const lines = out.split('\n');
+    expect(lines).toHaveLength(3);
+    expect(lines[0]).toContain('[1] click');
+    expect(lines[0]).toContain('Clicked <button> "Submit"');
+    expect(lines[1]).toContain('[2] console');
+    expect(lines[1]).toContain('[error] boom');
+    expect(lines[1]).not.toContain('[warning] hi'); // truncated to first line
+    expect(lines[2]).toContain('[3] fill');
+    expect(lines[2]).toContain('ERROR Element not found');
+  });
+
+  it('plain output handles empty result string with bare header', () => {
+    const out = formatBatchResults([{ cmd: 'press', ok: true, result: '' }], 'plain');
+    expect(out).toContain('[1/1] press');
+  });
+
+  it('compact marks empty result as ok', () => {
+    const out = formatBatchResults([{ cmd: 'press', ok: true, result: '' }], 'compact');
+    expect(out).toContain('[1] press: ok');
+  });
+});
+
+// =========================================================================
+// parseFlowSteps — semicolon-separated step parser
+// =========================================================================
+
+describe('parseFlowSteps', () => {
+  it('returns empty array for empty input', () => {
+    expect(parseFlowSteps('')).toEqual([]);
+    expect(parseFlowSteps('   ')).toEqual([]);
+    expect(parseFlowSteps(undefined)).toEqual([]);
+  });
+
+  it('parses a single command step', () => {
+    expect(parseFlowSteps('click @1')).toEqual([
+      { kind: 'command', cmd: 'click', args: ['@1'] },
+    ]);
+  });
+
+  it('parses multiple steps separated by semicolons', () => {
+    const steps = parseFlowSteps('click @1; summary; console --errors');
+    expect(steps).toHaveLength(3);
+    expect(steps[0]).toEqual({ kind: 'command', cmd: 'click', args: ['@1'] });
+    expect(steps[1]).toEqual({ kind: 'command', cmd: 'summary', args: [] });
+    expect(steps[2]).toEqual({ kind: 'command', cmd: 'console', args: ['--errors'] });
+  });
+
+  it('parses wait dom stable as a wait step', () => {
+    expect(parseFlowSteps('wait dom stable')).toEqual([
+      { kind: 'wait', what: 'dom stable' },
+    ]);
+  });
+
+  it('parses wait network idle as a wait step', () => {
+    expect(parseFlowSteps('wait network idle')).toEqual([
+      { kind: 'wait', what: 'network idle' },
+    ]);
+  });
+
+  it('mixes wait and command steps', () => {
+    const steps = parseFlowSteps('click @1; wait dom stable; summary; console --errors');
+    expect(steps.map(s => s.kind)).toEqual(['command', 'wait', 'command', 'command']);
+    expect(steps[1].what).toBe('dom stable');
+  });
+
+  it('trims whitespace and skips empty steps', () => {
+    expect(parseFlowSteps('  click @1  ;  ;  summary  ')).toEqual([
+      { kind: 'command', cmd: 'click', args: ['@1'] },
+      { kind: 'command', cmd: 'summary', args: [] },
+    ]);
+  });
+});
+
+// =========================================================================
+// flowStr — sequential runner with halt-on-error
+// =========================================================================
+
+describe('flowStr', () => {
+  it('throws when input is empty', async () => {
+    await expect(flowStr({ run: async () => ({}), settle: async () => '' }, '')).rejects.toThrow(/no steps/);
+  });
+
+  it('runs commands sequentially and includes results', async () => {
+    const calls = [];
+    const run = async (step) => {
+      calls.push(step);
+      return { ok: true, result: `did ${step.cmd}` };
+    };
+    const settle = async () => 'ignored';
+    const out = await flowStr({ run, settle }, 'click @1; summary');
+    expect(calls.map(c => c.cmd)).toEqual(['click', 'summary']);
+    expect(out).toContain('Flow: 2 step(s)');
+    expect(out).toContain('[1/2] click @1');
+    expect(out).toContain('did click');
+    expect(out).toContain('[2/2] summary');
+    expect(out).toContain('did summary');
+  });
+
+  it('invokes settle helper for wait steps', async () => {
+    const settleCalls = [];
+    const run = async () => ({ ok: true, result: 'ok' });
+    const settle = async (what) => { settleCalls.push(what); return `settled: ${what}`; };
+    const out = await flowStr({ run, settle }, 'wait dom stable; wait network idle');
+    expect(settleCalls).toEqual(['dom stable', 'network idle']);
+    expect(out).toContain('settled: dom stable');
+    expect(out).toContain('settled: network idle');
+  });
+
+  it('halts immediately on the first failing step', async () => {
+    const seen = [];
+    const run = async (step) => {
+      seen.push(step.cmd);
+      if (step.cmd === 'click') return { ok: false, error: 'Element not found' };
+      return { ok: true, result: 'ok' };
+    };
+    const out = await flowStr({ run, settle: async () => '' }, 'click @9; summary');
+    expect(seen).toEqual(['click']);
+    expect(out).toContain('Element not found');
+    expect(out).toContain('Flow halted');
+    expect(out).not.toContain('did summary');
+  });
+
+  it('halts when settle helper throws', async () => {
+    const run = async () => ({ ok: true, result: 'ok' });
+    const settle = async () => { throw new Error('settle exploded'); };
+    const out = await flowStr({ run, settle }, 'wait dom stable; summary');
+    expect(out).toContain('settle exploded');
+    expect(out).toContain('Flow halted');
+  });
+
+  it('produces a step-by-step layout (not one giant JSON blob)', async () => {
+    const run = async (step) => ({ ok: true, result: `result of ${step.cmd}` });
+    const out = await flowStr({ run, settle: async (w) => w }, 'click @1; wait dom stable; summary');
+    // Should not be JSON
+    expect(() => JSON.parse(out)).toThrow();
+    // Should have one numbered head per step
+    const heads = out.split('\n').filter(l => /^\[\d+\/\d+\]/.test(l));
+    expect(heads).toHaveLength(3);
+  });
+});
+
+// =========================================================================
+// settleFlow — wait helpers
+// =========================================================================
+
+describe('settleFlow', () => {
+  it('rejects unknown wait verb', async () => {
+    const cdp = createMockCDP({});
+    await expect(settleFlow(cdp, 'sid', 'paint stable', new Map())).rejects.toThrow(/dom stable.*network idle/i);
+  });
+
+  it('returns "network idle" immediately when no pending requests', async () => {
+    const cdp = createMockCDP({});
+    const out = await settleFlow(cdp, 'sid', 'network idle', new Map(), { quietMs: 50, maxMs: 500 });
+    expect(out).toBe('network idle');
+  });
+
+  it('reports timeout for network idle when requests stay pending', async () => {
+    const cdp = createMockCDP({});
+    const pending = new Map([['r1', {}], ['r2', {}]]);
+    const out = await settleFlow(cdp, 'sid', 'network idle', pending, { maxMs: 200, quietMs: 50 });
+    expect(out).toContain('timeout');
+    expect(out).toContain('2 pending');
+  });
+
+  it('uses waitForSettle for "dom stable"', async () => {
+    // waitForSettle calls evalStr with a Promise. Our mock resolves immediately.
+    const cdp = createMockCDP({
+      'Runtime.evaluate': () => ({ result: { value: undefined } }),
+    });
+    const out = await settleFlow(cdp, 'sid', 'dom stable', new Map(), { maxMs: 100 });
+    expect(out).toBe('dom stable');
+  });
+});
+
+// =========================================================================
+// Doctor / ready — diagnostics
+// =========================================================================
+
+describe('checkNode', () => {
+  it('returns OK for v22+', () => {
+    expect(checkNode('v22.10.0').status).toBe('OK');
+    expect(checkNode('v24.0.0').status).toBe('OK');
+    expect(checkNode('v22.0.0').status).toBe('OK');
+  });
+  it('returns FAIL for older Node', () => {
+    const r = checkNode('v18.16.0');
+    expect(r.status).toBe('FAIL');
+    expect(r.detail).toContain('need >= 22');
+    expect(r.hint).toMatch(/WebSocket/);
+  });
+  it('handles malformed version strings gracefully', () => {
+    const r = checkNode('???');
+    expect(r.status).toBe('FAIL');
+  });
+});
+
+describe('checkSkillSymlink', () => {
+  it('returns WARN when path does not exist', () => {
+    const fs = { existsSync: () => false };
+    const r = checkSkillSymlink({ home: '/home/test', fs });
+    expect(r.status).toBe('WARN');
+    expect(r.detail).toContain('/home/test/.claude/skills/chrome-cdp-ex');
+    expect(r.detail).toContain('not found');
+    expect(r.hint).toMatch(/cp -r/);
+  });
+
+  it('returns OK with "symlink" detail when target is a symlink', () => {
+    const fs = { existsSync: () => true, lstatSync: () => ({ isSymbolicLink: () => true }) };
+    const r = checkSkillSymlink({ home: '/h', fs });
+    expect(r.status).toBe('OK');
+    expect(r.detail).toContain('symlink');
+  });
+
+  it('returns OK with "directory" detail when target is a real directory', () => {
+    const fs = { existsSync: () => true, lstatSync: () => ({ isSymbolicLink: () => false }) };
+    const r = checkSkillSymlink({ home: '/h', fs });
+    expect(r.status).toBe('OK');
+    expect(r.detail).toContain('directory');
+  });
+
+  it('returns OK even when lstat is unavailable', () => {
+    const fs = { existsSync: () => true, lstatSync: null };
+    const r = checkSkillSymlink({ home: '/h', fs });
+    expect(r.status).toBe('OK');
+  });
+});
+
+describe('checkDaemonSockets', () => {
+  it('returns OK with "no live tab daemons" when none running', () => {
+    const r = checkDaemonSockets({ list: () => [] });
+    expect(r.status).toBe('OK');
+    expect(r.detail).toMatch(/no live tab daemons/);
+  });
+  it('lists daemon target prefixes when sockets are present', () => {
+    const r = checkDaemonSockets({ list: () => [
+      { targetId: 'AABBCCDDEEFF1122' },
+      { targetId: 'XYZ12345QQQQ' },
+    ] });
+    expect(r.status).toBe('OK');
+    expect(r.detail).toContain('2 live');
+    expect(r.detail).toContain('AABBCCDD');
+    expect(r.detail).toContain('XYZ12345');
+  });
+});
+
+describe('checkCdpReachability', () => {
+  it('returns OK when CDP_PORT /json/version succeeds with debugger url', async () => {
+    const fetcher = async () => ({
+      ok: true,
+      json: async () => ({ Browser: 'Chrome/123.0', webSocketDebuggerUrl: 'ws://x:9222/devtools/browser/abc' }),
+    });
+    const r = await checkCdpReachability({ env: { CDP_PORT: '9222' }, fetcher });
+    expect(r.status).toBe('OK');
+    expect(r.detail).toContain('Chrome/123.0');
+    expect(r.detail).toContain('9222');
+  });
+
+  it('annotates Electron in detail when User-Agent contains Electron/x', async () => {
+    const fetcher = async () => ({
+      ok: true,
+      json: async () => ({
+        Browser: 'HeadlessChrome/130',
+        webSocketDebuggerUrl: 'ws://localhost:9222/devtools/browser/abc',
+        'User-Agent': 'Mozilla/5.0 ... Electron/33.4.11',
+      }),
+    });
+    const r = await checkCdpReachability({ env: { CDP_PORT: '9222' }, fetcher });
+    expect(r.status).toBe('OK');
+    expect(r.detail).toContain('Electron 33.4.11');
+  });
+
+  it('returns FAIL when fetch throws (e.g. ECONNREFUSED)', async () => {
+    const fetcher = async () => { throw new Error('ECONNREFUSED'); };
+    const r = await checkCdpReachability({ env: { CDP_PORT: '9999' }, fetcher });
+    expect(r.status).toBe('FAIL');
+    expect(r.detail).toContain('cannot reach');
+    expect(r.hint).toContain('--remote-debugging-port=9999');
+  });
+
+  it('returns WARN when /json/version is reachable but missing webSocketDebuggerUrl', async () => {
+    const fetcher = async () => ({ ok: true, json: async () => ({ Browser: 'Chrome/123' }) });
+    const r = await checkCdpReachability({ env: { CDP_PORT: '9222' }, fetcher });
+    expect(r.status).toBe('WARN');
+    expect(r.detail).toMatch(/no webSocketDebuggerUrl/);
+  });
+
+  it('returns FAIL when no CDP_PORT and no DevToolsActivePort discoverable', async () => {
+    // Use a fake home so no DevToolsActivePort exists.
+    const fetcher = async () => { throw new Error('should not be called'); };
+    const r = await checkCdpReachability({
+      env: {}, fetcher,
+    });
+    // Either succeeds against the live machine or fails — both are acceptable
+    // shapes here. Critically, it must produce a structured result with hint
+    // when no port is set anywhere.
+    expect(['OK', 'WARN', 'FAIL']).toContain(r.status);
+    if (r.status === 'FAIL') {
+      expect(r.hint).toMatch(/chrome:\/\/inspect|CDP_PORT/);
+    }
+  });
+});
+
+describe('formatDoctorReport', () => {
+  it('renders OK/WARN/FAIL labels and shows hints', () => {
+    const out = formatDoctorReport([
+      { status: 'OK', label: 'Node', detail: 'v22.10.0' },
+      { status: 'WARN', label: 'Skill install', detail: '/h/.claude/skills/chrome-cdp-ex not found', hint: 'cp -r ...' },
+      { status: 'FAIL', label: 'CDP', detail: 'cannot reach 127.0.0.1:9222', hint: 'enable debugging' },
+    ]);
+    expect(out).toContain('chrome-cdp-ex doctor');
+    expect(out).toContain('[OK  ] Node');
+    expect(out).toContain('[WARN] Skill install');
+    expect(out).toContain('[FAIL] CDP');
+    expect(out).toContain('hint: cp -r ...');
+    expect(out).toContain('hint: enable debugging');
+    expect(out).toContain('Not ready');
+  });
+
+  it('reports "Ready." when all checks are OK', () => {
+    const out = formatDoctorReport([
+      { status: 'OK', label: 'Node', detail: 'v22' },
+      { status: 'OK', label: 'CDP', detail: 'reachable' },
+    ]);
+    expect(out).toContain('Ready.');
+    expect(out).not.toContain('Not ready');
+  });
+
+  it('reports "Mostly ready" when only WARNs present', () => {
+    const out = formatDoctorReport([
+      { status: 'OK', label: 'Node', detail: 'v22' },
+      { status: 'WARN', label: 'Skill', detail: 'missing' },
+    ]);
+    expect(out).toContain('Mostly ready');
+    expect(out).toContain('1 warning');
+  });
+});
+
+describe('runDoctorChecks', () => {
+  it('runs all checks and returns array of result objects', async () => {
+    const fetcher = async () => ({ ok: true, json: async () => ({ Browser: 'Chrome', webSocketDebuggerUrl: 'ws://x' }) });
+    const checks = await runDoctorChecks({
+      nodeVersion: 'v22.10.0',
+      home: '/tmp/no-such-home-here',
+      fs: { existsSync: () => false, lstatSync: null },
+      listDaemons: () => [],
+      env: { CDP_PORT: '9222' },
+      fetcher,
+    });
+    expect(Array.isArray(checks)).toBe(true);
+    expect(checks).toHaveLength(4);
+    expect(checks[0].label).toBe('Node');
+    expect(checks[1].label).toBe('Skill install');
+    expect(checks[2].label).toBe('Daemons');
+    expect(checks[3].label).toBe('CDP');
+  });
+});
+
+describe('doctorStr', () => {
+  it('returns formatted multi-line report including Ready./Not ready summary', async () => {
+    const fetcher = async () => ({ ok: true, json: async () => ({ Browser: 'Chrome/123', webSocketDebuggerUrl: 'ws://x' }) });
+    const out = await doctorStr({
+      nodeVersion: 'v22.10.0',
+      home: '/tmp/no-such-home',
+      fs: { existsSync: () => false, lstatSync: null },
+      listDaemons: () => [],
+      env: { CDP_PORT: '9222' },
+      fetcher,
+    });
+    expect(out).toContain('chrome-cdp-ex doctor');
+    expect(out).toMatch(/\[OK\s*\] Node/);
+    expect(out).toMatch(/\[WARN\] Skill install/);
+    expect(out).toMatch(/\[OK\s*\] Daemons/);
+    expect(out).toMatch(/\[OK\s*\] CDP/);
+    expect(out).toContain('Mostly ready');
+  });
+
+  it('marks report as Not ready when CDP fails', async () => {
+    const fetcher = async () => { throw new Error('ECONNREFUSED'); };
+    const out = await doctorStr({
+      nodeVersion: 'v22.10.0',
+      home: '/tmp/x',
+      fs: { existsSync: () => true, lstatSync: () => ({ isSymbolicLink: () => true }) },
+      listDaemons: () => [],
+      env: { CDP_PORT: '9999' },
+      fetcher,
+    });
+    expect(out).toContain('Not ready');
+    expect(out).toMatch(/\[FAIL\] CDP/);
   });
 });

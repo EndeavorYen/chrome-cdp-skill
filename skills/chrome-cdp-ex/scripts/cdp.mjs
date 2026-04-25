@@ -7,7 +7,7 @@
 // the CDP session open. Chrome's "Allow debugging" modal fires once per
 // daemon (= once per tab). Daemons auto-exit after 20min idle.
 
-import { readFileSync, writeFileSync, unlinkSync, existsSync, readdirSync, mkdirSync } from 'fs';
+import { readFileSync, writeFileSync, unlinkSync, existsSync, readdirSync, mkdirSync, lstatSync } from 'fs';
 import { homedir } from 'os';
 import { resolve } from 'path';
 import { spawn } from 'child_process';
@@ -2101,10 +2101,10 @@ function formatRecordEvent(e, startTs) {
 }
 
 function parseRecordArgs(args) {
-  const opts = { durationMs: 1000, until: null, action: null, actionArgs: [] };
+  const opts = { durationMs: 1000, until: null, action: null, actionArgs: [], explicitDuration: false };
   const setUntil = (val) => {
     const v = (val || '').toLowerCase();
-    if (!['dom stable', 'network idle'].includes(v)) throw new Error('record --until supports "dom stable" or "network idle"');
+    if (!['dom stable', 'network idle', 'auto settle'].includes(v)) throw new Error('record --until supports "dom stable" or "network idle"');
     opts.until = v;
   };
   for (let i = 0; i < args.length; i++) {
@@ -2112,16 +2112,14 @@ function parseRecordArgs(args) {
     if (arg === '--action') {
       opts.action = args[++i];
       if (!opts.action) throw new Error('record --action requires an action command (click, press, fill, select, type, scroll, nav)');
-      // Trailing args are passed to the action, but pull out a trailing
-      // --until so flag ordering (`--action click @5 --until "dom stable"`)
-      // works the same as the leading form. Anything not recognized as a
-      // known record flag is forwarded to the action verbatim.
       const rest = args.slice(i + 1);
       const actionArgs = [];
       for (let j = 0; j < rest.length; j++) {
         const a = rest[j];
-        if (a === '--until') {
-          setUntil(rest[++j]);
+        if (a === '--until') { setUntil(rest[++j]); continue; }
+        if (/^\d+$/.test(a) && j === rest.length - 1) {
+          opts.durationMs = Math.min(Math.max(parseInt(a), 100), 30000);
+          opts.explicitDuration = true;
           continue;
         }
         actionArgs.push(a);
@@ -2129,17 +2127,22 @@ function parseRecordArgs(args) {
       opts.actionArgs = actionArgs;
       break;
     }
-    if (arg === '--until') {
-      setUntil(args[++i]);
-      continue;
-    }
+    if (arg === '--until') { setUntil(args[++i]); continue; }
     if (/^\d+$/.test(arg)) {
       opts.durationMs = Math.min(Math.max(parseInt(arg), 100), 30000);
+      opts.explicitDuration = true;
       continue;
     }
     throw new Error(`Unknown record argument: ${arg}`);
   }
-  if (opts.until) opts.durationMs = 30000;
+  // --action with no explicit duration and no --until: auto-settle (DOM/network quiet)
+  // Cap: 5s for DOM-only, 10s if network activity observed.
+  if (opts.action && !opts.until && !opts.explicitDuration) {
+    opts.until = 'auto settle';
+    opts.durationMs = 10000;
+  } else if (opts.until && !opts.explicitDuration) {
+    opts.durationMs = 30000;
+  }
   return opts;
 }
 
@@ -2248,13 +2251,19 @@ async function recordStr(cdp, sid, args, refs) {
     }
 
     let quietSince = Date.now();
+    let networkSeen = false;
     const deadline = Date.now() + opts.durationMs;
+    // Auto-settle cap: 5s if no network activity has been observed yet, else 10s.
+    const autoCap = () => Date.now() - startTs >= (networkSeen ? 10000 : 5000);
     while (Date.now() < deadline) {
       await sleep(Math.min(100, deadline - Date.now()));
       const domSummary = await collectDomMutationSummary(cdp, sid);
       if (domSummary) { events.push({ kind: 'dom', summary: domSummary, ts: Date.now() }); quietSince = Date.now(); }
+      if (pending.size > 0 || events.some(e => e.kind === 'network')) networkSeen = true;
       if (opts.until === 'network idle' && pending.size === 0 && Date.now() - quietSince >= 500) break;
       if (opts.until === 'dom stable' && Date.now() - quietSince >= 500) break;
+      if (opts.until === 'auto settle' && pending.size === 0 && Date.now() - quietSince >= 500) break;
+      if (opts.until === 'auto settle' && autoCap()) break;
       if (!opts.until && Date.now() >= deadline) break;
     }
 
@@ -2280,21 +2289,103 @@ const INHERITABLE_PROPS = new Set([
   'cursor', 'direction', 'list-style',
 ]);
 
+// Strip Vite/CSS Module query suffixes (?vue&type=style&lang.css, ?direct, ?used)
+function stripVitePathQuery(url) {
+  if (!url) return url;
+  const q = url.indexOf('?');
+  return q === -1 ? url : url.slice(0, q);
+}
+
+const _B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+function decodeVLQ(str) {
+  const out = [];
+  let value = 0, shift = 0;
+  for (let i = 0; i < str.length; i++) {
+    const ch = _B64.indexOf(str[i]);
+    if (ch === -1) return out;
+    const cont = ch & 32;
+    const digit = ch & 31;
+    value += digit << shift;
+    shift += 5;
+    if (!cont) {
+      const negate = value & 1;
+      out.push(negate ? -(value >> 1) : (value >> 1));
+      value = 0; shift = 0;
+    }
+  }
+  return out;
+}
+
+// Walk source-map mappings to find first segment on generated line `genLine0`
+function mapLineToSource(mappings, genLine0) {
+  if (typeof mappings !== 'string' || !mappings) return null;
+  const lines = mappings.split(';');
+  if (genLine0 < 0 || genLine0 >= lines.length) return null;
+  let srcIdx = 0, origLine = 0, origCol = 0;
+  let result = null;
+  for (let i = 0; i <= genLine0; i++) {
+    const segments = lines[i].split(',');
+    for (const seg of segments) {
+      if (!seg) continue;
+      const vals = decodeVLQ(seg);
+      if (vals.length >= 4) {
+        srcIdx += vals[1];
+        origLine += vals[2];
+        origCol += vals[3];
+        if (i === genLine0 && result === null) {
+          result = { srcIdx, origLine, origCol };
+        }
+      }
+    }
+  }
+  return result;
+}
+
+function mapInlineSourceMap(sheetText, genLine0) {
+  const m = sheetText.match(/sourceMappingURL=data:application\/json[^,]*?base64,([A-Za-z0-9+/=]+)/);
+  if (!m) return null;
+  let json;
+  try {
+    const decoded = Buffer.from(m[1], 'base64').toString('utf8');
+    json = JSON.parse(decoded);
+  } catch { return null; }
+  const sources = json.sources || [];
+  if (sources.length === 0) return null;
+  const mapping = mapLineToSource(json.mappings || '', genLine0);
+  const srcIdx = mapping ? Math.max(0, Math.min(mapping.srcIdx, sources.length - 1)) : 0;
+  const origLine = mapping ? mapping.origLine : genLine0;
+  const sourceRoot = (json.sourceRoot || '').replace(/\/$/, '');
+  const rawSrc = sources[srcIdx] || '';
+  if (!rawSrc) return null;
+  const fullPath = sourceRoot ? `${sourceRoot}/${rawSrc}` : rawSrc;
+  return `${stripVitePathQuery(fullPath)}:${origLine + 1}`;
+}
+
+// Map a stylesheet line to the most-informative source location available
+function mapStyleSource(sheetText, sheetId, genLine0) {
+  const text = sheetText || '';
+  const inline = mapInlineSourceMap(text, genLine0);
+  if (inline) return inline;
+  const sourceUrl = text.match(/\/\*#?\s*sourceURL=([^*\n]+)\s*\*\//)?.[1]
+    || text.match(/\/\/# sourceURL=([^\n]+)/)?.[1];
+  if (sourceUrl) return `${stripVitePathQuery(sourceUrl.trim())}:${genLine0 + 1}`;
+  const mapUrl = text.match(/sourceMappingURL=([^\s*]+)/)?.[1];
+  if (mapUrl && !mapUrl.startsWith('data:')) {
+    return `${stripVitePathQuery(mapUrl.trim().replace(/\.map$/, ''))}:${genLine0 + 1}`;
+  }
+  return `${sheetId}:${genLine0 + 1}`;
+}
+
 async function resolveStyleSource(cdp, sid, rule) {
   const origin = rule.origin;
   if (origin === 'user-agent') return 'user-agent stylesheet';
   const sheetId = rule.style?.styleSheetId;
   if (!sheetId) return origin === 'regular' ? 'inline style' : (origin || 'unknown stylesheet');
   const range = rule.style.range;
-  const line = range ? `:${range.startLine + 1}` : '';
+  const genLine0 = range ? range.startLine : 0;
   let header;
   try { header = await cdp.send('CSS.getStyleSheetText', { styleSheetId: sheetId }, sid); } catch {}
-  const text = header?.text || '';
-  const sourceUrl = text.match(/\/\*#?\s*sourceURL=([^*\n]+)\s*\*\//)?.[1]
-    || text.match(/\/\/# sourceURL=([^\n]+)/)?.[1]
-    || text.match(/sourceMappingURL=([^\s*]+)/)?.[1];
-  if (sourceUrl) return `${sourceUrl.trim()}${line}`;
-  return `${sheetId}${line}`;
+  return mapStyleSource(header?.text || '', sheetId, genLine0);
 }
 
 async function cascadeStr(cdp, sid, selector, property, refMap) {
@@ -2371,15 +2462,21 @@ async function cascadeStr(cdp, sid, selector, property, refMap) {
     });
   }
 
-  // Dedupe identical (selector, value, source, origin) entries per property.
+  const normalizeCssValue = (v) => String(v || '')
+    .trim()
+    .replace(/\s*,\s*/g, ', ')
+    .replace(/\s+/g, ' ');
+
+  // Dedupe identical (selector, normalized value, source, origin) entries per property.
   // CDP can return repeated matchedCSSRules / cssProperties (e.g. same rule
-  // matched via multiple selectors in the selectorList); rendering them twice
+  // matched via multiple selectors in the selectorList, or authored vs normalized
+  // values like rgb(37,99,235) vs rgb(37, 99, 235)); rendering them twice
   // misleadingly implies multiple independent winning rules.
   for (const [name, rules] of propRules) {
     const seen = new Set();
     const deduped = [];
     for (const r of rules) {
-      const key = `${r.selector} ${r.value} ${r.source} ${r.origin}`;
+      const key = `${r.selector}\u0000${normalizeCssValue(r.value)}\u0000${r.source}\u0000${r.origin}`;
       if (seen.has(key)) continue;
       seen.add(key);
       deduped.push(r);
@@ -2409,7 +2506,7 @@ async function cascadeStr(cdp, sid, selector, property, refMap) {
 
     lines.push(`${prop}: ${computedVal}`);
     for (const r of rules) {
-      const isWinner = r.value.trim() === computedVal.trim();
+      const isWinner = normalizeCssValue(r.value) === normalizeCssValue(computedVal);
       const mark = isWinner ? '✓' : '✗';
       const note = isWinner ? '' : '  [overridden]';
       lines.push(`  ${mark} ${r.selector} { ${prop}: ${r.value} }${note}`);
@@ -2454,6 +2551,241 @@ async function cascadeStr(cdp, sid, selector, property, refMap) {
 async function closetabStr(cdp, targetId) {
   await cdp.send('Target.closeTarget', { targetId });
   return `Closed tab: ${targetId.slice(0, 8)}`;
+}
+
+// --- Batch result formatting ---
+function formatBatchResults(results, format = 'json') {
+  if (format === 'plain') {
+    const lines = [];
+    for (let i = 0; i < results.length; i++) {
+      const r = results[i];
+      lines.push(`[${i + 1}/${results.length}] ${r.cmd}${r.ok ? '' : ' (error)'}`);
+      if (r.ok) {
+        const body = (r.result ?? '').toString();
+        if (body) lines.push(...body.split('\n').map(l => '  ' + l));
+      } else {
+        lines.push(`  ${r.error}`);
+      }
+    }
+    return lines.join('\n');
+  }
+  if (format === 'compact') {
+    return results.map((r, i) => {
+      const head = `[${i + 1}] ${r.cmd}`;
+      if (!r.ok) return `${head}: ERROR ${r.error}`;
+      const body = (r.result ?? '').toString().split('\n')[0].slice(0, 200);
+      return body ? `${head}: ${body}` : `${head}: ok`;
+    }).join('\n');
+  }
+  return JSON.stringify(results, null, 2);
+}
+
+// --- Flow: sequential step runner ---
+function parseFlowSteps(input) {
+  if (typeof input !== 'string' || !input.trim()) return [];
+  return input.split(';').map(s => s.trim()).filter(Boolean).map(line => {
+    const parts = line.split(/\s+/);
+    const head = parts[0];
+    if (head === 'wait') {
+      const what = parts.slice(1).join(' ').toLowerCase();
+      return { kind: 'wait', what };
+    }
+    return { kind: 'command', cmd: head, args: parts.slice(1) };
+  });
+}
+
+async function settleFlow(cdp, sid, what, pendingReqs, opts = {}) {
+  const max = opts.maxMs || 10000;
+  const quiet = opts.quietMs || 500;
+  if (what === 'dom stable') {
+    await waitForSettle(cdp, sid, max);
+    return 'dom stable';
+  }
+  if (what === 'network idle') {
+    const deadline = Date.now() + max;
+    let lastBusy = Date.now();
+    while (Date.now() < deadline) {
+      const size = pendingReqs?.size || 0;
+      if (size > 0) lastBusy = Date.now();
+      else if (Date.now() - lastBusy >= quiet) return 'network idle';
+      await sleep(100);
+    }
+    return `network idle (timeout, ${pendingReqs?.size || 0} pending)`;
+  }
+  throw new Error(`Unknown wait: "${what}". Use "dom stable" or "network idle".`);
+}
+
+async function flowStr({ run, settle }, input) {
+  const steps = parseFlowSteps(input);
+  if (steps.length === 0) throw new Error('flow: no steps. Example: flow <target> "click @1; wait dom stable; summary"');
+  const lines = [`Flow: ${steps.length} step(s)`];
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i];
+    const head = step.kind === 'wait'
+      ? `[${i + 1}/${steps.length}] wait ${step.what}`
+      : `[${i + 1}/${steps.length}] ${step.cmd}${step.args.length ? ' ' + step.args.join(' ') : ''}`;
+    lines.push(head);
+    try {
+      let body;
+      if (step.kind === 'wait') {
+        body = await settle(step.what);
+      } else {
+        const r = await run(step);
+        if (!r.ok) {
+          lines.push(`  ✗ ${r.error}`);
+          lines.push(`Flow halted at step ${i + 1}/${steps.length}`);
+          return lines.join('\n');
+        }
+        body = r.result ?? '';
+      }
+      const text = (body || '').toString();
+      if (text) for (const ln of text.split('\n')) lines.push('  ' + ln);
+    } catch (e) {
+      lines.push(`  ✗ ${e.message}`);
+      lines.push(`Flow halted at step ${i + 1}/${steps.length}`);
+      return lines.join('\n');
+    }
+  }
+  return lines.join('\n');
+}
+
+// --- Doctor: one-call diagnostics ---
+function checkNode(version = process.version) {
+  const major = parseInt(String(version).replace(/^v/, '').split('.')[0]) || 0;
+  if (major >= 22) return { status: 'OK', label: 'Node', detail: `${version} (>= 22)` };
+  return {
+    status: 'FAIL', label: 'Node', detail: `${version} (need >= 22)`,
+    hint: 'chrome-cdp-ex uses built-in WebSocket which requires Node 22+',
+  };
+}
+
+function checkSkillSymlink({ home = homedir(), fs = { existsSync, lstatSync: null } } = {}) {
+  const target = resolve(home, '.claude', 'skills', 'chrome-cdp-ex');
+  if (!fs.existsSync(target)) {
+    return {
+      status: 'WARN', label: 'Skill install', detail: `${target} not found`,
+      hint: 'Install with: cp -r skills/chrome-cdp-ex ~/.claude/skills/  (or use the plugin loader)',
+    };
+  }
+  let kind = 'directory';
+  try {
+    const lstat = fs.lstatSync ? fs.lstatSync(target) : null;
+    if (lstat?.isSymbolicLink?.()) kind = 'symlink';
+  } catch {}
+  return { status: 'OK', label: 'Skill install', detail: `${kind}: ${target}` };
+}
+
+function checkDaemonSockets({ list = listDaemonSockets } = {}) {
+  const daemons = list();
+  if (!daemons || daemons.length === 0) {
+    return { status: 'OK', label: 'Daemons', detail: 'no live tab daemons' };
+  }
+  const ids = daemons.map(d => (d.targetId || '').slice(0, 8)).filter(Boolean);
+  return {
+    status: 'OK', label: 'Daemons',
+    detail: `${daemons.length} live: ${ids.join(', ')}`,
+  };
+}
+
+async function checkCdpReachability({ env = process.env, fetcher = fetch, host = process.env.CDP_HOST || '127.0.0.1' } = {}) {
+  const port = env.CDP_PORT;
+  const tryFetch = async (p) => {
+    const res = await fetcher(`http://${host}:${p}/json/version`, { signal: AbortSignal.timeout(3000) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  };
+  const describe = (info) => {
+    const product = info.Browser || info.product || 'unknown browser';
+    const ua = info['User-Agent'] || '';
+    const m = ua.match(/Electron\/([\d.]+)/);
+    return m ? `${product} (Electron ${m[1]})` : product;
+  };
+  if (port) {
+    try {
+      const info = await tryFetch(port);
+      if (!info.webSocketDebuggerUrl) {
+        return {
+          status: 'WARN', label: 'CDP', detail: `port ${port}: no webSocketDebuggerUrl`,
+          hint: 'Browser exposes /json/version but not the debugger WebSocket — toggle remote debugging again',
+        };
+      }
+      return { status: 'OK', label: 'CDP', detail: `${host}:${port} → ${describe(info)}` };
+    } catch (e) {
+      return {
+        status: 'FAIL', label: 'CDP', detail: `cannot reach ${host}:${port} (${e.message})`,
+        hint: `start the app with --remote-debugging-port=${port}, or unset CDP_PORT to auto-discover Chrome`,
+      };
+    }
+  }
+  // Auto-discover via DevToolsActivePort (light reuse — avoids full ws connect)
+  const home = homedir();
+  const localAppData = process.env.LOCALAPPDATA || '';
+  const tryPaths = [
+    process.env.CDP_PORT_FILE,
+    resolve(home, 'Library/Application Support/Google/Chrome/DevToolsActivePort'),
+    resolve(home, 'Library/Application Support/Google/Chrome/Default/DevToolsActivePort'),
+    resolve(home, '.config/google-chrome/DevToolsActivePort'),
+    resolve(home, '.config/chromium/DevToolsActivePort'),
+    resolve(localAppData, 'Google\\Chrome\\User Data\\DevToolsActivePort'),
+  ].filter(Boolean);
+  const found = tryPaths.find(p => existsSync(p));
+  if (!found) {
+    return {
+      status: 'FAIL', label: 'CDP', detail: 'no DevToolsActivePort and no CDP_PORT set',
+      hint: 'Toggle chrome://inspect/#remote-debugging in Chrome, or set CDP_PORT=<port> for an Electron app',
+    };
+  }
+  let lines;
+  try {
+    lines = readFileSync(found, 'utf8').trim().split('\n');
+  } catch (e) {
+    return { status: 'WARN', label: 'CDP', detail: `cannot read ${found}: ${e.message}` };
+  }
+  if (lines.length < 2 || !lines[0]) {
+    return { status: 'WARN', label: 'CDP', detail: `invalid DevToolsActivePort at ${found}` };
+  }
+  const discoveredPort = lines[0];
+  try {
+    const info = await tryFetch(discoveredPort);
+    return { status: 'OK', label: 'CDP', detail: `${host}:${discoveredPort} → ${describe(info)} (auto-discovered)` };
+  } catch (e) {
+    return {
+      status: 'WARN', label: 'CDP',
+      detail: `DevToolsActivePort points to ${discoveredPort} but /json/version unreachable: ${e.message}`,
+      hint: 'Browser may have stopped — re-toggle chrome://inspect/#remote-debugging',
+    };
+  }
+}
+
+function formatDoctorReport(checks) {
+  const lines = ['chrome-cdp-ex doctor'];
+  for (const c of checks) {
+    const tag = c.status.padEnd(4);
+    lines.push(`  [${tag}] ${c.label}: ${c.detail}`);
+    if (c.hint) lines.push(`         hint: ${c.hint}`);
+  }
+  const fails = checks.filter(c => c.status === 'FAIL').length;
+  const warns = checks.filter(c => c.status === 'WARN').length;
+  if (fails === 0 && warns === 0) lines.push('Ready.');
+  else if (fails === 0) lines.push(`Mostly ready (${warns} warning${warns > 1 ? 's' : ''}).`);
+  else lines.push(`Not ready: ${fails} failure${fails > 1 ? 's' : ''}${warns ? `, ${warns} warning${warns > 1 ? 's' : ''}` : ''}.`);
+  return lines.join('\n');
+}
+
+async function runDoctorChecks(opts = {}) {
+  const safeLstat = (p) => { try { return lstatSync(p); } catch { return null; } };
+  const fs = opts.fs || { existsSync, lstatSync: safeLstat };
+  const checks = [];
+  checks.push(checkNode(opts.nodeVersion));
+  checks.push(checkSkillSymlink({ home: opts.home, fs }));
+  checks.push(checkDaemonSockets({ list: opts.listDaemons }));
+  checks.push(await checkCdpReachability({ env: opts.env, fetcher: opts.fetcher, host: opts.host }));
+  return checks;
+}
+
+async function doctorStr(opts = {}) {
+  const checks = await runDoctorChecks(opts);
+  return formatDoctorReport(checks);
 }
 
 // ---------------------------------------------------------------------------
@@ -2696,7 +3028,9 @@ async function runDaemon(targetId) {
         case 'batch': {
           let commands;
           const parallel = args.includes('--parallel');
-          const input = args.filter(a => a !== '--parallel').join(' ') || '';
+          const plain = args.includes('--plain');
+          const compact = args.includes('--compact');
+          const input = args.filter(a => a !== '--parallel' && a !== '--plain' && a !== '--compact').join(' ') || '';
           if (input.startsWith('[')) {
             try { commands = JSON.parse(input); } catch { return { ok: false, error: 'batch: invalid JSON array' }; }
             if (!Array.isArray(commands)) return { ok: false, error: 'batch argument must be a JSON array' };
@@ -2724,7 +3058,16 @@ async function runDaemon(targetId) {
             results = [];
             for (const c of commands) results.push(await runOne(c));
           }
-          result = JSON.stringify(results, null, 2);
+          const fmt = plain ? 'plain' : compact ? 'compact' : 'json';
+          result = formatBatchResults(results, fmt);
+          break;
+        }
+        case 'flow': {
+          const input = args.join(' ');
+          result = await flowStr({
+            run: (step) => handleCommand({ cmd: step.cmd, args: step.args || [] }),
+            settle: (what) => settleFlow(cdp, sessionId, what, pendingReqs),
+          }, input);
           break;
         }
         case 'stop': return { ok: true, result: '', stopAfter: true };
@@ -2962,6 +3305,16 @@ Usage: cdp <command> [args]
                                     Pipe syntax: 'fill @3 hello | fill @5 world | click @7'
                                     JSON syntax: '[{"cmd":"click","args":["@1"]},{"cmd":"perceive","args":["--diff"]}]'
                                     --parallel  Run commands concurrently (for independent ops like multiple elshots)
+                                    --plain     Human-readable per-step output (default: pretty JSON)
+                                    --compact   One line per step (head + first line of result)
+  flow  <target> "<steps>"          Sequential runner. Steps separated by ";".
+                                    Each step is a normal command (e.g. "click @1") or a wait alias:
+                                    "wait dom stable" / "wait network idle" — uses settle helper.
+                                    Halts on the first failing step. Output is readable, not JSON.
+                                    Example: flow A7BA "click @1; wait dom stable; summary; console --errors"
+  doctor / ready                    One-call diagnostics: Node version, skill install path,
+                                    daemon socket state, CDP_PORT/DevToolsActivePort reachability.
+                                    No target required. Exits 1 if any check FAILs.
   open  [url]                       Open a new tab (default: about:blank)
                                     Note: each new tab triggers a fresh "Allow debugging?" prompt
   stop  [target]                    Stop daemon(s)
@@ -3002,7 +3355,7 @@ DAEMON IPC (for advanced use / scripting)
   fullshot, scanshot, html, nav, net, click, clickxy, hover, type, press, scroll, fill,
   select, waitfor, loadall, styles, cookies, cookieset, cookiedel, dialog, viewport,
   upload, text, table, back, forward, reload, closetab, netlog, inject, cascade,
-  record, evalraw, batch, stop.
+  record, evalraw, batch, flow, stop.
   The socket disappears after 20 min of inactivity or when the tab closes.
 `;
 
@@ -3010,7 +3363,7 @@ const NEEDS_TARGET = new Set([
   'snap','snapshot','eval','shot','screenshot','html','nav','navigate',
   'net','network','click','clickxy','type','press','scroll','hover','waitfor','loadall','fill','select','fullshot','scanshot','styles','cookies','cookieset','cookiedel','evalraw','status','console','summary','perceive','elshot','batch','dialog','viewport','upload',
   'text','table','back','forward','reload','closetab','netlog',
-  'inject','cascade','record',
+  'inject','cascade','record','flow',
 ]);
 
 async function main() {
@@ -3106,6 +3459,13 @@ async function main() {
     return;
   }
 
+  // Doctor / ready — one-call diagnostics, no target needed
+  if (cmd === 'doctor' || cmd === 'ready') {
+    const out = await doctorStr();
+    console.log(out);
+    process.exit(out.includes('Not ready') ? 1 : 0);
+  }
+
   // Page commands — need target prefix
   if (!NEEDS_TARGET.has(cmd)) {
     console.error(`Unknown command: ${cmd}\n`);
@@ -3166,8 +3526,12 @@ async function main() {
     if (!cmdArgs[0] || !cmdArgs[1]) { console.error('Error: selector and file path(s) required'); process.exit(1); }
     // args[0] = selector, args[1] = comma-separated file paths (no join needed)
   } else if (cmd === 'batch') {
-    const filtered = cmdArgs.filter(a => a !== '--parallel');
+    const filtered = cmdArgs.filter(a => a !== '--parallel' && a !== '--plain' && a !== '--compact');
     if (!filtered[0]) { console.error('Error: commands required (pipe syntax or JSON array)'); process.exit(1); }
+  } else if (cmd === 'flow') {
+    if (!cmdArgs[0]) { console.error('Error: flow steps required (semicolon-separated). Example: flow <target> "click @1; wait dom stable; summary"'); process.exit(1); }
+    // Preserve multi-word/unquoted step recipes as one daemon argument.
+    cmdArgs.splice(0, cmdArgs.length, cmdArgs.join(' '));
   }
 
   if ((cmd === 'nav' || cmd === 'navigate') && !cmdArgs[0]) {
@@ -3206,4 +3570,10 @@ export const __test__ = process.env.NODE_ENV === 'test' ? {
   resetScreenshotTier, getScreenshotTier, SCREENSHOT_TIMEOUT,
   // Constants
   KEY_MAP, ENRICHED_ROLES, INTERACTIVE_ROLES,
+  // Cascade source mapping
+  decodeVLQ, mapLineToSource, mapInlineSourceMap, stripVitePathQuery, mapStyleSource,
+  // Batch / flow / doctor
+  formatBatchResults, parseFlowSteps, settleFlow, flowStr,
+  checkNode, checkSkillSymlink, checkDaemonSockets, checkCdpReachability,
+  formatDoctorReport, runDoctorChecks, doctorStr,
 } : undefined;

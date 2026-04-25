@@ -1,6 +1,6 @@
 # chrome-cdp-ex
 
-[![45 Commands](https://img.shields.io/badge/commands-45-orange)](skills/chrome-cdp-ex/scripts/cdp.mjs)
+[![47 Commands](https://img.shields.io/badge/commands-47-orange)](skills/chrome-cdp-ex/scripts/cdp.mjs)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0-blue)](skills/chrome-cdp-ex/scripts/cdp.mjs)
 [![Node 22+](https://img.shields.io/badge/node-22%2B-brightgreen)](https://nodejs.org)
 [![MIT License](https://img.shields.io/badge/license-MIT-gray)](LICENSE)
@@ -22,7 +22,7 @@
 - [The Redesign Experiment](#the-redesign-experiment)
 - [Quick Start](#quick-start)
 - [How It Works](#how-it-works)
-- [Commands (45 total)](#commands-45-total)
+- [Commands (47 total)](#commands-47-total)
 - [WSL2 -> Windows Browser Control](#wsl2---windows-browser-control)
 - [Credits](#credits)
 - [License](#license)
@@ -54,7 +54,7 @@ The agent using `perceive` (layout + colors + spacing + coordinates) produced th
 | **Electron app support** | **Yes** - `CDP_PORT=9222` | No | No |
 | **WSL2 -> Windows** | **Yes** - built-in | No | No |
 | **Dependencies** | **0** | Playwright + Chromium binary | Varies |
-| **Commands** | **45** | N/A (programmatic API) | ~14 |
+| **Commands** | **47** | N/A (programmatic API) | ~14 |
 
 ## One command, complete page understanding
 
@@ -185,7 +185,7 @@ Output:
 1ED3DBAA  My App                                                  http://localhost:5173/#/menu
 ```
 
-All 45 commands work: `perceive`, `click`, `fill`, `cascade`, `record`, `inject`, and more.
+All 47 commands work: `perceive`, `click`, `fill`, `cascade`, `record`, `inject`, `flow`, `doctor`, and more.
 
 </details>
 
@@ -228,7 +228,7 @@ Each tab gets its own daemon process that keeps the CDP session open.
 Chrome's "Allow debugging" dialog appears **once per tab**, not once per command.
 Daemons auto-exit after 20 minutes of inactivity and passively collect console/exception/navigation events into ring buffers.
 
-## Commands (45 total)
+## Commands (47 total)
 
 Tip: start with `perceive`, then use `click`/`fill`/`select`; use `status` or `console` when you need debugging context.
 
@@ -240,6 +240,9 @@ list                               # list open tabs (shows targetId prefixes)
 open   [url]                       # open new tab (default: about:blank)
 stop   [target]                    # stop daemon(s)
 closetab <target>                  # close a browser tab
+doctor / ready                     # one-call diagnostics (no target needed)
+                                   # checks: Node 22+, skill install, daemon sockets, CDP reachability
+                                   # prints OK/WARN/FAIL with hints; exits 1 if any check FAILs
 ```
 
 </details>
@@ -336,13 +339,15 @@ inject  <target> --remove [id]      # remove injected element(s) — all or by i
 cascade <target> <sel|@ref>         # CSS origin tracing: full cascade with source file + line
 cascade <target> <sel|@ref> <prop>  # filter to one property (e.g. "background-color")
 record  <target> [ms]               # timeline of DOM/console/network/navigation events
-record  <target> --action click @5  # record cause → effect around an action
+record  <target> --action click @5  # record cause → effect around an action;
+                                    # auto-settles when no duration/--until given
+                                    # (cap: 5s without network activity, 10s with)
 record  <target> --until "dom stable"|"network idle"  # record until quiet (max 30s)
 ```
 
 `inject` returns an ID (`inject-1`, `inject-2`...) for targeted removal. URLs are validated (blocks `data:`, `file:`, cloud metadata).
 
-`cascade` shows which CSS rule won, which were overridden, inline styles, and inherited properties — with source locations. Answers "which file do I edit?" in one call.
+`cascade` shows which CSS rule won, which were overridden, inline styles, and inherited properties — with source locations. Answers "which file do I edit?" in one call. For Vite / CSS Modules pipelines, `cascade` also reads inline base64 source maps and stripped `?vue&type=style&…` query suffixes, so locations resolve to the original `*.module.css` / `*.vue` source instead of an opaque stylesheet id.
 
 </details>
 
@@ -350,8 +355,15 @@ record  <target> --until "dom stable"|"network idle"  # record until quiet (max 
 <summary><strong>Advanced</strong></summary>
 
 ```bash
-batch   <target> <json>             # execute multiple commands in one call
-                                    # [{"cmd":"click","args":["@1"]},{"cmd":"perceive","args":["--diff"]}]
+batch   <target> <cmds> [flags]     # execute multiple commands in one call (default JSON output)
+                                    # pipe:    'fill @3 hi | click @7'
+                                    # JSON:    '[{"cmd":"click","args":["@1"]},{"cmd":"perceive","args":["--diff"]}]'
+                                    # --parallel  run independent commands concurrently
+                                    # --plain     human-readable, indented per step
+                                    # --compact   one line per step
+flow    <target> "<steps>"          # sequential pipeline; semicolon-separated steps; halts on first error
+                                    # e.g. flow <t> "click @1; wait dom stable; summary; console --errors"
+                                    # wait aliases: "wait dom stable", "wait network idle"
 evalraw <target> <method> [json]    # raw CDP command passthrough
                                     # e.g. evalraw <t> "DOM.getDocument" '{}'
 ```
