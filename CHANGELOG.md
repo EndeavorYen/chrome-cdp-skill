@@ -1,5 +1,18 @@
 # Changelog
 
+## [2.4.0](https://github.com/EndeavorYen/chrome-cdp-ex/compare/v2.3.0...v2.4.0) (2026-04-26)
+
+
+### Features
+
+* add readiness and flow tooling — new `doctor` / `ready` one-call diagnostics (Node version, skill install path, daemon socket state, CDP reachability) and `flow` sequential pipeline runner with `wait dom stable` / `wait network idle` aliases ([f3b081d](https://github.com/EndeavorYen/chrome-cdp-ex/commit/f3b081d28b862ff176e3010b41ff709ae072d3a3))
+
+
+### Bug Fixes
+
+* implement `record` command (timeline of DOM/console/network/navigation events with `--action` and `--until` modes) and harden `cascade` source-map resolution for Vite / CSS Modules / Vue SFC pipelines ([2273c84](https://github.com/EndeavorYen/chrome-cdp-ex/commit/2273c847e3c5fc83d69738b821be1e4dc404507a))
+* polish `record` and `cascade` dogfood issues uncovered while using the tools end-to-end ([153a96f](https://github.com/EndeavorYen/chrome-cdp-ex/commit/153a96f91e6622b68c199c1ec95cb2273946e8ab))
+
 ## [2.3.0](https://github.com/EndeavorYen/chrome-cdp-ex/compare/pi-chrome-cdp-v2.2.0...pi-chrome-cdp-v2.3.0) (2026-04-02)
 
 
