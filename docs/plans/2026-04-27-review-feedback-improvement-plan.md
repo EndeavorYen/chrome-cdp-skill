@@ -1,395 +1,371 @@
-# chrome-cdp-ex Review Feedback Improvement Plan
+# chrome-cdp-ex 3y-Mud Playtest Feedback Improvement Plan
 
 > **For Hermes:** Use subagent-driven-development skill to implement this plan task-by-task.
 
-**Goal:** Turn the latest review feedback into a bounded, verifiable quality-improvement slice for `chrome-cdp-ex`, prioritizing real dogfood failures over new feature sprawl.
+**Goal:** Convert the real 3y-Mud `CHROME-CDP-EX-FEEDBACK.md` playtest feedback into a prioritized, test-driven repair plan for `chrome-cdp-ex`, improving long-session robustness without diluting its live-browser inspection focus.
 
-**Architecture:** Keep the zero-dependency single-script distribution for now, but add small internal parsing/resolution helpers inside `skills/chrome-cdp-ex/scripts/cdp.mjs` with unit tests in `tests/cdp.test.mjs`. Treat README/SKILL claims as product contracts: every advertised workflow must either be implemented, tested, and live-smoked, or explicitly documented as best-effort/fallback.
+**Architecture:** Keep the current zero-dependency, single-file CLI distribution (`skills/chrome-cdp-ex/scripts/cdp.mjs`) for this slice. Add small internal helpers, explicit state invalidation metadata, and focused command extensions. Treat `SKILL.md` and README as executable UX contracts: every recommendation must match what an autonomous agent can actually do on macOS/Edge/Vite long-session playtests.
 
-**Tech Stack:** Node.js 22+ ESM, raw Chrome DevTools Protocol, Vitest, ESLint, Markdown docs.
+**Tech Stack:** Node.js 22+ ESM, raw Chrome DevTools Protocol, Vitest, ESLint, Markdown docs, optional live CDP smoke with isolated Edge/Chrome profile.
 
-**Important feedback-source note:** The requested `CHROME-CDP-EX-FEEDBACK.md` was not present in `/Users/simon/Code/chrome-cdp-ex` at planning time, and filename search under the usual local workspaces did not locate it. This plan therefore anchors on the review/dogfood feedback already visible in repo context and prior session recall: stale roadmap/docs, over-strong cascade source-origin claims, `flow`/`batch` argument parsing weaknesses, numeric-key support gaps, `styles @ref` robustness, and missing real-app smoke evidence. If the missing file appears, Task 0 must be re-run and this plan amended before implementation.
+---
+
+## Verified Feedback Source
+
+Read on 2026-04-27:
+
+- `/Users/simon/Code/3y-Mud/CHROME-CDP-EX-FEEDBACK.md`
+- Scenario: 15–20 minute 3y-Mud beginner playtest, ~50 `cdp` calls, macOS Darwin 25.3.0, Microsoft Edge 147.0.3912.86, local Vite dev server.
+- Version used by reviewer: v2.3.0 from Claude plugin cache.
+
+The earlier plan incorrectly assumed the feedback file was missing from `~/Code/chrome-cdp-ex`; it was actually in `~/Code/3y-Mud`. This amended plan supersedes the previous fallback-based plan.
+
+---
+
+## Priority Summary
+
+### P0 — Must fix first
+
+1. **Debug-browser startup path is too rigid on macOS/Edge**
+   - Current SKILL says not to suggest `--remote-debugging-port`, but reviewer needed user permission to spawn an isolated debug profile.
+   - Need skill docs and ideally a `spawn` / `spawn-debug-browser` helper.
+
+2. **`@ref` stale/unknown failures are not actionable**
+   - Error says only `Unknown ref: @31. Run "perceive" first.`
+   - It does not distinguish never-created refs, DOM-mutation invalidation, navigation/HMR invalidation, or daemon restart.
+   - Batch/loops can waste many round-trips after the first stale ref.
+
+3. **`press` lacks single-character keys**
+   - Blocks keyboard shortcut testing such as `c`, `i`, `u`, `k`, `m`, and numeric hotkeys.
+
+4. **`perceive` coordinates are ambiguous after scroll/fixed UI**
+   - Reviewer saw fixed sidebar button as `Y=-5789`, while visually visible.
+   - Need viewport-coordinate clarity and fixed/sticky annotation.
+
+5. **`text` lacks selector fallback / auto-main extraction**
+   - Reviewer had to manually try `[role="region"][aria-label*="事件"]`, then `[class*=MainStage]`.
+   - Need selector fallback chain and `--auto` main-content heuristic.
+
+### P1 — Should fix in this slice if possible
+
+6. **Batch/loop robustness around stale refs**
+   - Encourage stable selectors in docs and optionally fail fast / retry once after ref invalidation.
+
+7. **Screenshot DPR hint contaminates main output**
+   - `shot` output begins with DPR guidance; scripts expecting saved path must filter noise.
+   - Move hint to stderr or support `--quiet`.
+
+8. **No modal-dismiss abstraction**
+   - Reviewer used `press Space` to close MOTD and triggered underlying game shortcut.
+   - Add `dismiss-modal` high-level helper or document safe modal-dismiss recipe.
+
+9. **`perceive` truncation can hide refs**
+   - Need `--keep-refs` and/or token-aware priority truncation.
+
+10. **No high-level wait for changing game/animation state**
+    - Add `waitfor --any-of` and `waitfor --selector-stable` before larger `wait-for-stable` family.
+
+### P2 — Polish / backlog
+
+11. `list` should include `about:blank` usable target prefixes.
+12. Session-level screenshot organization/reporting.
+13. `eval` result serialization guidance / `--raw` option.
+14. Console level fidelity should preserve log/warn/error/debug.
+15. Daemon crash should expose a log path and recovery hint.
+16. `SKILL.md` needs a top TL;DR for the first five commands.
+17. Docs need game/animation `record` examples, `@c` examples, `shot --annotate-fresh`, and Vite HMR ref invalidation guidance.
 
 ---
 
 ## Acceptance Criteria
 
 1. `npm test` and `npm run lint` pass.
-2. New tests cover every repaired behavior before/with implementation.
-3. README, `skills/chrome-cdp-ex/SKILL.md`, `TODOS.md`, and `DESIGN.md` no longer advertise stale or unqualified claims that are false in real Vite/React/CSS Modules apps.
-4. `flow` and `batch` preserve quoted multi-word arguments such as `fill @1 'look 訓練師'`.
-5. `press` supports numeric keys `0`-`9` and common single-character keys without breaking named keys (`Enter`, `Tab`, `Escape`, arrows, etc.).
-6. `styles` supports `@ref` selectors or returns an explicit actionable error if a stale ref cannot be resolved.
-7. `cascade` output clearly distinguishes exact source mapping, computed-style fallback, and unresolved/opaque stylesheet IDs.
-8. A deterministic local smoke page verifies `perceive`, `styles`, `cascade`, `record`, `batch`, `flow`, `press 1`, and quoted `fill` behavior against a real CDP browser.
-9. Release metadata is consistent: command count, version/changelog, TODO roadmap, and docs match implemented commands.
+2. Every code behavior change has a focused Vitest test before/with implementation.
+3. Live smoke, when a supported browser is available, exercises an isolated debug profile and verifies at least: `spawn`, `list`, `perceive`, `press c`, `text --auto`, `waitfor --any-of`, `waitfor --selector-stable`, `shot --quiet`, and stale-ref error wording.
+4. README and `skills/chrome-cdp-ex/SKILL.md` include an honest macOS/Edge startup path: prefer existing remote-debugging toggle when available; with user consent, spawn an isolated debug profile using `--remote-debugging-port` and `--user-data-dir=/tmp/...`.
+5. Stale-ref errors explain likely cause and recovery, not just `Unknown ref`.
+6. `press` supports named keys plus single-character keys (`a-z`, `A-Z`, `0-9`, common punctuation if low-risk).
+7. `perceive` clearly labels coordinate reference frame and fixed/sticky elements.
+8. `text` supports fallback selectors and an `--auto` mode that avoids nav/sidebar noise.
+9. `shot` machine-readable output starts with the saved path unless `--verbose` is requested.
+10. The plan's implementation does not add heavyweight dependencies or replace Playwright; `chrome-cdp-ex` remains a live user-session agent tool.
 
 ---
 
-## Feedback Synthesis / Problem List
+## Task 0: Verify current baseline and version delta from feedback
 
-### P0 — Planning input gap
-
-- `CHROME-CDP-EX-FEEDBACK.md` is absent from the repo path the user specified.
-- Risk: implementing from incomplete feedback may miss reviewer-specific concerns.
-- Mitigation: add a lightweight feedback-ingestion task and explicitly amend the plan if the file is supplied later.
-
-### P1 — Docs and roadmap overclaim/staleness
-
-Current findings:
-
-- `README.md` says `cascade` tells the exact file/line and says `inject`/`cascade`/`record` are available.
-- `TODOS.md` still lists `inject`, `cascade`, and `record` as unchecked future work even though they are implemented.
-- `DESIGN.md` release plan still describes v2.3/v2.4 features as future sketches and includes unimplemented `emulate`, `frame`, `components` without clear status boundaries.
-- Skill memory notes real-app dogfood showed `cascade` can still return `No matching CSS rules found` while `styles` has computed styles.
-
-Desired state:
-
-- README/SKILL describe `cascade` as “source-origin tracing when CDP/source maps expose rules; falls back to computed style / opaque sheet id otherwise.”
-- `styles` is documented as the reliable computed-style fallback.
-- Roadmap separates shipped, best-effort, and future work.
-
-### P1 — Shell parser / command parser weakness
-
-Current findings:
-
-- `parseFlowSteps(input)` uses `line.split(/\s+/)`, so quoted multi-word text is not preserved.
-- `batch` pipe-mode parsing also uses `.split(/\s+/)`.
-- Prior dogfood found direct `fill @ref 'look 訓練師'` works better than placing the same fill inside `flow`.
-
-Desired state:
-
-- Shared shell-like tokenizer supports single quotes, double quotes, and backslash escapes.
-- `flow <target> "fill @1 'look 訓練師'; press Enter"` passes `['@1', 'look 訓練師']` to `fill`.
-- `batch <target> "fill @1 'look 訓練師' | press Enter" --plain` behaves similarly.
-- JSON batch mode remains unchanged.
-
-### P1 — Keyboard input gap
-
-Current findings:
-
-- `KEY_MAP` supports named control/navigation keys but not numeric keys.
-- Prior real-app QA found `press 1` did not work for quickbar/hotkey testing.
-
-Desired state:
-
-- `press 1` dispatches keyDown/keyUp with `key: '1'`, `code: 'Digit1'`, `windowsVirtualKeyCode: 49`.
-- Support `0`-`9` and likely letters `a`-`z` if low-risk, but document exactly what is supported.
-- Keep named aliases case-insensitive.
-
-### P1 — `styles @ref` robustness
-
-Current findings:
-
-- `stylesStr(cdp, sid, selector)` currently appears selector-based; `handleCommand` calls `stylesStr(cdp, sessionId, args[0])` without `refMap`.
-- A previous `styles @9` dogfood attempt produced `Error: Uncaught`.
-- Many users naturally try `styles @ref` after `perceive` because `click`, `fill`, `hover`, `elshot`, and `cascade` support refs.
-
-Desired state:
-
-- `styles` accepts `@ref` and resolves it through shared ref resolution.
-- Stale refs produce `Unknown ref: @N. Run "perceive" first.` or `element may have been removed from DOM. Run "perceive" to refresh refs.`
-- CSS selector mode remains unchanged.
-
-### P1 — `cascade` fallback clarity
-
-Current findings:
-
-- `cascadeStr` already initializes DOM/CSS and parses inline sourcemaps, but real Vite/CSS Modules apps can still fail to map rules or find matching explicit rules for some properties.
-- Current no-rule property fallback returns `background-color: ... (computed, no explicit rule found)` only when a specific property is requested.
-- Full cascade with no matched rules still returns `No matching CSS rules found`, which can look like a total failure even when computed styles exist.
-
-Desired state:
-
-- When no explicit rules are found, include computed style hints for either the requested property or a short curated subset.
-- When source is an opaque `style-sheet-...`, annotate it as unresolved and suggest `styles` fallback / source-map limitation.
-- Do not claim exact file/line unless source is not an opaque generated id.
-
-### P2 — One-file maintainability pressure
-
-Current findings:
-
-- `cdp.mjs` is ~3,580 lines.
-- CLAUDE.md says the implementation is single-file by design, but future features (`frame`, `components`, `emulate`) will increase complexity.
-
-Desired state for this slice:
-
-- Do not split files yet unless required.
-- Add small pure helper functions with tests (`splitCommandLine`, `parsePipeline`, key mapping helpers, style-ref resolver), keeping distribution simple.
-- Add TODO/design note proposing a later internal modularization boundary if feature growth continues.
-
----
-
-## Task 0: Re-check for `CHROME-CDP-EX-FEEDBACK.md` and amend plan if present
-
-**Objective:** Avoid implementing from stale/incomplete feedback if the review file is supplied after this plan was drafted.
+**Objective:** Establish which feedback items are already fixed in `main` and which still need implementation.
 
 **Files:**
-- Read if present: `CHROME-CDP-EX-FEEDBACK.md`
-- Modify if needed: `docs/plans/2026-04-27-review-feedback-improvement-plan.md`
+- Read: `package.json`, `README.md`, `skills/chrome-cdp-ex/SKILL.md`, `skills/chrome-cdp-ex/scripts/cdp.mjs`, `tests/cdp.test.mjs`
+- Read feedback: `/Users/simon/Code/3y-Mud/CHROME-CDP-EX-FEEDBACK.md`
 
-**Step 1: Verify file presence**
-
-Run:
+**Step 1: Verify repo and tests**
 
 ```bash
 cd /Users/simon/Code/chrome-cdp-ex
-[ -f CHROME-CDP-EX-FEEDBACK.md ] && wc -l CHROME-CDP-EX-FEEDBACK.md && sed -n '1,240p' CHROME-CDP-EX-FEEDBACK.md || true
+pwd
+git remote -v
+git branch --show-current
+git status --short
+npm test
+npm run lint
 ```
 
-Expected if still absent: no output or a false branch.
+Expected: repo is `EndeavorYen/chrome-cdp-ex`; branch is intended working branch; tests/lint pass before edits.
 
-**Step 2: If present, extract actionable items**
+**Step 2: Map feedback to current implementation**
 
-Create a short checklist inside this plan under `Feedback Synthesis / Problem List` with:
-
-- exact feedback quote/summary;
-- severity (`P0/P1/P2`);
-- target file(s);
-- test requirement.
-
-**Step 3: Commit only the plan amendment if changed**
+Search current implementation:
 
 ```bash
-git add docs/plans/2026-04-27-review-feedback-improvement-plan.md
-git commit -m "docs: amend chrome-cdp-ex review plan with feedback file"
+grep -n "function pressStr\|const KEY_MAP\|function waitForStr\|function textStr\|function shotStr\|function perceiveStr\|function formatPageList\|Runtime.consoleAPICalled\|Unknown ref" skills/chrome-cdp-ex/scripts/cdp.mjs
 ```
 
-Skip commit if no file exists and no amendment is needed.
+Record in commit notes which items are already fixed since v2.3.0. Do not implement duplicates.
+
+**Step 3: Commit nothing**
+
+This is a baseline discovery step only.
 
 ---
 
-## Task 1: Add a shared shell-like tokenizer for flow/batch command strings
+## Task 1: Fix macOS/Edge startup UX and add `spawn-debug-browser`
 
-**Objective:** Preserve quoted multi-word arguments consistently.
+**Objective:** Make first-run setup actionable when no `DevToolsActivePort` and no `CDP_PORT` exist, without disturbing the user's normal browser profile.
+
+**Files:**
+- Modify: `skills/chrome-cdp-ex/scripts/cdp.mjs`
+- Modify: `README.md`
+- Modify: `skills/chrome-cdp-ex/SKILL.md`
+- Test: `tests/cdp.test.mjs`
+
+**Design:**
+
+Add a no-target command:
+
+```bash
+spawn-debug-browser [edge|chrome|brave] [--port 9222] [--url URL] [--profile-dir DIR]
+spawn [edge|chrome|brave] [--port 9222] [--url URL] [--profile-dir DIR]   # alias
+```
+
+Behavior:
+
+- macOS: detect app paths:
+  - `/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge`
+  - `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`
+  - `/Applications/Brave Browser.app/Contents/MacOS/Brave Browser`
+- Launch with:
+  - `--remote-debugging-port=<port>`
+  - `--user-data-dir=<profile-dir>` default `/tmp/chrome-cdp-ex-<browser>-debug-profile-<port>`
+  - `--no-first-run`
+  - `--no-default-browser-check`
+- Print a clear next command:
+
+```text
+Spawned Microsoft Edge debug profile on CDP_PORT=9222
+Profile: /tmp/chrome-cdp-ex-edge-debug-profile-9222
+Next: CDP_PORT=9222 node skills/chrome-cdp-ex/scripts/cdp.mjs list
+```
+
+**Step 1: Write tests for argument parsing and browser path planning**
+
+Create pure helpers so tests do not launch real browsers:
+
+```js
+describe('parseSpawnDebugBrowserArgs', () => {
+  it('defaults to edge on port 9222 with temp profile', () => {
+    expect(parseSpawnDebugBrowserArgs([])).toMatchObject({ browser: 'edge', port: 9222 });
+  });
+
+  it('parses browser, port, url, and profile-dir', () => {
+    expect(parseSpawnDebugBrowserArgs(['chrome', '--port', '9333', '--url', 'http://127.0.0.1:3000', '--profile-dir', '/tmp/p']))
+      .toEqual({ browser: 'chrome', port: 9333, url: 'http://127.0.0.1:3000', profileDir: '/tmp/p' });
+  });
+});
+```
+
+Add tests for app path detection via injected `existsSync`.
+
+**Step 2: Implement helpers and command registration**
+
+- Add `spawn-debug-browser` / `spawn` to no-target commands.
+- Do not add it to `NEEDS_TARGET`.
+- Add USAGE / README / SKILL docs.
+
+**Step 3: Verify**
+
+```bash
+npm test -- tests/cdp.test.mjs -t "spawn"
+npm test
+npm run lint
+```
+
+**Step 4: Commit**
+
+```bash
+git add skills/chrome-cdp-ex/scripts/cdp.mjs tests/cdp.test.mjs README.md skills/chrome-cdp-ex/SKILL.md
+git commit -m "feat: add isolated debug browser spawn helper"
+```
+
+---
+
+## Task 2: Add explicit ref lifecycle tracking and better stale-ref errors
+
+**Objective:** Make `@ref` failures diagnosable and reduce wasted loops after DOM/navigation invalidates refs.
 
 **Files:**
 - Modify: `skills/chrome-cdp-ex/scripts/cdp.mjs`
 - Test: `tests/cdp.test.mjs`
+- Docs: `skills/chrome-cdp-ex/SKILL.md`, `README.md`
 
-**Step 1: Write failing tests for tokenization**
+**Design:**
 
-Add tests near `parseFlowSteps`:
+Track ref metadata in daemon:
 
 ```js
-describe('splitCommandLine', () => {
-  it('preserves single-quoted multi-word arguments', () => {
-    expect(splitCommandLine("fill @1 'look 訓練師'")).toEqual(['fill', '@1', 'look 訓練師']);
+const refState = {
+  generation: 0,
+  lastPerceiveAt: 0,
+  invalidatedAt: 0,
+  invalidationReason: null, // 'dom-mutation' | 'navigation' | 'daemon-start' | null
+};
+```
+
+- On successful `perceive`, increment generation, clear invalidation reason, store `lastPerceiveAt`.
+- On `Page.frameNavigated`, set `invalidationReason='navigation'` and clear `refMap`.
+- On substantial DOM mutation after an action/record/perceive baseline, set `invalidationReason='dom-mutation'` but avoid noisy invalidation for every tiny text node if it breaks too much.
+- On daemon start, reason is `daemon-start` until first perceive.
+
+Error wording helper:
+
+```text
+Unknown ref: @31. Current ref map is empty because the page navigated/reloaded after the last perceive. Run "perceive" to refresh refs, or use a stable CSS selector for long loops.
+```
+
+For never-created:
+
+```text
+Unknown ref: @31. No refs have been assigned in this daemon yet. Run "perceive" first, or use a CSS selector.
+```
+
+For DOM mutation:
+
+```text
+Unknown ref: @31. Refs were invalidated by DOM changes after the last perceive. Run "perceive" again, or use a stable CSS selector in batch/loops.
+```
+
+**Step 1: Write tests for pure error helper**
+
+```js
+describe('formatUnknownRefError', () => {
+  it('explains never-created refs', () => {
+    expect(formatUnknownRefError('@31', { generation: 0, invalidationReason: 'daemon-start' })).toMatch(/No refs have been assigned/);
   });
 
-  it('preserves double-quoted multi-word arguments', () => {
-    expect(splitCommandLine('fill @1 "look 訓練師"')).toEqual(['fill', '@1', 'look 訓練師']);
+  it('explains navigation invalidation', () => {
+    expect(formatUnknownRefError('@31', { generation: 2, invalidationReason: 'navigation' })).toMatch(/navigated|reloaded/);
   });
 
-  it('supports backslash escaping outside quotes', () => {
-    expect(splitCommandLine('type hello\\ world')).toEqual(['type', 'hello world']);
-  });
-
-  it('throws on unterminated quotes', () => {
-    expect(() => splitCommandLine("fill @1 'unterminated")).toThrow(/Unterminated quote/);
+  it('explains DOM invalidation and suggests stable selectors', () => {
+    const msg = formatUnknownRefError('@31', { generation: 2, invalidationReason: 'dom-mutation' });
+    expect(msg).toMatch(/DOM changes/);
+    expect(msg).toMatch(/stable CSS selector/);
   });
 });
 ```
 
-Add/update `parseFlowSteps` tests:
+**Step 2: Thread `refState` through ref resolution**
+
+Current helpers likely take `(cdp, sid, refMap, selector)`. Extend minimally:
 
 ```js
-it('preserves quoted multi-word fill text in command steps', () => {
-  expect(parseFlowSteps("fill @1 'look 訓練師'; press Enter")).toEqual([
-    { kind: 'command', cmd: 'fill', args: ['@1', 'look 訓練師'] },
-    { kind: 'command', cmd: 'press', args: ['Enter'] },
-  ]);
-});
+resolveRefNode(cdp, sid, refMap, selector, refState)
+resolveRef(cdp, sid, refMap, selector, refState)
 ```
 
-Add a pure parser test for batch pipeline if a helper is extracted:
+Do not break selector paths.
+
+**Step 3: Invalidate on navigation**
+
+In `Page.frameNavigated` handler, for top-level navigation:
 
 ```js
-describe('parseBatchPipeline', () => {
-  it('preserves quoted arguments across pipe-separated commands', () => {
-    expect(parseBatchPipeline("fill @1 'look 訓練師' | press Enter")).toEqual([
-      { cmd: 'fill', args: ['@1', 'look 訓練師'] },
-      { cmd: 'press', args: ['Enter'] },
-    ]);
-  });
-});
+refMap.clear();
+refState.invalidatedAt = Date.now();
+refState.invalidationReason = 'navigation';
 ```
 
-**Step 2: Run targeted tests and confirm failure**
+**Step 4: Optional one-shot retry for action commands**
 
-Run:
+For this slice, prefer fail-fast with strong message over magical retry. If implementing retry, scope it only to commands that also have a stable selector fallback; do not attempt to guess `@ref` identity after DOM rewrite.
+
+**Step 5: Verify**
 
 ```bash
-npm test -- tests/cdp.test.mjs -t "splitCommandLine|parseFlowSteps|parseBatchPipeline"
-```
-
-Expected: FAIL because helpers do not exist or quoted args are split incorrectly.
-
-**Step 3: Implement `splitCommandLine` and `parseBatchPipeline`**
-
-Add near existing parser helpers:
-
-```js
-function splitCommandLine(input) {
-  const out = [];
-  let cur = '';
-  let quote = null;
-  let escape = false;
-  for (const ch of String(input || '')) {
-    if (escape) { cur += ch; escape = false; continue; }
-    if (ch === '\\') { escape = true; continue; }
-    if (quote) {
-      if (ch === quote) quote = null;
-      else cur += ch;
-      continue;
-    }
-    if (ch === "'" || ch === '"') { quote = ch; continue; }
-    if (/\s/.test(ch)) {
-      if (cur) { out.push(cur); cur = ''; }
-      continue;
-    }
-    cur += ch;
-  }
-  if (escape) cur += '\\';
-  if (quote) throw new Error(`Unterminated quote: ${quote}`);
-  if (cur) out.push(cur);
-  return out;
-}
-
-function parseBatchPipeline(input) {
-  return String(input || '')
-    .split('|')
-    .map(segment => {
-      const parts = splitCommandLine(segment.trim());
-      return { cmd: parts[0], args: parts.slice(1) };
-    })
-    .filter(c => c.cmd);
-}
-```
-
-**Step 4: Use it in `parseFlowSteps`**
-
-Replace:
-
-```js
-const parts = line.split(/\s+/);
-```
-
-with:
-
-```js
-const parts = splitCommandLine(line);
-```
-
-Keep `wait` behavior as `parts.slice(1).join(' ').toLowerCase()`.
-
-**Step 5: Use it in batch pipe mode**
-
-Replace the inline pipe parser in `handleCommand`:
-
-```js
-commands = input.split('|').map(segment => {
-  const parts = segment.trim().split(/\s+/);
-  return { cmd: parts[0], args: parts.slice(1) };
-}).filter(c => c.cmd);
-```
-
-with:
-
-```js
-commands = parseBatchPipeline(input);
-```
-
-**Step 6: Verify**
-
-Run:
-
-```bash
-npm test -- tests/cdp.test.mjs -t "splitCommandLine|parseFlowSteps|parseBatchPipeline|flowStr|formatBatchResults"
+npm test -- tests/cdp.test.mjs -t "Unknown ref|refState|resolveRef"
 npm test
+npm run lint
 ```
 
-Expected: targeted tests pass; full suite remains green.
+**Step 6: Docs update**
+
+Add guidance:
+
+- Use `@ref` for immediate next action after `perceive`.
+- Use stable CSS selectors for long `batch`/loops.
+- Re-run `perceive` after navigation, Vite HMR, or large DOM mutation.
 
 **Step 7: Commit**
 
 ```bash
-git add skills/chrome-cdp-ex/scripts/cdp.mjs tests/cdp.test.mjs
-git commit -m "fix: preserve quoted args in flow and batch"
+git add skills/chrome-cdp-ex/scripts/cdp.mjs tests/cdp.test.mjs README.md skills/chrome-cdp-ex/SKILL.md
+git commit -m "fix: explain stale ref failures"
 ```
 
 ---
 
-## Task 2: Add numeric and single-character key support to `press`
+## Task 3: Support single-character keys in `press`
 
-**Objective:** Make `press 1` and related hotkey testing work.
+**Objective:** Enable keyboard shortcut and hotkey testing.
 
 **Files:**
 - Modify: `skills/chrome-cdp-ex/scripts/cdp.mjs`
 - Test: `tests/cdp.test.mjs`
+- Docs: `README.md`, `skills/chrome-cdp-ex/SKILL.md`
 
-**Step 1: Write failing tests**
-
-Add near `KEY_MAP` / `pressStr` tests:
+**Step 1: Add tests**
 
 ```js
 describe('keyForPress', () => {
-  it('maps digit keys to DigitN codes', () => {
+  it('maps lowercase letters', () => {
+    expect(keyForPress('c')).toEqual({ key: 'c', code: 'KeyC', keyCode: 67 });
+  });
+
+  it('maps uppercase letters preserving key', () => {
+    expect(keyForPress('C')).toEqual({ key: 'C', code: 'KeyC', keyCode: 67, shift: true });
+  });
+
+  it('maps digits', () => {
     expect(keyForPress('1')).toEqual({ key: '1', code: 'Digit1', keyCode: 49 });
-    expect(keyForPress('0')).toEqual({ key: '0', code: 'Digit0', keyCode: 48 });
   });
 
-  it('maps letters to KeyX codes', () => {
-    expect(keyForPress('a')).toEqual({ key: 'a', code: 'KeyA', keyCode: 65 });
-  });
-
-  it('keeps named aliases case-insensitive', () => {
+  it('keeps named keys case-insensitive', () => {
     expect(keyForPress('Enter')).toEqual(KEY_MAP.enter);
   });
 });
 ```
 
-Add/extend `pressStr` mock-CDP test:
+**Step 2: Implement `keyForPress`**
 
-```js
-it('dispatches numeric key events for press 1', async () => {
-  const calls = [];
-  const cdp = { send: async (method, params, sid) => { calls.push({ method, params, sid }); return {}; } };
-  await pressStr(cdp, 'sid', '1');
-  expect(calls[0].params).toMatchObject({ type: 'keyDown', key: '1', code: 'Digit1', windowsVirtualKeyCode: 49 });
-  expect(calls[1].params).toMatchObject({ type: 'keyUp', key: '1', code: 'Digit1', windowsVirtualKeyCode: 49 });
-});
-```
+Use standard CDP `Input.dispatchKeyEvent` values. For uppercase letters, either set `modifiers: 8` for Shift or document that `press C` dispatches key `C` with `KeyC`.
 
-**Step 2: Run targeted test and confirm failure**
+**Step 3: Update `pressStr`**
 
-```bash
-npm test -- tests/cdp.test.mjs -t "keyForPress|pressStr"
-```
+Error should say:
 
-**Step 3: Implement `keyForPress`**
-
-```js
-function keyForPress(keyName) {
-  const raw = String(keyName || '');
-  const mapped = KEY_MAP[raw.toLowerCase()];
-  if (mapped) return mapped;
-  if (/^[0-9]$/.test(raw)) {
-    return { key: raw, code: `Digit${raw}`, keyCode: raw.charCodeAt(0) };
-  }
-  if (/^[a-zA-Z]$/.test(raw)) {
-    const upper = raw.toUpperCase();
-    return { key: raw, code: `Key${upper}`, keyCode: upper.charCodeAt(0) };
-  }
-  return null;
-}
-```
-
-Modify `pressStr` to use it:
-
-```js
-const mapped = keyForPress(keyName);
-if (!mapped) throw new Error(`Unknown key: ${keyName}. Supported: ${Object.keys(KEY_MAP).join(', ')}, 0-9, a-z`);
+```text
+Supported: enter, tab, escape, backspace, delete, space, arrow*, single characters (a-z, A-Z, 0-9, punctuation). Use `type` for multi-character text.
 ```
 
 **Step 4: Verify**
@@ -397,450 +373,542 @@ if (!mapped) throw new Error(`Unknown key: ${keyName}. Supported: ${Object.keys(
 ```bash
 npm test -- tests/cdp.test.mjs -t "keyForPress|pressStr|KEY_MAP"
 npm test
+npm run lint
 ```
 
 **Step 5: Commit**
 
 ```bash
-git add skills/chrome-cdp-ex/scripts/cdp.mjs tests/cdp.test.mjs
-git commit -m "fix: support numeric and letter key presses"
-```
-
----
-
-## Task 3: Add `styles @ref` support with actionable stale-ref errors
-
-**Objective:** Align `styles` with user expectations established by `click`, `fill`, `hover`, `elshot`, and `cascade`.
-
-**Files:**
-- Modify: `skills/chrome-cdp-ex/scripts/cdp.mjs`
-- Test: `tests/cdp.test.mjs`
-- Docs: `README.md`, `skills/chrome-cdp-ex/SKILL.md`
-
-**Step 1: Inspect current `stylesStr` implementation**
-
-Run/read around function:
-
-```bash
-python3 - <<'PY'
-from pathlib import Path
-s=Path('skills/chrome-cdp-ex/scripts/cdp.mjs').read_text().splitlines()
-for i,l in enumerate(s,1):
-    if 'function stylesStr' in l:
-        print(i)
-PY
-```
-
-**Step 2: Write failing tests**
-
-Add tests near `stylesStr` or create a new `describe('stylesStr', ...)` block:
-
-```js
-it('supports @ref by resolving backend node to object', async () => {
-  const refMap = new Map([[9, 12345]]);
-  const calls = [];
-  const cdp = { send: async (method, params, sid) => {
-    calls.push({ method, params, sid });
-    if (method === 'DOM.resolveNode') return { object: { objectId: 'obj-1' } };
-    if (method === 'Runtime.callFunctionOn') return { result: { value: {
-      tag: 'BUTTON', id: '', className: 'btn primary', styles: { display: 'block', color: 'rgb(1, 2, 3)' }
-    } } };
-    return {};
-  }};
-  const out = await stylesStr(cdp, 'sid', '@9', refMap);
-  expect(out).toContain('<BUTTON>.btn primary');
-  expect(out).toContain('color: rgb(1, 2, 3)');
-  expect(calls[0]).toMatchObject({ method: 'DOM.resolveNode', params: { backendNodeId: 12345 } });
-});
-
-it('throws actionable error for unknown @ref in styles', async () => {
-  await expect(stylesStr({ send: async () => ({}) }, 'sid', '@9', new Map()))
-    .rejects.toThrow(/Unknown ref: @9.*Run "perceive" first/);
-});
-```
-
-**Step 3: Run targeted tests and confirm failure**
-
-```bash
-npm test -- tests/cdp.test.mjs -t "stylesStr"
-```
-
-**Step 4: Implement shared element style evaluation**
-
-Refactor `stylesStr` into:
-
-- CSS selector path: existing `document.querySelector(selector)` logic.
-- `@ref` path: use existing `resolveRefNode(cdp, sid, refMap, selector)` to get `objectId`, then call the same style extraction function via `Runtime.callFunctionOn`.
-
-Pseudo-shape:
-
-```js
-const STYLE_EXTRACTOR = `function() {
-  const el = this;
-  const cs = getComputedStyle(el);
-  const props = ['display','opacity','position','width','height','border','box-sizing','overflow','align-items','justify-content','gap','color','background-color','font-size','font-weight','font-family','line-height','text-align','transition','cursor','box-shadow','border-radius','outline'];
-  const styles = {};
-  for (const p of props) {
-    const v = cs.getPropertyValue(p);
-    if (v) styles[p] = v;
-  }
-  return { tag: el.tagName, id: el.id || '', className: typeof el.className === 'string' ? el.className : '', styles };
-}`;
-```
-
-Ensure selector path still reports `Element not found: ...`.
-
-Change `handleCommand`:
-
-```js
-case 'styles': result = await stylesStr(cdp, sessionId, args[0], refMap); break;
-```
-
-**Step 5: Verify**
-
-```bash
-npm test -- tests/cdp.test.mjs -t "stylesStr|resolveRef"
-npm test
-```
-
-**Step 6: Docs update**
-
-In README command table and SKILL command reference, change:
-
-```text
-styles <target> <selector>
-```
-
-to:
-
-```text
-styles <target> <selector|@ref>
-```
-
-Add one short note:
-
-```text
-Use `styles` as the reliable computed-style fallback when `cascade` cannot resolve an exact source rule.
-```
-
-**Step 7: Commit**
-
-```bash
 git add skills/chrome-cdp-ex/scripts/cdp.mjs tests/cdp.test.mjs README.md skills/chrome-cdp-ex/SKILL.md
-git commit -m "fix: support refs in styles command"
+git commit -m "fix: support single-character key presses"
 ```
 
 ---
 
-## Task 4: Make `cascade` fallback output honest and useful
+## Task 4: Clarify `perceive` coordinate semantics and fixed/sticky elements
 
-**Objective:** Keep `cascade` valuable without overclaiming exact source lines when CDP/source maps cannot provide them.
+**Objective:** Prevent agents from misreading visible fixed UI as off-screen after scroll.
 
 **Files:**
 - Modify: `skills/chrome-cdp-ex/scripts/cdp.mjs`
 - Test: `tests/cdp.test.mjs`
 - Docs: `README.md`, `skills/chrome-cdp-ex/SKILL.md`
 
-**Step 1: Write failing tests for unresolved source annotation**
+**Design:**
 
-Add near `cascadeStr` tests:
+- Treat displayed `@ref` coordinates as viewport `getBoundingClientRect()` coordinates.
+- If current output can become document-relative through layout map logic, normalize it.
+- Add `position` annotation for `fixed` / `sticky` elements:
+
+```text
+@14 (1543,259 266×52, fixed)
+@8 (10,0 300×48, sticky)
+```
+
+- Add a header hint:
+
+```text
+Coords: viewport CSS px (use clickxy with these values)
+```
+
+**Step 1: Add test data for ref rect annotation**
+
+Test a pure formatter if possible:
 
 ```js
-it('annotates opaque stylesheet ids as unresolved generated sources', async () => {
-  const cdp = makeCascadeMock({
-    rules: [{ selector: '.btn', prop: 'color', value: 'red', source: 'style-sheet-123:4' }],
-    computed: { color: 'red' },
-    sheetText: ''
+describe('formatRefRect', () => {
+  it('marks fixed elements', () => {
+    expect(formatRefRect({ x: 1543, y: 259, w: 266, h: 52, position: 'fixed' }))
+      .toBe('(1543,259 266×52, fixed)');
   });
-  const out = await cascadeStr(cdp, 'sid', '.btn', 'color', new Map());
-  expect(out).toContain('style-sheet-');
-  expect(out).toContain('unresolved generated stylesheet');
 });
 ```
 
-If `makeCascadeMock` does not exist, add a tiny local test helper that mocks `DOM.getDocument`, `DOM.querySelector`, `CSS.getMatchedStylesForNode`, `CSS.getComputedStyleForNode`, and `CSS.getStyleSheetText`.
+**Step 2: Include `position` in rect resolution**
 
-**Step 2: Write failing test for no-explicit-rule computed fallback**
+Change `Runtime.callFunctionOn` for ref rects to return:
 
 ```js
-it('shows computed fallback when no explicit rules match requested property', async () => {
-  const cdp = makeCascadeMock({ rules: [], computed: { 'background-color': 'rgba(0, 0, 0, 0)' } });
-  const out = await cascadeStr(cdp, 'sid', '.btn', 'background-color', new Map());
-  expect(out).toContain('background-color: rgba(0, 0, 0, 0)');
-  expect(out).toContain('computed fallback');
-  expect(out).toContain('styles');
-});
+const cs = getComputedStyle(this);
+return { x, y, w, h, position: cs.position };
 ```
 
-**Step 3: Run targeted test and confirm failure**
+Only display `position` when `fixed` or `sticky`.
+
+**Step 3: Verify**
 
 ```bash
-npm test -- tests/cdp.test.mjs -t "cascadeStr"
-```
-
-**Step 4: Implement helpers**
-
-Add helpers:
-
-```js
-function isOpaqueStyleSource(source) {
-  return /^style-sheet-[^:]+:\d+/.test(String(source || ''));
-}
-
-function formatStyleSourceForDisplay(source) {
-  return isOpaqueStyleSource(source)
-    ? `${source} (unresolved generated stylesheet; use styles for computed value or verify source maps)`
-    : source;
-}
-```
-
-Use in `cascadeStr` when printing `→ ${r.source}` and inherited source lines.
-
-For property fallback, adjust existing branch:
-
-```js
-return computed
-  ? `${property}: ${computed} (computed fallback; no explicit matching CSS rule found — use styles ${selector} for full computed styles)`
-  : `Property "${property}" not found on this element`;
-```
-
-For full no-rule mode, consider returning a compact subset:
-
-```js
-const fallbackProps = ['display','color','background-color','font-size','font-weight','opacity','cursor'];
-const available = fallbackProps.filter(p => computedMap.get(p)).map(p => `  ${p}: ${computedMap.get(p)}`);
-return available.length
-  ? ['No matching CSS rules found. Computed fallback:', ...available, 'Use `styles` for full computed styles.'].join('\n')
-  : 'No matching CSS rules found for this element';
-```
-
-**Step 5: Verify**
-
-```bash
-npm test -- tests/cdp.test.mjs -t "cascadeStr|mapStyleSource"
+npm test -- tests/cdp.test.mjs -t "perceiveStr|formatRefRect|buildPerceiveTree"
 npm test
+npm run lint
 ```
 
-**Step 6: Docs update**
+**Step 4: Docs update**
 
-Update README/SKILL phrasing:
+Add note: coordinates are viewport CSS pixels, same coordinate system as `clickxy`; screenshot pixels may differ by DPR.
 
-- Replace “`cascade` tells exactly which file and line to edit” with “`cascade` traces matched CSS rules and source locations when available; Vite/CSS Modules source maps are best-effort; use `styles` as computed-style fallback.”
-- Add a short example of computed fallback.
-
-**Step 7: Commit**
+**Step 5: Commit**
 
 ```bash
 git add skills/chrome-cdp-ex/scripts/cdp.mjs tests/cdp.test.mjs README.md skills/chrome-cdp-ex/SKILL.md
-git commit -m "fix: clarify cascade fallbacks"
+git commit -m "fix: clarify perceive viewport coordinates"
 ```
 
 ---
 
-## Task 5: Reconcile roadmap, README, skill, and release metadata
+## Task 5: Add `text` selector fallback chain and `--auto`
 
-**Objective:** Make docs match actual shipped behavior and avoid future agents following stale promises.
+**Objective:** Make content extraction work across pages without repeated selector guessing.
 
 **Files:**
-- Modify: `README.md`
-- Modify: `skills/chrome-cdp-ex/SKILL.md`
-- Modify: `TODOS.md`
-- Modify: `DESIGN.md`
-- Modify if needed: `CHANGELOG.md`
-- Modify if needed: `package.json`
+- Modify: `skills/chrome-cdp-ex/scripts/cdp.mjs`
+- Test: `tests/cdp.test.mjs`
+- Docs: `README.md`, `skills/chrome-cdp-ex/SKILL.md`
 
-**Step 1: Audit command count and command list**
+**Design:**
 
-Run:
+Supported forms:
 
 ```bash
-node - <<'JS'
-const fs = require('fs');
-const s = fs.readFileSync('skills/chrome-cdp-ex/scripts/cdp.mjs','utf8');
-const m = s.match(/const NEEDS_TARGET = new Set\(\[([\s\S]*?)\]\)/);
-console.log(m ? m[1].split(',').map(x=>x.trim().replace(/["']/g,'')).filter(Boolean).length : 'NEEDS_TARGET not found');
-JS
+text <target>                         # existing full-page text
+text <target> <selector>              # existing scoped text
+text <target> "main, [role=main], #app .main"  # fallback selector chain
+text <target> --auto                  # heuristic main content extraction
+text <target> --auto --exclude "nav,aside,.sidebar"
 ```
 
-Also inspect `USAGE` for listed commands.
-
-**Step 2: Update `TODOS.md`**
-
-Move shipped items out of unchecked future roadmap. Suggested structure:
-
-```md
-## Shipped / maintain
-
-- [x] `inject` — shipped in v2.2.0; maintain security validation and removal semantics.
-- [x] `cascade` — shipped; source mapping is best-effort and needs real-app dogfood.
-- [x] `record` — shipped; maintain action/settle semantics.
-
-## Next high-value repairs
-
-- [ ] Real-app Vite/CSS Modules dogfood matrix for `cascade` source mapping.
-- [ ] `emulate` — network/theme emulation.
-- [ ] `frame` — cross-origin iframe discovery/observation.
-- [ ] `components` — React/Vue component tree/state inspection.
-```
-
-**Step 3: Update `DESIGN.md` status headers**
-
-Add a top status table:
-
-```md
-| Feature | Status | Notes |
-|---|---|---|
-| inject | Shipped | zero-dependency, URL validation |
-| cascade | Shipped / best-effort source mapping | use styles fallback when rules/source unavailable |
-| record | Shipped | action mode auto-settles |
-| emulate | Not shipped | future |
-| frame | Not shipped | future |
-| components | Not shipped | future |
-```
-
-Mark old implementation sketches as historical design notes, not current truth.
-
-**Step 4: Update README/SKILL command examples**
-
-Ensure all command references include:
-
-- `styles <target> <selector|@ref>`
-- `press <target> <key>` supports named keys plus `0-9`, `a-z`
-- `flow`/`batch` examples with quoted args:
+Important: a CSS comma list currently means “query all matching selectors.” The requested behavior is fallback chain. To avoid breaking CSS semantics, choose explicit flag:
 
 ```bash
-flow <t> "fill @1 'look 訓練師'; press Enter; wait dom stable; summary"
-batch <t> "styles @1 | cascade @1 color | console --errors" --plain
+text <target> --first "[role='region'][aria-label*='事件']" "[class*=MainStage]" "main"
 ```
 
-**Step 5: Verify docs do not overclaim**
+But reviewer explicitly suggested `"main, [role=main], #app .main"`. Implementing comma fallback is acceptable if documented. Preserve old single selector behavior when selector contains comma but first matching element is fine.
 
-Run searches:
+**Step 1: Write tests for parser**
+
+```js
+describe('parseTextArgs', () => {
+  it('parses comma fallback selectors', () => {
+    expect(parseTextArgs(['main, [role=main], #app .main']).selectors).toEqual(['main', '[role=main]', '#app .main']);
+  });
+
+  it('parses --auto', () => {
+    expect(parseTextArgs(['--auto']).auto).toBe(true);
+  });
+});
+```
+
+**Step 2: Write tests for extraction JS behavior with mocked eval**
+
+Mock `evalStr` result or extract pure JS builder `textPageScript(opts)` and assert it contains:
+
+- exclusion of `script, style, svg, nav, aside`;
+- candidates `main`, `[role=main]`, `article`, `#root`, `body`;
+- fallback selector loop.
+
+**Step 3: Implement**
+
+- `parseTextArgs(args)`
+- `textStr(cdp, sid, args)` or preserve signature with options.
+- If no selector found in fallback, return actionable error listing tried selectors.
+
+**Step 4: Verify**
 
 ```bash
-grep -R "exactly which file\|exact file\|always" -n README.md skills/chrome-cdp-ex/SKILL.md DESIGN.md TODOS.md || true
-grep -R "styles <target> <selector>" -n README.md skills/chrome-cdp-ex/SKILL.md || true
+npm test -- tests/cdp.test.mjs -t "textStr|parseTextArgs"
+npm test
+npm run lint
 ```
 
-Expected: no stale exact/always claims for cascade; no old styles signature.
+**Step 5: Docs update**
+
+Add examples from feedback:
+
+```bash
+text <t> --auto
+text <t> "[role='region'][aria-label*='事件'], [class*=MainStage], main"
+```
 
 **Step 6: Commit**
 
 ```bash
-git add README.md skills/chrome-cdp-ex/SKILL.md TODOS.md DESIGN.md CHANGELOG.md package.json
-git commit -m "docs: reconcile shipped chrome-cdp-ex roadmap"
+git add skills/chrome-cdp-ex/scripts/cdp.mjs tests/cdp.test.mjs README.md skills/chrome-cdp-ex/SKILL.md
+git commit -m "feat: add text fallback extraction"
 ```
 
 ---
 
-## Task 6: Add deterministic local CDP smoke page and manual smoke script
+## Task 6: Make `shot` output script-friendly
 
-**Objective:** Verify fixed behavior in a real browser without depending on `3y-mud` availability.
+**Objective:** Keep human DPR guidance without polluting the primary saved-path output.
 
 **Files:**
-- Create: `scripts/smoke-page.html`
-- Create: `scripts/live-smoke.mjs` or `scripts/live-smoke.sh`
-- Modify: `package.json` scripts if desired
-- Docs: `CONTRIBUTING.md` or `README.md`
+- Modify: `skills/chrome-cdp-ex/scripts/cdp.mjs`
+- Test: `tests/cdp.test.mjs`
+- Docs: `README.md`, `skills/chrome-cdp-ex/SKILL.md`
 
-**Step 1: Create smoke page**
+**Design:**
 
-`scripts/smoke-page.html` should include:
-
-- input `#cmd`;
-- button `#hotkey-target` with `keydown` listener logging numeric key presses;
-- button `#mutate` that appends DOM nodes, logs console output, and fires a fetch to a harmless local/data endpoint if feasible;
-- CSS rule with `sourceURL` or inline sourcemap comment for cascade;
-- CSS module-like generated class to test source fallback wording.
-
-Minimal page skeleton:
-
-```html
-<!doctype html>
-<meta charset="utf-8">
-<title>chrome-cdp-ex smoke</title>
-<style>
-.btn { color: rgb(1, 2, 3); background-color: rgb(4, 5, 6); }
-/*# sourceURL=/tmp/chrome-cdp-ex-smoke.css */
-</style>
-<input id="cmd" aria-label="command" />
-<button id="hotkey-target" class="btn">Hotkey target</button>
-<button id="mutate" class="btn">Mutate</button>
-<div id="log"></div>
-<script>
-document.getElementById('hotkey-target').addEventListener('keydown', e => {
-  document.getElementById('log').textContent = 'key:' + e.key;
-  console.log('key', e.key);
-});
-document.getElementById('mutate').addEventListener('click', () => {
-  const p = document.createElement('p');
-  p.textContent = 'mutated ' + Date.now();
-  document.getElementById('log').appendChild(p);
-  console.warn('mutated');
-});
-</script>
-```
-
-**Step 2: Create smoke runner**
-
-The script should:
-
-1. Start a simple local static server (`python3 -m http.server`) in `scripts/`.
-2. Launch isolated Chrome/Edge with `--remote-debugging-port=9333` and a temp profile.
-3. Run:
-   - `doctor`
-   - `list`
-   - `perceive -C -d 8`
-   - `styles @ref`
-   - `cascade @ref color`
-   - `flow "fill @ref 'look 訓練師'; press Enter; summary"`
-   - `press 1` after focusing `#hotkey-target`
-   - `record --action click @mutateRef`
-   - `batch "styles @ref | console --errors" --plain`
-4. Print PASS/FAIL summary.
-5. Clean up only the temp browser/profile/server.
-
-Prefer a conservative script that skips if Chrome/Edge cannot be found, so CI does not become flaky.
-
-**Step 3: Document smoke usage**
-
-Add to `CONTRIBUTING.md`:
+- Default stdout first line must be the saved path.
+- DPR guidance appears only after saved path, or through stderr if easy in CLI path, or behind `--verbose`.
+- Add `--quiet` to suppress hints:
 
 ```bash
-npm test
-npm run lint
-node scripts/live-smoke.mjs
+shot <target> /tmp/a.png --quiet
 ```
 
-**Step 4: Verify locally**
+**Step 1: Add tests for output ordering**
 
-Run:
+```js
+it('shot output starts with the saved path', async () => {
+  const out = await shotStr(fakeCdp, 'sid', '/tmp/a.png', 'target', { quiet: false });
+  expect(out.split('\n')[0]).toBe('/tmp/a.png');
+});
+```
+
+**Step 2: Implement argument parsing**
+
+Update `handleCommand` for `shot` to parse flags rather than passing only `args[0]`.
+
+**Step 3: Verify**
 
 ```bash
+npm test -- tests/cdp.test.mjs -t "shotStr|screenshot"
 npm test
 npm run lint
-node scripts/live-smoke.mjs
 ```
 
-Expected: unit tests and lint pass; smoke script either passes or explicitly skips with a clear reason.
+**Step 4: Commit**
+
+```bash
+git add skills/chrome-cdp-ex/scripts/cdp.mjs tests/cdp.test.mjs README.md skills/chrome-cdp-ex/SKILL.md
+git commit -m "fix: make screenshot output script friendly"
+```
+
+---
+
+## Task 7: Add long-session wait primitives: `waitfor --any-of` and `--selector-stable`
+
+**Objective:** Replace brittle `sleep 25` playtest waits with semantic waits for combat/animation/log stabilization.
+
+**Files:**
+- Modify: `skills/chrome-cdp-ex/scripts/cdp.mjs`
+- Test: `tests/cdp.test.mjs`
+- Docs: `README.md`, `skills/chrome-cdp-ex/SKILL.md`
+
+**Supported forms:**
+
+```bash
+waitfor <target> --any-of "戰鬥勝利|戰敗|逃跑成功" [timeoutMs] [--scope selector]
+waitfor <target> --selector-stable ".combat-log" [stableMs=3000] [timeoutMs=30000]
+```
+
+**Step 1: Parser tests**
+
+```js
+describe('parseWaitForArgs', () => {
+  it('parses any-of pattern and timeout', () => {
+    expect(parseWaitForArgs(['--any-of', '勝利|敗北|逃跑成功', '60000'])).toMatchObject({ mode: 'any-of', pattern: '勝利|敗北|逃跑成功', timeoutMs: 60000 });
+  });
+
+  it('parses selector-stable', () => {
+    expect(parseWaitForArgs(['--selector-stable', '.combat-log', '3000', '60000'])).toMatchObject({ mode: 'selector-stable', selector: '.combat-log', stableMs: 3000, timeoutMs: 60000 });
+  });
+});
+```
+
+**Step 2: Implement `--any-of`**
+
+Use page text from scope or body and regex split by `|`:
+
+- Escape plain terms unless user explicitly opts into regex later.
+- Return matched term and snippet.
+
+**Step 3: Implement `--selector-stable`**
+
+Poll `el.innerText || el.textContent` hash/string. When unchanged for `stableMs`, return.
+
+**Step 4: Verify**
+
+```bash
+npm test -- tests/cdp.test.mjs -t "waitForStr|parseWaitForArgs|selector-stable|any-of"
+npm test
+npm run lint
+```
+
+**Step 5: Docs update with game example**
+
+```bash
+record <t> --action click @5 --until "dom stable"
+waitfor <t> --any-of "戰鬥勝利|戰敗|逃跑成功" 60000 --scope ".combat-log"
+waitfor <t> --selector-stable ".combat-log" 3000 60000
+```
+
+**Step 6: Commit**
+
+```bash
+git add skills/chrome-cdp-ex/scripts/cdp.mjs tests/cdp.test.mjs README.md skills/chrome-cdp-ex/SKILL.md
+git commit -m "feat: add semantic waitfor modes"
+```
+
+---
+
+## Task 8: Add `dismiss-modal` safe high-level action
+
+**Objective:** Close common modals without accidentally triggering underlying page shortcuts.
+
+**Files:**
+- Modify: `skills/chrome-cdp-ex/scripts/cdp.mjs`
+- Test: `tests/cdp.test.mjs`
+- Docs: `README.md`, `skills/chrome-cdp-ex/SKILL.md`
+
+**Design:**
+
+Command:
+
+```bash
+dismiss-modal <target>
+```
+
+Strategy order:
+
+1. Try click on visible close buttons inside `[role=dialog], dialog, [aria-modal=true]`:
+   - `[aria-label*=close i]`, `[aria-label*=關閉]`, `button:has-text` is not native CSS, so use JS text matching for `關閉`, `Close`, `×`, `OK`, `確認`, `繼續`.
+2. Try `Escape`.
+3. Try a synthetic key event targeted only at the dialog root with stop propagation? CDP cannot directly set `stopPropagation` on real key events, so avoid promising full isolation unless implemented via page-side JS dispatch.
+4. Return clear status and what worked.
+
+Do **not** default to `Space`; the feedback shows why.
+
+**Step 1: Tests**
+
+Add pure JS selector/text matching helper tests if possible.
+
+**Step 2: Implement command**
+
+Add to `handleCommand`, `NEEDS_TARGET`, `USAGE`, README, SKILL.
+
+**Step 3: Verify**
+
+```bash
+npm test -- tests/cdp.test.mjs -t "dismiss-modal|modal"
+npm test
+npm run lint
+```
+
+**Step 4: Commit**
+
+```bash
+git add skills/chrome-cdp-ex/scripts/cdp.mjs tests/cdp.test.mjs README.md skills/chrome-cdp-ex/SKILL.md
+git commit -m "feat: add safe modal dismissal command"
+```
+
+---
+
+## Task 9: Improve `perceive` truncation controls
+
+**Objective:** Prevent important `@ref` lines from disappearing in long event-log pages.
+
+**Files:**
+- Modify: `skills/chrome-cdp-ex/scripts/cdp.mjs`
+- Test: `tests/cdp.test.mjs`
+- Docs: `README.md`, `skills/chrome-cdp-ex/SKILL.md`
+
+**Supported forms:**
+
+```bash
+perceive <target> --keep-refs
+perceive <target> --last 20
+```
+
+**Design:**
+
+- `--keep-refs`: when truncating, preserve all interactive/ref lines and summarize omitted static text blocks.
+- `--last N`: for large text/event-log areas, include only the last N static/text rows per overflowing subtree. Keep simple for this slice; do not build a full token-budget optimizer yet.
+
+**Step 1: Parser tests**
+
+Extend `parsePerceiveArgs` tests for `--keep-refs` and `--last`.
+
+**Step 2: BuildPerceiveTree tests**
+
+Add a tree with 100 StaticText nodes and one textbox/button near the end; assert `--keep-refs` preserves ref lines.
+
+**Step 3: Implement minimal truncation policy**
+
+Prefer a conservative implementation over a complex token estimator.
+
+**Step 4: Verify**
+
+```bash
+npm test -- tests/cdp.test.mjs -t "parsePerceiveArgs|keep-refs|last"
+npm test
+npm run lint
+```
 
 **Step 5: Commit**
 
 ```bash
-git add scripts/smoke-page.html scripts/live-smoke.mjs package.json CONTRIBUTING.md
-git commit -m "test: add live CDP smoke coverage"
+git add skills/chrome-cdp-ex/scripts/cdp.mjs tests/cdp.test.mjs README.md skills/chrome-cdp-ex/SKILL.md
+git commit -m "feat: add perceive ref-preserving truncation"
 ```
 
 ---
 
-## Task 7: Final verification and release hygiene
+## Task 10: Fix P2 output fidelity and lifecycle polish
 
-**Objective:** Ensure all changes are coherent and ready for push/release.
+**Objective:** Pick off cheap reliability/polish items from the 5-minute bucket.
 
 **Files:**
-- Possibly: `CHANGELOG.md`, `package.json`, `.claude-plugin/plugin.json`
+- Modify: `skills/chrome-cdp-ex/scripts/cdp.mjs`
+- Test: `tests/cdp.test.mjs`
+- Docs if needed: `README.md`, `skills/chrome-cdp-ex/SKILL.md`
 
-**Step 1: Run full verification**
+### 10A: `list` should show `about:blank`
+
+Tests:
+
+```js
+it('formatPageList includes about:blank as a usable blank tab', () => {
+  const out = formatPageList([{ id: 'ABCDEF123456', type: 'page', title: '', url: 'about:blank' }]);
+  expect(out).toContain('ABCDEF12');
+  expect(out).toContain('(blank tab)');
+});
+```
+
+Implementation: do not filter `about:blank` page targets; label them.
+
+### 10B: Console level fidelity
+
+Verify current `Runtime.consoleAPICalled` maps `params.type` faithfully. If existing behavior is correct, add regression tests and document that app-side `console.error` remains `[error]` by design. If broken, fix.
+
+### 10C: Eval serialization guidance
+
+Current `evalStr` appears to JSON.stringify object results. Verify with tests. If already fixed, update docs with examples:
+
+```bash
+eval <t> "({ title: document.title, url: location.href })"
+eval <t> "Array.from(document.querySelectorAll('button')).map(b => b.innerText)"
+```
+
+### 10D: Daemon crash hint/log path
+
+When socket closes before response, improve client error:
+
+```text
+Connection closed before response. The daemon for <target> may have crashed or exited. Re-run `perceive` to restart it; check <runtime-dir>/cdp-<target>.log if present.
+```
+
+If adding daemon logs, redirect daemon stderr to a per-target log file instead of `stdio: 'ignore'`.
+
+**Commit:**
+
+```bash
+git add skills/chrome-cdp-ex/scripts/cdp.mjs tests/cdp.test.mjs README.md skills/chrome-cdp-ex/SKILL.md
+git commit -m "fix: polish list console eval and daemon diagnostics"
+```
+
+---
+
+## Task 11: Rewrite docs for first-use and long-session agent workflows
+
+**Objective:** Make SKILL.md easier for agents to follow and align docs with real playtest needs.
+
+**Files:**
+- Modify: `skills/chrome-cdp-ex/SKILL.md`
+- Modify: `README.md`
+- Modify: `TODOS.md`
+- Modify: `DESIGN.md`
+
+**Required SKILL.md top section:**
+
+```md
+## TL;DR — 90% workflow
+
+1. `cdp list` — discover tabs; if no CDP is available, run `cdp doctor` then either toggle browser remote debugging or, with user consent, `cdp spawn-debug-browser edge --port 9222 --url <url>`.
+2. `cdp perceive <target> -C -d 8` — observe structure, refs, viewport CSS coordinates, console health.
+3. `cdp click|fill|press <target> @ref|selector` — interact; use `@ref` for immediate next action, stable selectors for long loops.
+4. `cdp text <target> --auto` or `text <target> "sel1, sel2, main"` — extract content.
+5. `cdp shot <target> --annotate` / `elshot` — visual evidence when text/layout is insufficient.
+```
+
+**Required recipes:**
+
+- macOS/Edge first-run: existing session vs isolated debug profile.
+- Long game/animation session:
+  - `waitfor --any-of`
+  - `waitfor --selector-stable`
+  - `record` timeline example for combat/logs.
+- `@ref` lifecycle and stable selector guidance.
+- `@c` / `-C` hidden clickable discovery example.
+- Screenshot workflow and `shot --quiet` / `--annotate` / future `--annotate-fresh` note.
+- Vite HMR: page reload invalidates refs; re-run `perceive`.
+
+**TODOS/DESIGN cleanup:**
+
+- Mark shipped features as shipped.
+- Move wishlist items into realistic buckets:
+  - Cheap: single-char `press`, list about:blank, console fidelity, DPR quiet, TL;DR.
+  - Medium: stale-ref lifecycle, text fallback, fixed/sticky coords, spawn helper, waitfor modes.
+  - Larger: checkpoint/restore, record-actions/replay, session screenshots, mock/throttle/clock, structured JSON summary.
+
+**Verify docs:**
+
+```bash
+grep -R "do NOT suggest restarting Chrome" -n README.md skills/chrome-cdp-ex/SKILL.md || true
+grep -R "TL;DR" -n skills/chrome-cdp-ex/SKILL.md README.md
+grep -R "waitfor --any-of\|selector-stable\|spawn-debug-browser" -n README.md skills/chrome-cdp-ex/SKILL.md
+```
+
+**Commit:**
+
+```bash
+git add README.md skills/chrome-cdp-ex/SKILL.md TODOS.md DESIGN.md
+git commit -m "docs: add long-session agent workflow guidance"
+```
+
+---
+
+## Task 12: Add deterministic live CDP smoke for 3y-Mud-like workflows
+
+**Objective:** Prevent regressions in exactly the scenario that produced the feedback: Vite app, long page, modal, fixed sidebar, keyboard shortcuts, logs, screenshots, and semantic waits.
+
+**Files:**
+- Create: `scripts/smoke-page.html`
+- Create: `scripts/live-smoke.mjs`
+- Modify: `package.json` scripts if desired
+- Modify: `CONTRIBUTING.md`
+
+**Smoke page must include:**
+
+- Long scrollable event log with 100+ messages.
+- Fixed right sidebar button with keyboard shortcut `(C)`.
+- Modal that says “press any key” and a background shortcut that should not fire when using `dismiss-modal`.
+- Input placeholder for command text.
+- Buttons that mutate DOM and append combat outcomes (`戰鬥勝利`, `戰敗`, `逃跑成功`).
+- A custom clickable `div` discoverable via `-C`.
+- Styles with `position: fixed` / `sticky` for coordinate annotation.
+
+**Smoke script should:**
+
+1. Start local static server.
+2. Spawn isolated debug browser via new `spawn-debug-browser` if possible, or launch directly as fallback.
+3. Run commands:
+   - `doctor`
+   - `list`
+   - `perceive -C -d 8 --keep-refs`
+   - `press c`
+   - `text --auto`
+   - `text "[role='region'][aria-label*='事件'], [class*=MainStage], main"`
+   - `waitfor --any-of "戰鬥勝利|戰敗|逃跑成功" 10000`
+   - `waitfor --selector-stable "#combat-log" 500 5000`
+   - `dismiss-modal`
+   - `shot /tmp/chrome-cdp-ex-smoke.png --quiet`
+4. Assert output snippets and print PASS/FAIL.
+5. Clean up only temporary browser/server/profile.
+
+**Verification:**
 
 ```bash
 npm test
@@ -848,93 +916,90 @@ npm run lint
 node scripts/live-smoke.mjs
 ```
 
-Expected:
-
-- `npm test`: all tests pass.
-- `npm run lint`: no errors.
-- live smoke: PASS or SKIP with clear environment reason.
-
-**Step 2: Inspect git diff**
+**Commit:**
 
 ```bash
-git diff --stat HEAD~6..HEAD
-git log --oneline -8
+git add scripts/smoke-page.html scripts/live-smoke.mjs package.json CONTRIBUTING.md
+git commit -m "test: add long-session live CDP smoke"
 ```
 
-Check that changes are scoped to parser/key/style/cascade/docs/smoke, not unrelated feature sprawl.
+---
 
-**Step 3: Check package/plugin version consistency**
+## Task 13: Final verification, changelog, and push
 
-Read:
+**Objective:** Ensure repair slice is coherent and ready for release.
+
+**Files:**
+- Modify if needed: `CHANGELOG.md`, `package.json`, `.claude-plugin/plugin.json`
+
+**Step 1: Full verification**
 
 ```bash
-node -p "require('./package.json').version"
-cat .claude-plugin/plugin.json
+npm test
+npm run lint
+node scripts/live-smoke.mjs
 ```
 
-If behavior changes warrant patch release, bump package/plugin version consistently and update changelog. If auto-release is configured by conventional commits, do not manually bump unless repo convention requires it.
+If live smoke skips due to no browser, record the skip reason. Do not claim live browser verification if it skipped.
 
-**Step 4: Final manual dogfood on a real app if available**
-
-If `3y-mud` or another Vite/React/CSS Modules app is running, run one real smoke:
-
-```bash
-CDP_PORT=9333 node skills/chrome-cdp-ex/scripts/cdp.mjs list
-CDP_PORT=9333 node skills/chrome-cdp-ex/scripts/cdp.mjs perceive <target> -C -d 8
-CDP_PORT=9333 node skills/chrome-cdp-ex/scripts/cdp.mjs styles <target> @1
-CDP_PORT=9333 node skills/chrome-cdp-ex/scripts/cdp.mjs cascade <target> @1 color
-CDP_PORT=9333 node skills/chrome-cdp-ex/scripts/cdp.mjs flow <target> "fill @1 'look 訓練師'; press Enter; summary"
-```
-
-Record exact output snippets in the PR/commit notes, especially whether `cascade` resolved source files or used fallback wording.
-
-**Step 5: Push**
+**Step 2: Inspect diff and history**
 
 ```bash
 git status --short
+git log --oneline -12
+git diff --stat origin/main...HEAD
+```
+
+**Step 3: Release metadata**
+
+If repo uses conventional commits/auto-release, leave version bump to automation unless established convention says otherwise. Otherwise bump patch/minor according to scope:
+
+- `feat:` commands (`spawn-debug-browser`, `waitfor` modes, `dismiss-modal`) likely warrant minor.
+- Pure fixes only warrant patch.
+
+**Step 4: Push**
+
+```bash
 git push origin main
 ```
 
 ---
 
-## Implementation Order / Commit Plan
+## Suggested Implementation Order
 
-1. `docs: add chrome-cdp-ex review feedback improvement plan`
-2. `fix: preserve quoted args in flow and batch`
-3. `fix: support numeric and letter key presses`
-4. `fix: support refs in styles command`
-5. `fix: clarify cascade fallbacks`
-6. `docs: reconcile shipped chrome-cdp-ex roadmap`
-7. `test: add live CDP smoke coverage`
-8. Optional release metadata commit if required by repo convention.
-
----
-
-## Non-goals for this slice
-
-- Do not implement `emulate`, `frame`, or `components` in this slice.
-- Do not split `cdp.mjs` into multiple modules unless a tiny helper extraction becomes unavoidable.
-- Do not claim `cascade` always maps to original source files in all bundlers.
-- Do not replace Playwright or deterministic E2E testing; `chrome-cdp-ex` remains a live-browser inspection/dogfood tool.
+1. Baseline audit and docs correction for actual feedback file.
+2. `press` single-character keys — cheap, high impact.
+3. Ref lifecycle / stale-ref errors — highest robustness leverage.
+4. `text` fallback and `--auto` — high daily utility.
+5. `waitfor --any-of` / `--selector-stable` — solves long combat/session sleeps.
+6. `perceive` fixed/sticky coordinate labels and `--keep-refs`.
+7. `shot --quiet` and output ordering.
+8. `spawn-debug-browser` macOS/Edge helper.
+9. `dismiss-modal`.
+10. P2 polish: `about:blank`, console fidelity tests, eval docs, daemon crash hint.
+11. Docs rewrite / TL;DR / workflow recipes.
+12. Live smoke.
+13. Final release hygiene and push.
 
 ---
 
-## Risk Controls
+## Non-goals for This Slice
 
-- **Parser regressions:** Keep JSON batch mode unchanged; add targeted tests for old simple cases and new quoted cases.
-- **Key event incompatibility:** Use standard Chrome key/code/keyCode values; verify in live smoke.
-- **Ref staleness:** Reuse existing ref error hints; do not silently query stale DOM nodes.
-- **Cascade false confidence:** Label unresolved generated stylesheet sources explicitly.
-- **Live smoke flakiness:** Make smoke script skip gracefully when no supported browser binary is available.
+- Do not implement checkpoint/restore, record-actions/replay, network mock, clock control, tab groups, or embedded LLM `ask` in this slice.
+- Do not add Playwright/Puppeteer dependencies to the distributed tool.
+- Do not promise `press --isolated` unless event propagation isolation is actually implemented and tested.
+- Do not make `@ref` look as stable as Playwright Locator; document that refs are short-lived handles and stable selectors are better for loops.
+- Do not convert the single-file implementation into a multi-package architecture yet.
 
 ---
 
-## Current Baseline Verified During Planning
+## Current Baseline Previously Verified Before This Amendment
 
 - Repo: `/Users/simon/Code/chrome-cdp-ex`
 - Remote: `https://github.com/EndeavorYen/chrome-cdp-ex`
 - Branch: `main`
-- Worktree before plan: clean
-- Baseline tests: `npm test` → `279 passed / 0 failed`
-- Main implementation file: `skills/chrome-cdp-ex/scripts/cdp.mjs` (~3,580 lines)
-- Test file: `tests/cdp.test.mjs` (~3,264 lines)
+- Baseline tests at earlier planning time: `npm test` → `279 passed / 0 failed`
+- Main implementation: `skills/chrome-cdp-ex/scripts/cdp.mjs`
+- Tests: `tests/cdp.test.mjs`
+
+Re-run Task 0 before implementation because this plan was amended after reading feedback from a sibling repo.
