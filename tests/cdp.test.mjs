@@ -3840,3 +3840,262 @@ describe('parsePerceiveArgs (keep-refs/last)', () => {
     expect(T.parsePerceiveArgs(['--last', 'xyz']).last).toBeNull();
   });
 });
+
+// =========================================================================
+// jsClickStr — explicit JS-fallback click via HTMLElement.click()
+// =========================================================================
+
+describe('jsClickStr', () => {
+  const { jsClickStr } = T;
+
+  it('calls HTMLElement.click() through Runtime.callFunctionOn for @ref targets', async () => {
+    let fnDecl = '';
+    const refMap = new Map([[1, 555]]);
+    const cdp = createMockCDP({
+      'DOM.resolveNode': () => ({ object: { objectId: 'obj-555' } }),
+      'Runtime.callFunctionOn': (params) => {
+        fnDecl = params.functionDeclaration;
+        return { result: { value: { tag: 'BUTTON', text: 'OK' } } };
+      },
+    });
+    const out = await jsClickStr(cdp, 'sid', '@1', refMap, { generation: 1 });
+    expect(out).toMatch(/JS-clicked <BUTTON> "OK" \(@1\)/);
+    expect(fnDecl).toMatch(/this\.click\(\)/);
+    // No mouse events should have been dispatched in JS-fallback mode
+    expect(cdp.calls.find(c => c.method === 'Input.dispatchMouseEvent')).toBeUndefined();
+  });
+
+  it('uses document.querySelector + el.click() for CSS selectors', async () => {
+    let evalledExpr = '';
+    const cdp = createMockCDP({
+      'Runtime.evaluate': (params) => {
+        evalledExpr = params.expression;
+        return { result: { value: JSON.stringify({ ok: true, tag: 'A', text: 'Help' }) } };
+      },
+    });
+    const out = await jsClickStr(cdp, 'sid', 'a.help', new Map());
+    expect(out).toMatch(/JS-clicked <A> "Help"/);
+    expect(evalledExpr).toContain('document.querySelector');
+    expect(evalledExpr).toMatch(/el\.click\(\)/);
+  });
+
+  it('throws when the CSS selector does not match', async () => {
+    const cdp = createMockCDP({
+      'Runtime.evaluate': () => ({ result: { value: JSON.stringify({ ok: false, error: 'Element not found: .nope' }) } }),
+    });
+    await expect(jsClickStr(cdp, 'sid', '.nope', new Map())).rejects.toThrow(/Element not found/);
+  });
+
+  it('throws on unknown @ref with a refState-aware message', async () => {
+    const refMap = new Map();
+    const refState = { generation: 0, invalidationReason: 'daemon-start' };
+    const cdp = createMockCDP({});
+    await expect(jsClickStr(cdp, 'sid', '@99', refMap, refState))
+      .rejects.toThrow(/No refs have been assigned/);
+  });
+
+  it('rejects empty selector', async () => {
+    const cdp = createMockCDP({});
+    await expect(jsClickStr(cdp, 'sid', undefined, new Map())).rejects.toThrow(/selector.*required/i);
+  });
+});
+
+// =========================================================================
+// repeat primitive — count cap, fail-fast, --continue
+// =========================================================================
+
+describe('parseRepeatArgs', () => {
+  const { parseRepeatArgs } = T;
+
+  it('parses count, command, and command args', () => {
+    const opts = parseRepeatArgs(['3', 'press', 'c']);
+    expect(opts.count).toBe(3);
+    expect(opts.cmd).toBe('press');
+    expect(opts.args).toEqual(['c']);
+    expect(opts.continueOnError).toBe(false);
+  });
+
+  it('parses --continue anywhere in the argument list', () => {
+    expect(parseRepeatArgs(['5', '--continue', 'click', '@1']).continueOnError).toBe(true);
+    expect(parseRepeatArgs(['5', 'click', '@1', '--continue']).continueOnError).toBe(true);
+    expect(parseRepeatArgs(['-c', '4', 'press', 'space']).continueOnError).toBe(true);
+  });
+
+  it('rejects non-positive counts', () => {
+    expect(() => parseRepeatArgs(['0', 'press', 'c'])).toThrow(/positive integer/);
+    expect(() => parseRepeatArgs(['-1', 'press', 'c'])).toThrow(/positive integer/);
+    expect(() => parseRepeatArgs(['abc', 'press', 'c'])).toThrow(/positive integer/);
+  });
+
+  it('caps the loop count to prevent runaways', () => {
+    expect(() => parseRepeatArgs(['9999', 'press', 'c'])).toThrow(/exceeds cap/);
+  });
+
+  it('rejects nesting itself or other meta-commands', () => {
+    expect(() => parseRepeatArgs(['3', 'repeat', '2', 'press', 'c'])).toThrow(/cannot wrap/);
+    expect(() => parseRepeatArgs(['3', 'batch', 'press c'])).toThrow(/cannot wrap/);
+    expect(() => parseRepeatArgs(['3', 'stop'])).toThrow(/cannot wrap/);
+  });
+
+  it('allows wrapping flow so multi-step bodies can loop (matches README)', () => {
+    const opts = parseRepeatArgs(['3', 'flow', 'click @1; wait dom stable']);
+    expect(opts.count).toBe(3);
+    expect(opts.cmd).toBe('flow');
+    expect(opts.args).toEqual(['click @1; wait dom stable']);
+  });
+
+  it('requires a command name after the count', () => {
+    expect(() => parseRepeatArgs(['3'])).toThrow(/command name required|repeat requires/);
+  });
+});
+
+describe('repeatStr', () => {
+  const { repeatStr } = T;
+
+  it('runs the inner command N times and counts successes', async () => {
+    let calls = 0;
+    const run = async (step) => { calls++; return { ok: true, result: `tick ${step.cmd} ${calls}` }; };
+    const out = await repeatStr({ run }, ['3', 'press', 'c']);
+    expect(calls).toBe(3);
+    expect(out).toMatch(/Repeat 3× press c/);
+    expect(out).toMatch(/\[1\/3\] ok/);
+    expect(out).toMatch(/\[3\/3\] ok/);
+    expect(out).toMatch(/Done: 3 ok, 0 failed/);
+  });
+
+  it('halts on the first error by default (fail-fast)', async () => {
+    let calls = 0;
+    const run = async () => {
+      calls++;
+      if (calls === 2) return { ok: false, error: 'kaboom' };
+      return { ok: true, result: 'ok' };
+    };
+    const out = await repeatStr({ run }, ['5', 'click', '@1']);
+    expect(calls).toBe(2);
+    expect(out).toMatch(/Repeat halted at iteration 2\/5/);
+    expect(out).toMatch(/✗ kaboom/);
+    expect(out).toMatch(/Done: 1 ok, 1 failed/);
+  });
+
+  it('keeps going through errors when --continue is passed', async () => {
+    let calls = 0;
+    const run = async () => {
+      calls++;
+      if (calls % 2 === 0) return { ok: false, error: 'flap' };
+      return { ok: true, result: 'fine' };
+    };
+    const out = await repeatStr({ run }, ['4', '--continue', 'press', 'space']);
+    expect(calls).toBe(4);
+    expect(out).toMatch(/Done: 2 ok, 2 failed/);
+    expect(out).not.toMatch(/halted/);
+  });
+
+  it('forwards command args verbatim each iteration', async () => {
+    const seen = [];
+    const run = async (step) => { seen.push(step); return { ok: true, result: '' }; };
+    await repeatStr({ run }, ['2', 'fill', '@3', 'hello world']);
+    expect(seen).toHaveLength(2);
+    expect(seen[0]).toEqual({ cmd: 'fill', args: ['@3', 'hello world'] });
+    expect(seen[1]).toEqual({ cmd: 'fill', args: ['@3', 'hello world'] });
+  });
+
+  it('dispatches flow as the inner command (multi-step body loop)', async () => {
+    const seen = [];
+    const run = async (step) => { seen.push(step); return { ok: true, result: 'flow ok' }; };
+    const out = await repeatStr({ run }, ['3', 'flow', 'click @1; wait dom stable']);
+    expect(seen).toHaveLength(3);
+    expect(seen[0]).toEqual({ cmd: 'flow', args: ['click @1; wait dom stable'] });
+    expect(out).toMatch(/Repeat 3× flow click @1; wait dom stable/);
+    expect(out).toMatch(/Done: 3 ok, 0 failed/);
+  });
+
+  it('halts a repeat-over-flow loop on the first failed flow turn', async () => {
+    let calls = 0;
+    const run = async () => {
+      calls++;
+      if (calls === 2) return { ok: false, error: 'Flow halted at step 2/3' };
+      return { ok: true, result: 'flow ok' };
+    };
+    const out = await repeatStr({ run }, ['5', 'flow', 'click @attack; wait dom stable']);
+    expect(calls).toBe(2);
+    expect(out).toMatch(/Repeat halted at iteration 2\/5/);
+    expect(out).toMatch(/Done: 1 ok, 1 failed/);
+  });
+});
+
+// =========================================================================
+// eval64 / eval --b64 — base64 transport for CJK / shell-hostile expressions
+// =========================================================================
+
+describe('eval base64 transport', () => {
+  const { evalBase64Decode } = T;
+
+  it('decodes UTF-8 base64 expressions losslessly (CJK round-trip)', () => {
+    const expr = 'document.title === "戰鬥勝利"';
+    const b64 = Buffer.from(expr, 'utf8').toString('base64');
+    expect(evalBase64Decode(b64)).toBe(expr);
+  });
+
+  it('rejects empty input with a clear error', () => {
+    expect(() => evalBase64Decode('')).toThrow(/empty/);
+    expect(() => evalBase64Decode(null)).toThrow(/empty/);
+  });
+
+  it('rejects non-base64 garbage instead of silently running', () => {
+    // base64 alphabet only; invalid chars should fail
+    expect(() => evalBase64Decode('not base64!!')).toThrow(/base64/i);
+  });
+
+  it('rejects payloads whose length is not a multiple of 4', () => {
+    // "YWJj" decodes to "abc" cleanly; truncating one char leaves a 3-char
+    // payload that Node would silently decode to 2 bytes. We must reject it.
+    expect(() => evalBase64Decode('YWJ')).toThrow(/length/i);
+    expect(() => evalBase64Decode('YWJjZA')).toThrow(/length/i);
+  });
+
+  it('rejects = padding that appears anywhere but the tail', () => {
+    // "YQ==" is the canonical encoding of "a"; placing = in the middle is
+    // never legal even if the overall length is a multiple of 4.
+    expect(() => evalBase64Decode('YQ==YQ==')).toThrow(/padding/i);
+    expect(() => evalBase64Decode('AB=CDEFG')).toThrow(/padding/i);
+  });
+
+  it('rejects payloads where Node lenient-decodes but loses bytes (round-trip)', () => {
+    // "ABCDE" is 5 chars (length not %4). After we add the length check this
+    // is caught earlier; but build a length-%4 payload whose final char does
+    // not align to a 6-bit boundary so the round-trip guard fires.
+    // "YWJjZGV=" — last group has 3 base64 chars + 1 pad: legal length, but
+    // the trailing low bits of the third char must be zero. "ZGV=" decodes
+    // to "de" (last char of input must end in == or two trailing zero bits).
+    // Picking a char whose low bits are non-zero ("ZGW=") triggers the
+    // round-trip guard.
+    expect(() => evalBase64Decode('YWJjZGW=')).toThrow(/canonical|truncated|corrupt/i);
+  });
+
+  it('accepts canonical padded base64 without flagging it', () => {
+    // "abc" round-trips cleanly with one = pad; "ab" with two; "abcd" with none.
+    expect(evalBase64Decode('YWJj')).toBe('abc');
+    expect(evalBase64Decode('YWI=')).toBe('ab');
+    expect(evalBase64Decode('YWJjZA==')).toBe('abcd');
+  });
+});
+
+// =========================================================================
+// stale-ref recovery hint — explicit "no remap" wording in messaging
+// =========================================================================
+
+describe('formatUnknownRefError recovery wording', () => {
+  const { formatUnknownRefError } = T;
+
+  it('navigation message names a concrete recovery command', () => {
+    const msg = formatUnknownRefError('@31', { generation: 2, invalidationReason: 'navigation' });
+    expect(msg).toMatch(/perceive/);
+    // No claim of automatic remap — agent must re-perceive itself.
+    expect(msg).toMatch(/stable CSS selector/);
+  });
+
+  it('dom-mutation message tells loop authors to switch to selectors', () => {
+    const msg = formatUnknownRefError('@31', { generation: 5, invalidationReason: 'dom-mutation' });
+    expect(msg).toMatch(/stable CSS selector in batch\/loops|stable CSS selector/);
+  });
+});

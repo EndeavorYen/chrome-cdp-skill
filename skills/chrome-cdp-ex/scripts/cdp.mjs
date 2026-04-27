@@ -363,6 +363,63 @@ async function snapshotStr(cdp, sid, compact = false) {
   return lines.join('\n');
 }
 
+// Decode a base64-encoded eval expression. Used by `eval64` and `eval --b64`
+// so agents can ship CJK / Unicode / shell-hostile expressions without losing
+// bytes to the surrounding shell quoting rules. We validate eagerly because a
+// silently-corrupted expression would still compile and could match the wrong
+// elements — better to surface a base64 error than to evaluate garbage.
+function evalBase64Decode(b64) {
+  if (b64 == null || b64 === '') {
+    throw new Error('eval --b64: empty expression. Pass a base64-encoded JS expression.');
+  }
+  if (typeof b64 !== 'string') {
+    throw new Error('eval --b64: expression must be a base64 string');
+  }
+  const cleaned = b64.replace(/\s+/g, '');
+  // Charset check is intentionally loose on `=` so a misplaced pad falls
+  // through to the dedicated padding check below with a clearer message.
+  if (!/^[A-Za-z0-9+/=]+$/.test(cleaned)) {
+    throw new Error('eval --b64: invalid base64 input (only A-Z, a-z, 0-9, +, /, = are allowed)');
+  }
+  // Standard base64 must be a multiple of 4 chars after padding, and `=`
+  // padding may only appear at the very end. Node's Buffer base64 decoder is
+  // intentionally lenient (it silently drops trailing junk), so without these
+  // checks a corrupted or truncated payload would decode to a partial JS
+  // expression and run as if it were the agent's intent.
+  if (cleaned.length % 4 !== 0) {
+    throw new Error(`eval --b64: invalid base64 length (${cleaned.length} chars; must be a multiple of 4 with = padding)`);
+  }
+  const padIdx = cleaned.indexOf('=');
+  if (padIdx !== -1 && padIdx < cleaned.length - 2) {
+    throw new Error('eval --b64: invalid base64 padding (= may only appear as the last 1-2 chars)');
+  }
+  if (padIdx === cleaned.length - 2 && cleaned[cleaned.length - 1] !== '=') {
+    // e.g. "AB=Y" — first `=` at -2 but final char is not `=`; means body
+    // starts after a single trailing pad, which is also illegal.
+    throw new Error('eval --b64: invalid base64 padding (= may only appear as the last 1-2 chars)');
+  }
+  let decoded;
+  try {
+    decoded = Buffer.from(cleaned, 'base64').toString('utf8');
+  } catch (e) {
+    throw new Error(`eval --b64: cannot decode base64 (${e.message})`);
+  }
+  if (!decoded) {
+    throw new Error('eval --b64: decoded expression is empty');
+  }
+  // Round-trip guard: re-encoding the decoded bytes must reproduce the
+  // canonical input. This catches cases where the lenient Node decoder
+  // accepted bytes it should not have (e.g. a tail char that does not align
+  // to a 6-bit boundary), which would otherwise yield a silently-truncated
+  // expression. We compare to the original `cleaned` form so legitimate
+  // whitespace in the wire format is still tolerated.
+  const reencoded = Buffer.from(decoded, 'utf8').toString('base64');
+  if (reencoded !== cleaned) {
+    throw new Error('eval --b64: input is not canonical base64 (decoder dropped bytes — payload may be truncated or corrupt)');
+  }
+  return decoded;
+}
+
 async function evalStr(cdp, sid, expression, autoWrap = false) {
   // Auto-wrap: if expression contains `await`, wrap in async IIFE
   let expr = expression;
@@ -1530,6 +1587,46 @@ async function getDpr(cdp, sid) {
     if (parsed > 0) return parsed;
   } catch {}
   return 1;
+}
+
+// JS-fallback click: uses HTMLElement.click() / dispatchEvent in the page
+// instead of CDP Input.dispatchMouseEvent. Useful when the page intercepts
+// real-pointer events with overlays, has misaligned hit testing under custom
+// transforms, or when an MUD/game UI binds handlers only to synthetic clicks.
+// This path is intentionally separate from clickStr — agents opt into it via
+// `jsclick` or `click --js` so the default behaviour stays a realistic mouse
+// dispatch.
+async function jsClickStr(cdp, sid, selector, refMap, refState) {
+  if (!selector) throw new Error('CSS selector or @ref required');
+  if (isRef(selector)) {
+    const objectId = await resolveRefNode(cdp, sid, refMap, selector, refState);
+    const res = await cdp.send('Runtime.callFunctionOn', {
+      objectId,
+      functionDeclaration: `function() {
+        this.scrollIntoView({ block: 'center', inline: 'center' });
+        if (typeof this.click === 'function') this.click();
+        else this.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+        return { tag: this.tagName, text: (this.textContent || '').trim().substring(0, 80) };
+      }`,
+      returnByValue: true,
+    }, sid);
+    const r = res.result.value || {};
+    return `JS-clicked <${r.tag || '?'}> "${r.text || ''}" (${selector})`;
+  }
+  const expr = `
+    (function() {
+      const el = document.querySelector(${JSON.stringify(selector)});
+      if (!el) return { ok: false, error: 'Element not found: ' + ${JSON.stringify(selector)} };
+      el.scrollIntoView({ block: 'center', inline: 'center' });
+      if (typeof el.click === 'function') el.click();
+      else el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+      return { ok: true, tag: el.tagName, text: (el.textContent || '').trim().substring(0, 80) };
+    })()
+  `;
+  const result = await evalStr(cdp, sid, expr);
+  const r = JSON.parse(result);
+  if (!r.ok) throw new Error(r.error);
+  return `JS-clicked <${r.tag}> "${r.text}"`;
 }
 
 // Click element by CSS selector or @ref
@@ -2950,6 +3047,76 @@ function formatBatchResults(results, format = 'json') {
   return JSON.stringify(results, null, 2);
 }
 
+// --- Repeat: bounded loop primitive ---
+// `repeat <count> <cmd> [args...]` runs the inner command up to count times.
+// Defaults to fail-fast (halt on first error) so a stale @ref or missing
+// element does not waste 50 round-trips silently. `--continue` (or `-c`) keeps
+// going through errors and reports the tally at the end. The cap is
+// intentionally low — repeat is for "press c 5 times to advance through MUD
+// dialogue", not for unbounded loops; agents that need more should drive their
+// own loop with state checks between iterations.
+const REPEAT_CAP = 50;
+// `flow` is intentionally allowed: `repeat N flow "step1; step2; ..."` is the
+// documented pattern for bounded multi-step loops (combat turns, multi-phase
+// dialogues). Nesting is a single level — the inner flow runs through the
+// same daemon dispatcher and cannot recurse back into repeat. `batch` stays
+// blocked because its parallel/JSON modes are awkward to compose linearly,
+// and `repeat`/`stop` are blocked to avoid recursion and IPC corruption.
+const REPEAT_BLOCKED = new Set(['repeat', 'batch', 'stop']);
+
+function parseRepeatArgs(args) {
+  if (!Array.isArray(args) || args.length < 1) {
+    throw new Error('repeat requires <count> <cmd> [args...]');
+  }
+  const opts = { count: 0, cmd: null, args: [], continueOnError: false };
+  const positional = [];
+  for (const a of args) {
+    if (a === '--continue' || a === '-c') opts.continueOnError = true;
+    else positional.push(a);
+  }
+  if (positional.length < 1) throw new Error('repeat requires <count> <cmd> [args...]');
+  const count = parseInt(positional[0], 10);
+  if (!Number.isFinite(count) || count < 1 || String(count) !== String(positional[0]).trim()) {
+    throw new Error(`repeat: count must be a positive integer, got "${positional[0]}"`);
+  }
+  if (count > REPEAT_CAP) {
+    throw new Error(`repeat: count ${count} exceeds cap ${REPEAT_CAP}. Run multiple repeats or drive your own loop with state checks.`);
+  }
+  opts.count = count;
+  if (positional.length < 2) throw new Error('repeat: command name required after count');
+  opts.cmd = positional[1];
+  opts.args = positional.slice(2);
+  if (REPEAT_BLOCKED.has(opts.cmd)) {
+    throw new Error(`repeat: cannot wrap "${opts.cmd}" (would recurse or break IPC). Use a single-shot command (click, press, fill, ...).`);
+  }
+  return opts;
+}
+
+async function repeatStr({ run }, args) {
+  const opts = parseRepeatArgs(args);
+  const head = `Repeat ${opts.count}× ${opts.cmd}${opts.args.length ? ' ' + opts.args.join(' ') : ''}${opts.continueOnError ? ' (--continue)' : ''}`;
+  const lines = [head];
+  let okCount = 0, failCount = 0;
+  for (let i = 1; i <= opts.count; i++) {
+    const r = await run({ cmd: opts.cmd, args: opts.args.slice() });
+    if (r && r.ok) {
+      okCount++;
+      const body = (r.result || '').toString().split('\n')[0].slice(0, 200);
+      lines.push(body ? `[${i}/${opts.count}] ok: ${body}` : `[${i}/${opts.count}] ok`);
+    } else {
+      failCount++;
+      const errText = (r && r.error) || 'unknown error';
+      lines.push(`[${i}/${opts.count}] ✗ ${errText}`);
+      if (!opts.continueOnError) {
+        lines.push(`Repeat halted at iteration ${i}/${opts.count} (use --continue to keep going).`);
+        break;
+      }
+    }
+  }
+  lines.push(`Done: ${okCount} ok, ${failCount} failed`);
+  return lines.join('\n');
+}
+
 // --- Flow: sequential step runner ---
 function parseFlowSteps(input) {
   if (typeof input !== 'string' || !input.trim()) return [];
@@ -3506,9 +3673,9 @@ async function runDaemon(targetId) {
 
   // Action feedback: wait for DOM to settle, then return perceive diff
   const OBSERVE_KEYS = new Set(['enter', 'escape', 'tab']);
-  const BATCH_BLOCKED = new Set(['batch', 'stop']);
+  const BATCH_BLOCKED = new Set(['batch', 'stop', 'repeat', 'flow']);
   // Commands that mutate shared state (refMap, lastPerceiveStore) — unsafe for parallel execution
-  const BATCH_NO_PARALLEL = new Set(['click', 'clickxy', 'select', 'press', 'scroll', 'nav', 'navigate', 'viewport', 'perceive', 'snap', 'snapshot', 'dismiss-modal', 'dismissmodal']);
+  const BATCH_NO_PARALLEL = new Set(['click', 'clickxy', 'jsclick', 'select', 'press', 'scroll', 'nav', 'navigate', 'viewport', 'perceive', 'snap', 'snapshot', 'dismiss-modal', 'dismissmodal']);
   async function actionFeedback(actionResult) {
     await waitForSettle(cdp, sessionId);
     const diff = await perceiveStr(cdp, sessionId, consoleBuf, exceptionBuf, refMap, lastPerceiveStore, { diff: true }, refState);
@@ -3532,7 +3699,23 @@ async function runDaemon(targetId) {
           break;
         }
         case 'snap': case 'snapshot': result = await snapshotStr(cdp, sessionId, args[0] !== '--full'); break;
-        case 'eval': result = await evalStr(cdp, sessionId, args[0], true); break;
+        case 'eval': {
+          // `eval --b64 <base64>` decodes a CJK / shell-hostile expression
+          // before running it; otherwise args[0] is treated as the literal
+          // expression as before.
+          if (args[0] === '--b64' || args[0] === '-b') {
+            const decoded = evalBase64Decode(args[1]);
+            result = await evalStr(cdp, sessionId, decoded, true);
+          } else {
+            result = await evalStr(cdp, sessionId, args[0], true);
+          }
+          break;
+        }
+        case 'eval64': {
+          const decoded = evalBase64Decode(args[0]);
+          result = await evalStr(cdp, sessionId, decoded, true);
+          break;
+        }
         case 'shot': case 'screenshot': {
           if (args[0] === '--annotate' || args[0] === '-a') {
             result = await annotshotStr(cdp, sessionId, targetId, refMap);
@@ -3559,7 +3742,19 @@ async function runDaemon(targetId) {
           break;
         }
         case 'elshot': result = await elshotStr(cdp, sessionId, args[0], targetId, refMap, refState); break;
-        case 'click': result = await actionFeedback(await clickStr(cdp, sessionId, args[0], refMap, refState)); break;
+        case 'click': {
+          // `click --js <selector|@ref>` switches to the JS-fallback path that
+          // calls HTMLElement.click() instead of dispatching CDP mouse events.
+          // Useful when overlays or weird hit testing block the realistic
+          // mouse path; opt-in only so default behaviour is unchanged.
+          if (args[0] === '--js' || args[0] === '-j') {
+            result = await actionFeedback(await jsClickStr(cdp, sessionId, args[1], refMap, refState));
+          } else {
+            result = await actionFeedback(await clickStr(cdp, sessionId, args[0], refMap, refState));
+          }
+          break;
+        }
+        case 'jsclick': result = await actionFeedback(await jsClickStr(cdp, sessionId, args[0], refMap, refState)); break;
         case 'clickxy': result = await actionFeedback(await clickXyStr(cdp, sessionId, args[0], args[1])); break;
         case 'type': result = await typeStr(cdp, sessionId, args[0]); break;
         case 'press': {
@@ -3646,6 +3841,12 @@ async function runDaemon(targetId) {
             run: (step) => handleCommand({ cmd: step.cmd, args: step.args || [] }),
             settle: (what) => settleFlow(cdp, sessionId, what, pendingReqs),
           }, input);
+          break;
+        }
+        case 'repeat': {
+          result = await repeatStr({
+            run: (step) => handleCommand({ cmd: step.cmd, args: step.args || [] }),
+          }, args);
           break;
         }
         case 'stop': return { ok: true, result: '', stopAfter: true };
@@ -3829,6 +4030,9 @@ Usage: cdp <command> [args]
                                     -C / --cursor-interactive: include non-ARIA clickable elements (@c refs)
   snap  <target> [--full]           Accessibility tree snapshot (compact by default, --full for complete)
   eval  <target> <expr>             Evaluate JS expression
+                                    --b64 / -b <base64>: decode UTF-8 base64 first
+                                    (safe transport for CJK / shell-hostile expressions)
+  eval64 <target> <base64>          Shorthand for eval --b64; preserves multibyte characters
   elshot <target> <sel|@ref>        Element screenshot: captures element by CSS selector or @ref
   shot  <target> [file|--annotate]  Viewport screenshot; --annotate (-a) overlays @ref labels
   html  <target> [selector]         Get HTML (full page or CSS selector)
@@ -3838,6 +4042,9 @@ Usage: cdp <command> [args]
   summary <target>                  Token-efficient page overview (interactive elements, scroll, console health)
   net   <target>                    Network performance entries
   click   <target> <sel|@ref>       Click element by CSS selector or @ref
+                                    --js / -j: use HTMLElement.click() (JS fallback)
+  jsclick <target> <sel|@ref>       JS-only click: el.click() instead of CDP mouse events
+                                    Use when overlays or hit-testing block the realistic mouse path.
   clickxy <target> <x> <y>          Click at CSS pixel coordinates (see coordinate note below)
   type    <target> <text>           Type text at current focus via Input.insertText
                                     Works in cross-origin iframes unlike eval-based approaches
@@ -3890,6 +4097,15 @@ Usage: cdp <command> [args]
                                     "wait dom stable" / "wait network idle" — uses settle helper.
                                     Halts on the first failing step. Output is readable, not JSON.
                                     Example: flow A7BA "click @1; wait dom stable; summary; console --errors"
+  repeat <target> <N> <cmd> [args]  Run a command up to N times (cap 50). Fail-fast by default.
+                                    --continue / -c: keep going through errors and report tally.
+                                    Cannot wrap repeat/batch/stop (recursion / IPC corruption).
+                                    Can wrap flow for multi-step turn loops, e.g.
+                                    repeat A7BA 3 flow "click @1; wait dom stable; text .log"
+                                    Useful for advancing MUD dialogue ("repeat 5 press space"),
+                                    retry-style probes, or short keypress sequences. Re-perceive
+                                    between iterations if the DOM changes — refs are not auto-remapped.
+                                    Example: repeat A7BA 5 press c
   doctor / ready                    One-call diagnostics: Node version, skill install path,
                                     daemon socket state, CDP_PORT/DevToolsActivePort reachability.
                                     No target required. Exits 1 if any check FAILs.
@@ -3935,19 +4151,19 @@ DAEMON IPC (for advanced use / scripting)
     Request:  {"id":<number>, "cmd":"<command>", "args":["arg1","arg2",...]}
     Response: {"id":<number>, "ok":true,  "result":"<string>"}
            or {"id":<number>, "ok":false, "error":"<message>"}
-  Commands mirror the CLI: perceive, status, summary, console, snap, eval, shot, elshot,
-  fullshot, scanshot, html, nav, net, click, clickxy, hover, type, press, scroll, fill,
-  select, waitfor, loadall, styles, cookies, cookieset, cookiedel, dialog, viewport,
-  upload, text, table, back, forward, reload, closetab, netlog, inject, cascade,
-  record, evalraw, batch, flow, stop.
+  Commands mirror the CLI: perceive, status, summary, console, snap, eval, eval64, shot,
+  elshot, fullshot, scanshot, html, nav, net, click, jsclick, clickxy, hover, type, press,
+  scroll, fill, select, waitfor, loadall, styles, cookies, cookieset, cookiedel, dialog,
+  viewport, upload, text, table, back, forward, reload, closetab, netlog, inject, cascade,
+  record, evalraw, batch, flow, repeat, stop.
   The socket disappears after 20 min of inactivity or when the tab closes.
 `;
 
 const NEEDS_TARGET = new Set([
-  'snap','snapshot','eval','shot','screenshot','html','nav','navigate',
-  'net','network','click','clickxy','type','press','scroll','hover','waitfor','loadall','fill','select','fullshot','scanshot','styles','cookies','cookieset','cookiedel','evalraw','status','console','summary','perceive','elshot','batch','dialog','viewport','upload',
+  'snap','snapshot','eval','eval64','shot','screenshot','html','nav','navigate',
+  'net','network','click','clickxy','jsclick','type','press','scroll','hover','waitfor','loadall','fill','select','fullshot','scanshot','styles','cookies','cookieset','cookiedel','evalraw','status','console','summary','perceive','elshot','batch','dialog','viewport','upload',
   'text','table','back','forward','reload','closetab','netlog',
-  'inject','cascade','record','flow',
+  'inject','cascade','record','flow','repeat',
   'dismiss-modal','dismissmodal',
 ]);
 
@@ -4097,9 +4313,22 @@ async function main() {
   const cmdArgs = args.slice(1);
 
   if (cmd === 'eval') {
-    const expr = cmdArgs.join(' ');
-    if (!expr) { console.error('Error: expression required'); process.exit(1); }
-    cmdArgs[0] = expr;
+    if (cmdArgs[0] === '--b64' || cmdArgs[0] === '-b') {
+      // eval --b64 <base64>: pass the flag and the (possibly chunked) base64
+      // payload through to the daemon untouched. Shells split a long base64
+      // blob across argv slots; rejoin without spaces.
+      const b64 = cmdArgs.slice(1).join('').trim();
+      if (!b64) { console.error('Error: base64 expression required'); process.exit(1); }
+      cmdArgs.splice(0, cmdArgs.length, '--b64', b64);
+    } else {
+      const expr = cmdArgs.join(' ');
+      if (!expr) { console.error('Error: expression required'); process.exit(1); }
+      cmdArgs[0] = expr;
+    }
+  } else if (cmd === 'eval64') {
+    const b64 = cmdArgs.join('').trim();
+    if (!b64) { console.error('Error: base64 expression required'); process.exit(1); }
+    cmdArgs.splice(0, cmdArgs.length, b64);
   } else if (cmd === 'elshot') {
     if (!cmdArgs[0]) { console.error('Error: CSS selector required'); process.exit(1); }
   } else if (cmd === 'type') {
@@ -4161,7 +4390,8 @@ export const __test__ = process.env.NODE_ENV === 'test' ? {
   parsePerceiveArgs, buildPerceiveTree, perceivePageScript,
   // Command implementations
   formatPageList, dialogStr, netlogStr, injectStr, cascadeStr, recordStr, parseRecordArgs,
-  evalStr, navStr, clickStr, fillStr, waitForStr, snapshotStr,
+  evalStr, evalBase64Decode, navStr, clickStr, jsClickStr, fillStr, waitForStr, snapshotStr,
+  parseRepeatArgs, repeatStr,
   // 3y-mud feedback additions
   KEY_MAP, PUNCT_KEY_MAP, SHIFTED_PUNCT_KEY_MAP, keyForPress, pressStr,
   formatUnknownRefError, resolveRefNode, formatRefRect,

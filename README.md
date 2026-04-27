@@ -1,6 +1,6 @@
 # chrome-cdp-ex
 
-[![47 Commands](https://img.shields.io/badge/commands-47-orange)](skills/chrome-cdp-ex/scripts/cdp.mjs)
+[![50 Commands](https://img.shields.io/badge/commands-50-orange)](skills/chrome-cdp-ex/scripts/cdp.mjs)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0-blue)](skills/chrome-cdp-ex/scripts/cdp.mjs)
 [![Node 22+](https://img.shields.io/badge/node-22%2B-brightgreen)](https://nodejs.org)
 [![MIT License](https://img.shields.io/badge/license-MIT-gray)](LICENSE)
@@ -22,7 +22,7 @@
 - [The Redesign Experiment](#the-redesign-experiment)
 - [Quick Start](#quick-start)
 - [How It Works](#how-it-works)
-- [Commands (47 total)](#commands-47-total)
+- [Commands (50 total)](#commands-50-total)
 - [WSL2 -> Windows Browser Control](#wsl2---windows-browser-control)
 - [Credits](#credits)
 - [License](#license)
@@ -54,7 +54,7 @@ The agent using `perceive` (layout + colors + spacing + coordinates) produced th
 | **Electron app support** | **Yes** - `CDP_PORT=9222` | No | No |
 | **WSL2 -> Windows** | **Yes** - built-in | No | No |
 | **Dependencies** | **0** | Playwright + Chromium binary | Varies |
-| **Commands** | **47** | N/A (programmatic API) | ~14 |
+| **Commands** | **50** | N/A (programmatic API) | ~14 |
 
 ## One command, complete page understanding
 
@@ -188,7 +188,7 @@ Output:
 1ED3DBAA  My App                                                  http://localhost:5173/#/menu
 ```
 
-All 47 commands work: `perceive`, `click`, `fill`, `cascade`, `record`, `inject`, `flow`, `doctor`, and more.
+All 50 commands work: `perceive`, `click`, `fill`, `cascade`, `record`, `inject`, `flow`, `repeat`, `doctor`, and more.
 
 </details>
 
@@ -231,9 +231,65 @@ Each tab gets its own daemon process that keeps the CDP session open.
 Chrome's "Allow debugging" dialog appears **once per tab**, not once per command.
 Daemons auto-exit after 20 minutes of inactivity and passively collect console/exception/navigation events into ring buffers.
 
-## Commands (47 total)
+## Commands (50 total)
 
 Tip: start with `perceive`, then use `click`/`fill`/`select`; use `status` or `console` when you need debugging context.
+
+### MUD / game / long-session recipes
+
+`chrome-cdp-ex` was hardened against real long-session play feedback (15–20 minute MUD playtests, combat logs, modals that share keys with global hotkeys). Patterns the tool now supports first-class:
+
+```bash
+# Advance through dialogue / cutscenes safely (fail-fast on first error):
+cdp repeat <t> 5 press space
+
+# Fire a hotkey N times, keep going past transient misses:
+cdp repeat <t> 8 --continue press c
+
+# Pass CJK / shell-hostile expressions without quoting headaches:
+B64=$(printf '%s' 'document.title.includes("戰鬥勝利")' | base64)
+cdp eval64 <t> "$B64"
+cdp eval   <t> --b64 "$B64"
+
+# Click via HTMLElement.click() when an overlay blocks the realistic mouse path
+# (common for modals that paint over their own buttons):
+cdp jsclick <t> @17
+cdp click   <t> --js "button[data-action='confirm']"
+
+# Wait for a combat log line, then snapshot the result:
+cdp waitfor <t> --any-of "戰鬥勝利|戰敗|逃跑成功" 60000 --scope ".combat-log"
+cdp waitfor <t> --selector-stable ".combat-log" 3000 60000
+cdp text    <t> ".combat-log"
+
+# Capture cause-and-effect of a single action (DOM + network + console):
+cdp record <t> --action click @5 --until "dom stable"
+
+# Dismiss MOTD / modal without firing the underlying game's hotkey:
+cdp dismiss-modal <t>     # close button → Escape fallback (NEVER Space)
+```
+
+**Sequence capture pattern** — fold these into a single readable transcript with `flow`:
+
+```bash
+cdp flow <t> "perceive -i; click @5; wait dom stable; perceive --diff; text .combat-log"
+```
+
+For a multi-turn loop where you want fail-fast safety per turn, layer `repeat` over `flow` — the inner `flow` body becomes one "turn", and `repeat` halts on the first turn that fails:
+
+```bash
+# 3 combat turns; each turn clicks attack, waits for the DOM to settle, then
+# checks the log. Quoting matters: the whole flow body is a single arg.
+cdp repeat <t> 3 flow "click button[data-act='attack']; wait dom stable; text .combat-log"
+
+# Single-command body is fine too — fail-fast on first stale @ref:
+cdp repeat <t> 3 click @attackBtn
+# When the DOM rewrites @5 between turns, switch to a stable selector instead:
+cdp repeat <t> 3 click "button[data-act='attack']"
+```
+
+`repeat` allows wrapping `flow` (one-level nesting) but still refuses to wrap `repeat`, `batch`, or `stop` — those would either recurse or corrupt the daemon IPC stream.
+
+**Stale `@ref` reminder** — refs are short-lived handles assigned by `perceive`. They do **not** auto-remap after navigation, Vite HMR, or large DOM mutations. The error you'll see is now classified (e.g. `Unknown ref: @31. Refs were cleared because the page navigated/reloaded …`). Honour it: re-run `perceive`, or — for any loop longer than 1–2 immediate actions — use a stable CSS selector. `repeat` does not retry around stale refs because remapping a ref to "the new equivalent" cannot be done correctly without agent context.
 
 <details>
 <summary><strong>Discovery & Lifecycle</strong></summary>
@@ -318,6 +374,8 @@ cookiedel <target> <name>           # delete a cookie by name
 
 ```bash
 click   <target> <sel|@ref>         # click element (CDP mouse events, not el.click())
+click   <target> --js <sel|@ref>    # JS-fallback: HTMLElement.click() — bypasses overlays/hit-testing
+jsclick <target> <sel|@ref>         # alias for click --js
 clickxy <target> <x> <y>            # click at CSS pixel coordinates
 type    <target> <text>             # type at focused element (cross-origin safe)
 press   <target> <key>              # press key (Enter, Tab, Escape, Backspace, Space, Arrow*,
@@ -388,6 +446,14 @@ batch   <target> <cmds> [flags]     # execute multiple commands in one call (def
 flow    <target> "<steps>"          # sequential pipeline; semicolon-separated steps; halts on first error
                                     # e.g. flow <t> "click @1; wait dom stable; summary; console --errors"
                                     # wait aliases: "wait dom stable", "wait network idle"
+repeat  <target> <N> <cmd> [args]   # run a single command up to N times (cap 50). Fail-fast by default.
+                                    # --continue / -c  keep going through errors and report tally
+                                    # e.g. `repeat <t> 5 press space` to advance MUD dialogue
+                                    # NOTE: refs are NOT auto-remapped between iterations — use stable
+                                    # selectors if the DOM mutates during the loop.
+eval    <target> <expr>             # evaluate JS in page context
+eval    <target> --b64 <base64>     # decode UTF-8 base64 first (CJK / shell-hostile transport)
+eval64  <target> <base64>           # alias for `eval --b64`
 evalraw <target> <method> [json]    # raw CDP command passthrough
                                     # e.g. evalraw <t> "DOM.getDocument" '{}'
 ```

@@ -273,9 +273,17 @@ scripts/cdp.mjs fullshot <target> [file]  # single full-page image (may be tiny 
 
 ```bash
 scripts/cdp.mjs eval <target> <expr>
+scripts/cdp.mjs eval <target> --b64 <base64>   # decode UTF-8 base64 first
+scripts/cdp.mjs eval64 <target> <base64>       # alias for `eval --b64`
 ```
 
 > **Watch out:** avoid index-based selection (`querySelectorAll(...)[i]`) across multiple `eval` calls when the DOM can change between them (e.g. after clicking Ignore, card indices shift). Collect all data in one `eval` or use stable selectors.
+
+> **CJK / shell-hostile expressions:** quote-mangling across bash / zsh / PowerShell makes naive
+> `eval` calls with Chinese / Japanese / Korean text or embedded quotes unreliable. Encode the
+> expression in base64 (`printf '%s' 'expr' | base64`) and pass it through `eval64` or
+> `eval --b64`. The decoder validates the payload, so corrupt input fails loudly instead of
+> silently evaluating a fragment.
 
 ### Page status & console
 
@@ -766,7 +774,18 @@ Refs are short-lived handles assigned by `perceive`. They become invalid when:
 - a large DOM rewrite replaces the labelled element,
 - the daemon restarts (idle timeout, crash, or fresh `_daemon` spawn).
 
-The error you'll see is now classified, e.g. `Unknown ref: @31. Refs were cleared because the page navigated/reloaded after the last perceive (e.g. Vite HMR or in-app routing). Run "perceive" to refresh refs, or use a stable CSS selector for long loops.` Honour the suggestion — for any loop longer than 1–2 immediate actions, prefer a stable CSS selector like `input[placeholder*="look"]` over `@31`.
+**No automatic remap.** When a ref goes stale, the tool reports the error and
+clears the entry — it does **not** try to guess "the new equivalent" element,
+because that decision needs page semantics the daemon does not have. The agent
+must re-perceive (or pivot to a stable selector) and pick the next handle.
+
+The error you'll see is classified by cause:
+
+- `No refs have been assigned in this daemon yet.` — daemon-start; just run `perceive`.
+- `Refs were cleared because the page navigated/reloaded after the last perceive (e.g. Vite HMR or in-app routing). Run "perceive" to refresh refs, or use a stable CSS selector for long loops.` — top-level navigation invalidation.
+- `Refs were invalidated by DOM changes after the last perceive. Run "perceive" again, or use a stable CSS selector in batch/loops.` — backend node could not be re-resolved (large rewrite).
+
+Honour the wording — for any loop longer than 1–2 immediate actions, prefer a stable CSS selector like `input[placeholder*="look"]` over `@31`. `repeat`/`batch`/`flow` deliberately do not retry around stale refs for the same reason. `repeat` may wrap `flow` for multi-step turns, but it still cannot wrap `repeat`, `batch`, or `stop`.
 
 ### Wait primitives for combat / chat / animations
 
@@ -780,6 +799,84 @@ cdp waitfor <t> --selector-stable ".combat-log" 3000 60000
 # 3) Capture cause-and-effect timeline around an action:
 cdp record <t> --action click @5 --until "dom stable"
 ```
+
+### Bounded loops — `repeat`
+
+```bash
+cdp repeat <t> 5 press space          # advance 5 dialogue beats; halt on first failure
+cdp repeat <t> 8 --continue press c   # fire shortcut 8 times, ignore transient misses
+cdp repeat <t> 3 click @attackBtn     # 3 combat turns; fail-fast preserves diagnosability
+
+# Multi-step body — wrap a flow as the inner command (one-level nesting OK):
+cdp repeat <t> 3 flow "click button[data-act='attack']; wait dom stable; text .combat-log"
+```
+
+`repeat` caps `<count>` at 50 and refuses to wrap `repeat`/`batch`/`stop` so an
+agent loop cannot recurse or corrupt the daemon IPC stream. `flow` *is* allowed
+as the inner command, so a single "turn" can be `click → wait → check log` and
+the outer `repeat` halts on the first turn that fails. Default behaviour is
+fail-fast — the first failing iteration halts the loop and prints which
+iteration tripped, so you can re-perceive and adjust before the next attempt.
+Use `--continue` only when later iterations are independent of the failing one
+(e.g. retrying through transient input misses on a hot keyboard handler).
+
+**Refs and `repeat`**: refs are not auto-remapped between iterations. If iteration
+1 mutates the DOM enough to invalidate `@5`, iteration 2 will fail with a
+classified `Unknown ref` error. Switch to a stable selector
+(`button[data-act='attack']`) for any loop that survives DOM rewrites.
+
+### JS-fallback click — `jsclick` / `click --js`
+
+```bash
+cdp jsclick <t> @17                                       # @ref form
+cdp click   <t> --js "button[data-action='confirm']"     # CSS form
+```
+
+Use this when the realistic mouse path (CDP `Input.dispatchMouseEvent`) is blocked:
+- Transparent overlay covers the button but does not consume `el.click()`.
+- Page applies a CSS transform/scale that breaks viewport-to-content hit testing.
+- A Vue/React component listens only for synthetic clicks bubbled through its root.
+
+`jsclick` calls `HTMLElement.click()` (falling back to `dispatchEvent(new MouseEvent('click'))`).
+The default `click` is still preferred — it produces realistic event sequences
+that pass through `:active`/`:hover`/focus rings — but `jsclick` is the right
+escape hatch when you can prove the mouse path is the blocker.
+
+### Safe transport for CJK / shell-hostile JS — `eval64` / `eval --b64`
+
+```bash
+B64=$(printf '%s' 'document.title.includes("戰鬥勝利")' | base64)
+cdp eval64 <t> "$B64"
+cdp eval   <t> --b64 "$B64"
+```
+
+Shell quoting mangles Unicode bytes inconsistently across `bash`, `zsh`, and PowerShell.
+Encoding the expression as base64 sidesteps the entire quoting layer and produces a
+lossless round-trip for CJK/RTL/control-character expressions. The decoder
+validates the input — non-base64 garbage raises a clear error rather than
+silently evaluating part of the payload.
+
+### Game / MUD sequence capture — putting it all together
+
+```bash
+# 1. Discover the page once
+cdp perceive <t> -C -d 8 -x "nav, aside"
+
+# 2. Capture the cause-and-effect of a single combat action
+cdp record <t> --action click @5 --until "dom stable"
+
+# 3. Wait for the human-language outcome line
+cdp waitfor <t> --any-of "戰鬥勝利|戰敗|逃跑成功" 60000 --scope ".combat-log"
+
+# 4. Pull the post-action log content (use a stable selector, not @ref)
+cdp text <t> ".combat-log"
+
+# 5. For multi-turn drills where each turn is independent:
+cdp repeat <t> 3 click "button[data-act='attack']"
+```
+
+This sequence consistently captures: structure → action → settle → outcome →
+extracted text, in five short calls without any `sleep`-based polling.
 
 ### Modal dismissal that does NOT fire underlying shortcuts
 
