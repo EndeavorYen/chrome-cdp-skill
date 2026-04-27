@@ -41,11 +41,12 @@ New commands must be registered in **5 places**:
 ## Testing
 
 ```bash
-npx vitest run          # unit tests
-npx vitest run --watch  # watch mode during development
+npm test              # unit tests
+npm run lint          # ESLint (warnings allowed, errors fail)
+npm run smoke:live    # optional real-browser smoke; skips if no supported browser is installed
 ```
 
-Manual testing with a real Chrome instance is essential — many CDP behaviors can't be unit tested.
+Manual testing with a real Chrome/Edge instance is essential — many CDP behaviors can't be unit tested. The live smoke starts an isolated debug profile against `scripts/smoke-page.html`, exercises long-session workflows (`dismiss-modal`, `press c`, `text --auto`, semantic `waitfor`, `shot --quiet`), and cleans up its temporary profile.
 
 ## License
 

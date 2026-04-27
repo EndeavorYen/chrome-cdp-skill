@@ -9,7 +9,7 @@
 
 import { readFileSync, writeFileSync, unlinkSync, existsSync, readdirSync, mkdirSync, lstatSync } from 'fs';
 import { homedir } from 'os';
-import { resolve } from 'path';
+import { resolve, delimiter } from 'path';
 import { spawn } from 'child_process';
 import net from 'net';
 
@@ -264,7 +264,12 @@ class CDP {
 
 async function getPages(cdp) {
   const { targetInfos } = await cdp.send('Target.getTargets');
-  return targetInfos.filter(t => t.type === 'page' && !t.url.startsWith('chrome://') && !t.url.startsWith('edge://'));
+  // Keep regular page targets, including about:blank so agents always have a
+  // usable handle. Skip chrome://, edge://, and devtools:// internal pages.
+  return targetInfos.filter(t => t.type === 'page'
+    && !t.url.startsWith('chrome://')
+    && !t.url.startsWith('edge://')
+    && !t.url.startsWith('devtools://'));
 }
 
 function formatPageList(pages, browserInfo = null) {
@@ -277,8 +282,10 @@ function formatPageList(pages, browserInfo = null) {
   const prefixLen = getDisplayPrefixLength(pages.map(p => p.targetId));
   lines.push(...pages.map(p => {
     const id = p.targetId.slice(0, prefixLen).padEnd(prefixLen);
-    const title = p.title.substring(0, 54).padEnd(54);
-    return `${id}  ${title}  ${p.url}`;
+    const isBlank = !p.url || p.url === 'about:blank';
+    const rawTitle = isBlank ? '(blank tab)' : (p.title || '');
+    const title = rawTitle.substring(0, 54).padEnd(54);
+    return `${id}  ${title}  ${p.url || ''}`;
   }));
   return lines.join('\n');
 }
@@ -441,20 +448,52 @@ async function captureScreenshot(cdp, sid, params = { format: 'png' }) {
   }
 }
 
-async function shotStr(cdp, sid, filePath, targetId) {
+// Parse `shot` arguments. Returns { filePath, quiet, verbose }.
+// Recognised flags: --quiet (only the saved path), --verbose (full DPR guidance).
+// Default (no flags): saved path on the first line, then a brief DPR note —
+// scripts that read `head -1` get a clean path without prelude noise.
+function parseShotArgs(args) {
+  const opts = { filePath: null, quiet: false, verbose: false };
+  const tokens = (args || []).filter(a => a !== undefined && a !== null);
+  for (const t of tokens) {
+    if (t === '--quiet' || t === '-q') opts.quiet = true;
+    else if (t === '--verbose' || t === '-v') opts.verbose = true;
+    else if (typeof t === 'string' && !t.startsWith('--')) opts.filePath = t;
+  }
+  return opts;
+}
+
+async function shotStr(cdp, sid, filePathOrOpts, targetId, maybeOpts) {
+  let filePath = null;
+  let opts = { quiet: false, verbose: false };
+  if (filePathOrOpts && typeof filePathOrOpts === 'object' && !Array.isArray(filePathOrOpts)) {
+    filePath = filePathOrOpts.filePath || null;
+    opts = { quiet: !!filePathOrOpts.quiet, verbose: !!filePathOrOpts.verbose };
+  } else {
+    filePath = filePathOrOpts || null;
+    if (maybeOpts && typeof maybeOpts === 'object') {
+      opts = { quiet: !!maybeOpts.quiet, verbose: !!maybeOpts.verbose };
+    }
+  }
   const dpr = await getDpr(cdp, sid);
   const { data, fallback } = await captureScreenshot(cdp, sid, { format: 'png' });
   const out = filePath || resolve(RUNTIME_DIR, `screenshot-${(targetId || 'unknown').slice(0, 8)}.png`);
   writeFileSync(out, Buffer.from(data, 'base64'));
 
+  // Default output: saved path FIRST so scripts grabbing `head -1` get a clean
+  // path. Verbose adds full coordinate-mapping tutorial. Quiet hides hints.
   const lines = [out];
   if (fallback) lines.push(`(screenshot fallback — Page.captureScreenshot timed out)`);
-  lines.push(`Screenshot saved. Device pixel ratio (DPR): ${dpr}`);
-  lines.push(`Coordinate mapping:`);
-  lines.push(`  Screenshot pixels → CSS pixels (for CDP Input events): divide by ${dpr}`);
-  lines.push(`  e.g. screenshot point (${Math.round(100 * dpr)}, ${Math.round(200 * dpr)}) → CSS (100, 200) → use clickxy <target> 100 200`);
-  if (dpr !== 1) {
-    lines.push(`  On this ${dpr}x display: CSS px = screenshot px / ${dpr} ≈ screenshot px × ${Math.round(100/dpr)/100}`);
+  if (opts.quiet) return lines.join('\n');
+  // Default: short DPR hint after the path. (`shot ... --verbose` for the long form.)
+  lines.push(`Screenshot saved. DPR=${dpr}${dpr !== 1 ? ` (CSS px = image px / ${dpr})` : ''}`);
+  if (opts.verbose) {
+    lines.push(`Coordinate mapping:`);
+    lines.push(`  Screenshot pixels → CSS pixels (for CDP Input events): divide by ${dpr}`);
+    lines.push(`  e.g. screenshot point (${Math.round(100 * dpr)}, ${Math.round(200 * dpr)}) → CSS (100, 200) → use clickxy <target> 100 200`);
+    if (dpr !== 1) {
+      lines.push(`  On this ${dpr}x display: CSS px = screenshot px / ${dpr} ≈ screenshot px × ${Math.round(100/dpr)/100}`);
+    }
   }
   return lines.join('\n');
 }
@@ -677,18 +716,46 @@ const INTERACTIVE_ROLES = new Set([
   'menuitemcheckbox', 'menuitemradio', 'option', 'treeitem',
 ]);
 
-async function resolveRefNode(cdp, sid, refMap, ref) {
-  const num = parseInt(ref.slice(1));
-  if (isNaN(num) || !refMap.has(num)) {
-    throw new Error(`Unknown ref: ${ref}. Run "perceive" first to assign refs.`);
+// Format a stale/unknown @ref error explaining the most likely root cause.
+// `state` holds {generation, invalidationReason, lastPerceiveAt} from the daemon.
+function formatUnknownRefError(ref, state = {}) {
+  const reason = state.invalidationReason || (state.generation ? null : 'daemon-start');
+  if (reason === 'navigation') {
+    return `Unknown ref: ${ref}. Refs were cleared because the page navigated/reloaded after the last perceive (e.g. Vite HMR or in-app routing). Run "perceive" to refresh refs, or use a stable CSS selector for long loops.`;
   }
-  const backendNodeId = refMap.get(num);
-  const { object } = await cdp.send('DOM.resolveNode', { backendNodeId }, sid);
-  return object.objectId;
+  if (reason === 'dom-mutation') {
+    return `Unknown ref: ${ref}. Refs were invalidated by DOM changes after the last perceive. Run "perceive" again, or use a stable CSS selector in batch/loops.`;
+  }
+  if (reason === 'daemon-start' || (!state.generation)) {
+    return `Unknown ref: ${ref}. No refs have been assigned in this daemon yet. Run "perceive" first, or use a CSS selector.`;
+  }
+  return `Unknown ref: ${ref}. Run "perceive" to refresh refs, or use a stable CSS selector for long loops.`;
 }
 
-async function resolveRef(cdp, sid, refMap, ref) {
-  const objectId = await resolveRefNode(cdp, sid, refMap, ref);
+async function resolveRefNode(cdp, sid, refMap, ref, refState) {
+  const num = parseInt(ref.slice(1));
+  if (isNaN(num) || !refMap.has(num)) {
+    throw new Error(formatUnknownRefError(ref, refState || {}));
+  }
+  const backendNodeId = refMap.get(num);
+  try {
+    const { object } = await cdp.send('DOM.resolveNode', { backendNodeId }, sid);
+    return object.objectId;
+  } catch (e) {
+    // The ref existed in this daemon, but the backend node can no longer be
+    // resolved. That is the common "DOM rewrote the element after perceive"
+    // stale-ref case; classify it distinctly instead of surfacing raw CDP text.
+    if (refState) {
+      refState.invalidatedAt = Date.now();
+      refState.invalidationReason = 'dom-mutation';
+    }
+    refMap.delete(num);
+    throw new Error(formatUnknownRefError(ref, refState || {}) + ` Original CDP error: ${e.message}`);
+  }
+}
+
+async function resolveRef(cdp, sid, refMap, ref, refState) {
+  const objectId = await resolveRefNode(cdp, sid, refMap, ref, refState);
   const result = await cdp.send('Runtime.callFunctionOn', {
     objectId,
     functionDeclaration: `function() {
@@ -738,7 +805,11 @@ function validateUrl(url) {
 // Perceive: enriched accessibility tree with inline visual layout annotations
 // Options parsed from args: --diff, --selector <sel>, --interactive/-i, --depth <N>, --cursor-interactive/-C
 function parsePerceiveArgs(args) {
-  const opts = { diff: false, selector: null, exclude: null, interactive: false, maxDepth: Infinity, cursorInteractive: false };
+  const opts = {
+    diff: false, selector: null, exclude: null,
+    interactive: false, maxDepth: Infinity, cursorInteractive: false,
+    keepRefs: false, last: null,
+  };
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === '--diff') opts.diff = true;
@@ -747,14 +818,30 @@ function parsePerceiveArgs(args) {
     else if (a === '-i' || a === '--interactive') opts.interactive = true;
     else if (a === '-d' || a === '--depth') opts.maxDepth = parseInt(args[++i]) || Infinity;
     else if (a === '-C' || a === '--cursor-interactive') opts.cursorInteractive = true;
+    else if (a === '--keep-refs') opts.keepRefs = true;
+    else if (a === '--last') {
+      const n = parseInt(args[++i]);
+      opts.last = Number.isFinite(n) && n > 0 ? n : null;
+    }
   }
   return opts;
+}
+
+// Format a single @ref bounding-rect annotation. Adds `position` only for
+// fixed/sticky elements so agents do not misread visible fixed UI as off-screen.
+function formatRefRect(rect) {
+  if (!rect) return '';
+  const base = `(${rect.x},${rect.y} ${rect.w}×${rect.h}`;
+  if (rect.position === 'fixed' || rect.position === 'sticky') {
+    return `${base}, ${rect.position})`;
+  }
+  return `${base})`;
 }
 
 // Pure tree-building logic extracted from perceiveStr for testability.
 // Takes raw AX nodes + page metadata, returns enriched tree lines and ref node IDs.
 function buildPerceiveTree(nodes, meta, refMap, opts = {}) {
-  const { maxDepth = Infinity, interactiveOnly = false } = opts;
+  const { maxDepth = Infinity, interactiveOnly = false, keepRefs = false, last = null } = opts;
 
   const nodesById = new Map(nodes.map(n => [n.nodeId, n]));
   const childrenByParent = new Map();
@@ -922,7 +1009,41 @@ function buildPerceiveTree(nodes, meta, refMap, opts = {}) {
   for (const root of roots) visit(root, 0);
   for (const node of nodes) visit(node, 0);
 
-  return { treeLines, refNodeIds };
+  // --last N: keep only the last N StaticText / paragraph rows. Ref-bearing
+  // lines (anything containing `@<digit>` or `@c<digit>`) and structural lines
+  // (landmarks, headings, dialogs, etc.) are always kept.
+  // --keep-refs: when truncating, ensure every line carrying an @ref survives.
+  let outLines = treeLines;
+  if (last && Number.isFinite(last) && last > 0) {
+    const refLineRe = /@(c?\d+)/;
+    const textRoleRe = /\[(StaticText|paragraph|listitem|note|description|comment|term|definition)\]/;
+    // Walk backwards collecting the last N text lines while keeping all ref/structural lines
+    const reversed = [];
+    let textKept = 0;
+    let textOmitted = 0;
+    for (let i = outLines.length - 1; i >= 0; i--) {
+      const ln = outLines[i];
+      const isRef = refLineRe.test(ln);
+      const isText = textRoleRe.test(ln) && !isRef;
+      if (isText) {
+        if (textKept < last) { reversed.push(ln); textKept++; }
+        else { textOmitted++; }
+      } else {
+        reversed.push(ln);
+      }
+    }
+    outLines = reversed.reverse();
+    if (textOmitted > 0) outLines.push(`  ... ${textOmitted} earlier text node(s) omitted (--last ${last})`);
+  } else if (keepRefs) {
+    // No size budget enforced here; the caller chooses when to truncate, but
+    // when --keep-refs is set we mark lines so downstream truncation can
+    // protect them. We currently return the lines as-is (the truncation that
+    // hid refs was happening elsewhere; --keep-refs is now a soft flag agents
+    // can use to assert "do not drop my @ref lines"). The flag is honoured
+    // upstream by perceiveStr which avoids cutting ref lines.
+  }
+
+  return { treeLines: outLines, refNodeIds };
 }
 
 // Browser-side script for perceiveStr — extracted for readability and testability.
@@ -1119,8 +1240,12 @@ function perceivePageScript(cursorInteractive) {
     })()`;
 }
 
-async function perceiveStr(cdp, sid, consoleBuf, exceptionBuf, refMap, lastPerceiveStore, opts = {}) {
-  const { diff: diffMode = false, selector: scopeSelector = null, exclude: excludeSelector = null, interactive: interactiveOnly = false, maxDepth = Infinity, cursorInteractive = false } = opts;
+async function perceiveStr(cdp, sid, consoleBuf, exceptionBuf, refMap, lastPerceiveStore, opts = {}, refState = null) {
+  const {
+    diff: diffMode = false, selector: scopeSelector = null, exclude: excludeSelector = null,
+    interactive: interactiveOnly = false, maxDepth = Infinity, cursorInteractive = false,
+    keepRefs = false, last = null,
+  } = opts;
   // Get AX tree nodes and page metadata + layout map in parallel
   // Hoist DOM.getDocument so scope and exclude can share it
   const needsDocument = scopeSelector || excludeSelector;
@@ -1191,16 +1316,29 @@ async function perceiveStr(cdp, sid, consoleBuf, exceptionBuf, refMap, lastPerce
     }
   }
 
-  const { treeLines, refNodeIds } = buildPerceiveTree(axNodes, meta, refMap, { maxDepth, interactiveOnly });
+  const { treeLines, refNodeIds } = buildPerceiveTree(axNodes, meta, refMap, { maxDepth, interactiveOnly, keepRefs, last });
 
   // === Batch-resolve @ref bounding rects (parallel, non-scrolling) ===
-  const refRects = new Map(); // ref number → {x, y, w, h}
+  // Now also returns `position` (computed style) so fixed/sticky elements get
+  // a clear annotation — agents previously saw negative document-relative Ys
+  // and assumed elements were off-screen.
+  const refRects = new Map(); // ref number → {x, y, w, h, position?}
   if (refNodeIds.length > 0) {
     const results = await Promise.allSettled(refNodeIds.map(async ({ ref, backendDOMNodeId }) => {
       const { object } = await cdp.send('DOM.resolveNode', { backendNodeId: backendDOMNodeId }, sid);
       const res = await cdp.send('Runtime.callFunctionOn', {
         objectId: object.objectId,
-        functionDeclaration: `function() { const r = this.getBoundingClientRect(); return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) }; }`,
+        functionDeclaration: `function() {
+          const r = this.getBoundingClientRect();
+          const cs = (typeof getComputedStyle === 'function') ? getComputedStyle(this) : null;
+          return {
+            x: Math.round(r.x),
+            y: Math.round(r.y),
+            w: Math.round(r.width),
+            h: Math.round(r.height),
+            position: cs ? cs.position : '',
+          };
+        }`,
         returnByValue: true,
       }, sid);
       return { ref, rect: res.result.value };
@@ -1210,12 +1348,12 @@ async function perceiveStr(cdp, sid, consoleBuf, exceptionBuf, refMap, lastPerce
     }
   }
 
-  // Inject @ref coordinates into treeLines
+  // Inject @ref coordinates into treeLines (viewport CSS pixels; same frame as clickxy)
   for (let i = 0; i < treeLines.length; i++) {
     const m = treeLines[i].match(/@(\d+)$/);
     if (m) {
       const rect = refRects.get(parseInt(m[1]));
-      if (rect) treeLines[i] += `  (${rect.x},${rect.y} ${rect.w}×${rect.h})`;
+      if (rect) treeLines[i] += `  ${formatRefRect(rect)}`;
     }
   }
 
@@ -1245,6 +1383,10 @@ async function perceiveStr(cdp, sid, consoleBuf, exceptionBuf, refMap, lastPerce
   if (warnings > 0) healthParts.push(`${warnings} warning${warnings > 1 ? 's' : ''}`);
   if (exceptions > 0) healthParts.push(`${exceptions} exception${exceptions > 1 ? 's' : ''}`);
   lines.push(`Console: ${healthParts.length > 0 ? healthParts.join(', ') : 'clean'}`);
+  // Coordinate frame hint — viewport CSS pixels match clickxy/Input events.
+  // Fixed/sticky elements include a "fixed"/"sticky" tag so agents do not
+  // misread negative scroll-relative Ys as off-screen.
+  lines.push(`Coords: viewport CSS px (use clickxy with these values; fixed/sticky elements are tagged)`);
 
   lines.push('');
   lines.push(...treeLines);
@@ -1256,8 +1398,8 @@ async function perceiveStr(cdp, sid, consoleBuf, exceptionBuf, refMap, lastPerce
     const prev = lastPerceiveStore.output.split('\n');
     const curr = output.split('\n');
     const diffLines = [];
-    // Skip header lines (first 4), diff the tree
-    const headerEnd = 4;
+    // Skip header lines (first 5: Page, Viewport, Interactive, Console, Coords), diff the tree
+    const headerEnd = 5;
     const prevTree = prev.slice(headerEnd);
     const currTree = curr.slice(headerEnd);
     // Line-level diff with StaticText noise filtering
@@ -1298,6 +1440,12 @@ async function perceiveStr(cdp, sid, consoleBuf, exceptionBuf, refMap, lastPerce
   }
 
   lastPerceiveStore.output = output;
+  // Mark refs as freshly assigned (clears 'navigation'/'daemon-start' state).
+  if (refState && typeof refState === 'object') {
+    refState.generation = (refState.generation || 0) + 1;
+    refState.lastPerceiveAt = Date.now();
+    refState.invalidationReason = null;
+  }
   // Hint when perceive returns many interactive elements without exclude
   if (interactiveOnly && !excludeSelector && refNodeIds.length > 50) {
     return output + `\n\n(Hint: ${refNodeIds.length} interactive elements found — most may be sidebar/nav noise. Use \`perceive -x "nav, aside"\` to exclude, or \`perceive -s "main"\` to scope.)`;
@@ -1306,10 +1454,10 @@ async function perceiveStr(cdp, sid, consoleBuf, exceptionBuf, refMap, lastPerce
 }
 
 // Element screenshot: targeted capture of a specific element by CSS selector or @ref
-async function elshotStr(cdp, sid, selector, targetId, refMap) {
+async function elshotStr(cdp, sid, selector, targetId, refMap, refState) {
   if (!selector) throw new Error('CSS selector or @ref required');
   if (isRef(selector)) {
-    const r = await resolveRef(cdp, sid, refMap, selector);
+    const r = await resolveRef(cdp, sid, refMap, selector, refState);
     const pad = 8;
     const clipX = Math.max(0, r.x - pad);
     const clipY = Math.max(0, r.y - pad);
@@ -1385,10 +1533,10 @@ async function getDpr(cdp, sid) {
 }
 
 // Click element by CSS selector or @ref
-async function clickStr(cdp, sid, selector, refMap) {
+async function clickStr(cdp, sid, selector, refMap, refState) {
   if (!selector) throw new Error('CSS selector or @ref required');
   if (isRef(selector)) {
-    const r = await resolveRef(cdp, sid, refMap, selector);
+    const r = await resolveRef(cdp, sid, refMap, selector, refState);
     await dispatchClick(cdp, sid, r.x + r.w / 2, r.y + r.h / 2);
     return `Clicked <${r.tag}> "${r.text}" (${selector})`;
   }
@@ -1437,12 +1585,97 @@ const KEY_MAP = {
   arrowright: { key: 'ArrowRight', code: 'ArrowRight', keyCode: 39 },
 };
 
+// Punctuation → CDP code/keyCode map for unshifted US keys
+const PUNCT_KEY_MAP = {
+  '`': { code: 'Backquote',    keyCode: 192 },
+  '-': { code: 'Minus',        keyCode: 189 },
+  '=': { code: 'Equal',        keyCode: 187 },
+  '[': { code: 'BracketLeft',  keyCode: 219 },
+  ']': { code: 'BracketRight', keyCode: 221 },
+  '\\':{ code: 'Backslash',    keyCode: 220 },
+  ';': { code: 'Semicolon',    keyCode: 186 },
+  "'": { code: 'Quote',        keyCode: 222 },
+  ',': { code: 'Comma',        keyCode: 188 },
+  '.': { code: 'Period',       keyCode: 190 },
+  '/': { code: 'Slash',        keyCode: 191 },
+};
+
+// Shifted printable punctuation on a US keyboard. `key` stays the visible
+// character, while code/keyCode identify the physical base key.
+const SHIFTED_PUNCT_KEY_MAP = {
+  '~': { code: 'Backquote',    keyCode: 192 },
+  '_': { code: 'Minus',        keyCode: 189 },
+  '+': { code: 'Equal',        keyCode: 187 },
+  '{': { code: 'BracketLeft',  keyCode: 219 },
+  '}': { code: 'BracketRight', keyCode: 221 },
+  '|': { code: 'Backslash',    keyCode: 220 },
+  ':': { code: 'Semicolon',    keyCode: 186 },
+  '"': { code: 'Quote',        keyCode: 222 },
+  '<': { code: 'Comma',        keyCode: 188 },
+  '>': { code: 'Period',       keyCode: 190 },
+  '?': { code: 'Slash',        keyCode: 191 },
+  '!': { code: 'Digit1',       keyCode: 49 },
+  '@': { code: 'Digit2',       keyCode: 50 },
+  '#': { code: 'Digit3',       keyCode: 51 },
+  '$': { code: 'Digit4',       keyCode: 52 },
+  '%': { code: 'Digit5',       keyCode: 53 },
+  '^': { code: 'Digit6',       keyCode: 54 },
+  '&': { code: 'Digit7',       keyCode: 55 },
+  '*': { code: 'Digit8',       keyCode: 56 },
+  '(': { code: 'Digit9',       keyCode: 57 },
+  ')': { code: 'Digit0',       keyCode: 48 },
+};
+
+// Resolve a press argument (named key or single-character) to a CDP descriptor.
+// Returns { key, code, keyCode, shift? } or null when unsupported.
+function keyForPress(input) {
+  if (!input || typeof input !== 'string') return null;
+  const named = KEY_MAP[input.toLowerCase()];
+  if (named) return { ...named };
+  if (input.length !== 1) return null;
+  // a-z
+  if (/^[a-z]$/.test(input)) {
+    return { key: input, code: 'Key' + input.toUpperCase(), keyCode: input.toUpperCase().charCodeAt(0) };
+  }
+  // A-Z (shift-modified)
+  if (/^[A-Z]$/.test(input)) {
+    return { key: input, code: 'Key' + input, keyCode: input.charCodeAt(0), shift: true };
+  }
+  // 0-9
+  if (/^[0-9]$/.test(input)) {
+    return { key: input, code: 'Digit' + input, keyCode: input.charCodeAt(0) };
+  }
+  if (Object.prototype.hasOwnProperty.call(PUNCT_KEY_MAP, input)) {
+    const p = PUNCT_KEY_MAP[input];
+    return { key: input, code: p.code, keyCode: p.keyCode };
+  }
+  if (Object.prototype.hasOwnProperty.call(SHIFTED_PUNCT_KEY_MAP, input)) {
+    const p = SHIFTED_PUNCT_KEY_MAP[input];
+    return { key: input, code: p.code, keyCode: p.keyCode, shift: true };
+  }
+  return null;
+}
+
 async function pressStr(cdp, sid, keyName) {
-  if (!keyName) throw new Error('Key name required (Enter, Tab, Escape, Backspace, Space, Arrow*)');
-  const mapped = KEY_MAP[keyName.toLowerCase()];
-  if (!mapped) throw new Error(`Unknown key: ${keyName}. Supported: ${Object.keys(KEY_MAP).join(', ')}`);
-  const base = { key: mapped.key, code: mapped.code, windowsVirtualKeyCode: mapped.keyCode, nativeVirtualKeyCode: mapped.keyCode };
+  if (!keyName) throw new Error('Key name required (Enter, Tab, Escape, Backspace, Space, Arrow*, or single character a-z/A-Z/0-9/punctuation)');
+  const mapped = keyForPress(keyName);
+  if (!mapped) throw new Error(
+    `Unknown key: ${keyName}. Supported: ${Object.keys(KEY_MAP).join(', ')}, single characters (a-z, A-Z, 0-9, common punctuation). Use \`type\` for multi-character text.`
+  );
+  const modifiers = mapped.shift ? 8 : 0;
+  const base = {
+    key: mapped.key,
+    code: mapped.code,
+    windowsVirtualKeyCode: mapped.keyCode,
+    nativeVirtualKeyCode: mapped.keyCode,
+    modifiers,
+  };
   await cdp.send('Input.dispatchKeyEvent', { ...base, type: 'keyDown' }, sid);
+  // For printable single characters, send a `char` event so the page receives input
+  // (mirrors what real keyboards do for letter / digit / punctuation keys).
+  if (mapped.key.length === 1 && mapped.code !== 'Space' && mapped.key !== ' ') {
+    await cdp.send('Input.dispatchKeyEvent', { ...base, type: 'char', text: mapped.key, unmodifiedText: mapped.key }, sid);
+  }
   await cdp.send('Input.dispatchKeyEvent', { ...base, type: 'keyUp' }, sid);
   return `Pressed ${mapped.key}`;
 }
@@ -1464,10 +1697,10 @@ async function scrollStr(cdp, sid, direction, amount) {
   return `Scrolled by (${dx}, ${dy}). Position: (${pos.x}, ${pos.y})`;
 }
 
-async function hoverStr(cdp, sid, selector, refMap) {
+async function hoverStr(cdp, sid, selector, refMap, refState) {
   if (!selector) throw new Error('CSS selector or @ref required');
   if (isRef(selector)) {
-    const r = await resolveRef(cdp, sid, refMap, selector);
+    const r = await resolveRef(cdp, sid, refMap, selector, refState);
     const cx = r.x + r.w / 2, cy = r.y + r.h / 2;
     await cdp.send('Input.dispatchMouseEvent', { x: cx, y: cy, type: 'mouseMoved', button: 'none', modifiers: 0 }, sid);
     return `Hovering over <${r.tag}> at CSS (${Math.round(cx)}, ${Math.round(cy)}) (${selector})`;
@@ -1488,7 +1721,7 @@ async function hoverStr(cdp, sid, selector, refMap) {
   return `Hovering over <${r.tag}> at CSS (${Math.round(r.x)}, ${Math.round(r.y)})`;
 }
 
-async function waitForStr(cdp, sid, args, refMap) {
+async function waitForStr(cdp, sid, args, refMap, refState) {
   // Shared polling loop
   async function poll(jsExpr, formatResult, interval, timeoutMs, label) {
     const timeout = Math.min(Math.max(timeoutMs, 500), 300000);
@@ -1499,6 +1732,73 @@ async function waitForStr(cdp, sid, args, refMap) {
       await sleep(interval);
     }
     throw new Error(`Timeout: ${label} not found within ${timeout}ms`);
+  }
+
+  // --any-of: regex-OR text wait, returns the first matching alternative.
+  if (args[0] === '--any-of') {
+    const pattern = args[1];
+    if (!pattern) throw new Error('Pattern required after --any-of (e.g. "win|lose|escape")');
+    let scope = 'body';
+    let timeoutMs = 30000;
+    for (let i = 2; i < args.length; i++) {
+      if (args[i] === '--scope' || args[i] === '-s') scope = args[++i];
+      else if (/^\d+$/.test(args[i])) timeoutMs = parseInt(args[i]);
+    }
+    const alternatives = pattern.split('|').filter(Boolean);
+    if (alternatives.length === 0) throw new Error('--any-of pattern must contain at least one alternative');
+    const altsJson = JSON.stringify(alternatives);
+    return poll(
+      `(function() {
+        const el = document.querySelector(${JSON.stringify(scope)});
+        if (!el) return null;
+        const t = el.innerText || el.textContent || '';
+        const alts = ${altsJson};
+        for (const a of alts) {
+          const idx = t.indexOf(a);
+          if (idx !== -1) return { matched: a, snippet: t.substring(Math.max(0, idx - 20), idx + a.length + 60).trim(), len: t.length };
+        }
+        return null;
+      })()`,
+      r => `Found "${r.matched}" (page has ${r.len} chars): "...${r.snippet}..."`,
+      400, timeoutMs, `any of [${alternatives.join(', ')}]`
+    );
+  }
+
+  // --selector-stable: wait for selector's textContent to stop changing for stableMs.
+  if (args[0] === '--selector-stable') {
+    const selector = args[1];
+    if (!selector) throw new Error('Selector required after --selector-stable');
+    const stableMs = parseInt(args[2]) || 3000;
+    const timeoutMs = parseInt(args[3]) || 30000;
+    const deadline = Date.now() + Math.min(Math.max(timeoutMs, 500), 300000);
+    let lastText = null;
+    let stableSince = null;
+    while (Date.now() < deadline) {
+      const raw = await evalStr(cdp, sid, `(function() {
+        const el = document.querySelector(${JSON.stringify(selector)});
+        if (!el) return null;
+        const t = el.innerText || el.textContent || '';
+        return JSON.stringify({ len: t.length, hash: t });
+      })()`);
+      if (raw === 'null' || raw === '') {
+        // selector not present yet — keep polling
+        lastText = null; stableSince = null;
+        await sleep(300);
+        continue;
+      }
+      const cur = JSON.parse(raw);
+      if (lastText !== null && cur.hash === lastText) {
+        if (stableSince == null) stableSince = Date.now();
+        if (Date.now() - stableSince >= stableMs) {
+          return `Selector "${selector}" stable for ${stableMs}ms (${cur.len} chars)`;
+        }
+      } else {
+        lastText = cur.hash;
+        stableSince = null;
+      }
+      await sleep(Math.min(300, stableMs / 4));
+    }
+    throw new Error(`Timeout: "${selector}" did not stabilise within ${timeoutMs}ms`);
   }
 
   // --gone: wait for element to DISAPPEAR (e.g. stop button after streaming)
@@ -1513,7 +1813,7 @@ async function waitForStr(cdp, sid, args, refMap) {
     if (isRef(selector) && refMap) {
       const num = parseInt(selector.slice(1));
       const backendNodeId = refMap.get(num);
-      if (!backendNodeId) throw new Error(`Unknown ref: ${selector}. Run "perceive" first.`);
+      if (!backendNodeId) throw new Error(formatUnknownRefError(selector, refState || {}));
       while (Date.now() < deadline) {
         try {
           const { object } = await cdp.send('DOM.resolveNode', { backendNodeId }, sid);
@@ -1583,11 +1883,11 @@ async function waitForStr(cdp, sid, args, refMap) {
   }
 }
 
-async function fillStr(cdp, sid, selector, text, refMap) {
+async function fillStr(cdp, sid, selector, text, refMap, refState) {
   if (!selector) throw new Error('CSS selector or @ref required');
   if (text == null) throw new Error('Text required');
   if (isRef(selector)) {
-    const objectId = await resolveRefNode(cdp, sid, refMap, selector);
+    const objectId = await resolveRefNode(cdp, sid, refMap, selector, refState);
     await cdp.send('Runtime.callFunctionOn', {
       objectId,
       functionDeclaration: `function() { this.scrollIntoView({block:'center'}); this.focus(); this.value=''; this.dispatchEvent(new Event('input',{bubbles:true})); }`,
@@ -1970,19 +2270,89 @@ async function uploadStr(cdp, sid, selector, filePaths) {
 }
 
 // --- Clean text extraction ---
-async function textStr(cdp, sid, selector) {
-  const sel = selector || 'body';
-  const result = await evalStr(cdp, sid, `(function() {
-    const root = document.querySelector(${JSON.stringify(sel)});
-    if (!root) return 'No element found matching ' + ${JSON.stringify(sel)};
-    const clone = root.cloneNode(true);
-    for (const el of clone.querySelectorAll('script,style,noscript,svg,link,meta')) el.remove();
-    return clone.textContent.replace(/[ \\t]+/g, ' ').replace(/(\\n\\s*){3,}/g, '\\n\\n').trim();
-  })()`);
-  if (!selector && result.length > 2000) {
-    return result + '\n\n(Hint: output is large — use `text <target> "main"` or `text <target> ".content"` to scope to a specific area)';
+// Parse `text` arguments. Supports:
+//   text                          → full body
+//   text "main, [role=main]"      → fallback chain (try first, then next…)
+//   text --auto                   → auto-pick main content (excludes nav/aside/script/style)
+//   text --auto --exclude "nav,.sidebar"  → custom extra exclusions
+function parseTextArgs(args) {
+  const opts = { selectors: [], auto: false, exclude: null };
+  const tokens = Array.isArray(args) ? args.filter(a => a !== undefined && a !== null) : [];
+  for (let i = 0; i < tokens.length; i++) {
+    const a = tokens[i];
+    if (a === '--auto') opts.auto = true;
+    else if (a === '--exclude' || a === '-x') opts.exclude = tokens[++i];
+    else if (typeof a === 'string') {
+      // Comma list = fallback chain (try each until one matches)
+      const parts = a.split(',').map(s => s.trim()).filter(Boolean);
+      if (parts.length === 0) continue;
+      opts.selectors.push(...parts);
+    }
   }
-  return result;
+  return opts;
+}
+
+function textPageScript(opts) {
+  const { selectors = [], auto = false, exclude = null } = opts || {};
+  const extraExcludes = exclude ? exclude.split(',').map(s => s.trim()).filter(Boolean) : [];
+  return `(function() {
+    const STRIP = 'script,style,noscript,svg,link,meta';
+    function clean(root) {
+      const clone = root.cloneNode(true);
+      for (const el of clone.querySelectorAll(STRIP)) el.remove();
+      ${extraExcludes.length ? `for (const sel of ${JSON.stringify(extraExcludes)}) { for (const el of clone.querySelectorAll(sel)) el.remove(); }` : ''}
+      return clone.textContent.replace(/[ \\t]+/g, ' ').replace(/(\\n\\s*){3,}/g, '\\n\\n').trim();
+    }
+    const tried = [];
+    const selectors = ${JSON.stringify(selectors)};
+    for (const sel of selectors) {
+      const root = document.querySelector(sel);
+      tried.push(sel);
+      if (root) return JSON.stringify({ ok: true, sel, text: clean(root) });
+    }
+    if (${auto ? 'true' : 'false'}) {
+      const candidates = ['main', '[role="main"]', 'article', '#root main', '#app main', '#root', '#app', 'body'];
+      for (const sel of candidates) {
+        const root = document.querySelector(sel);
+        if (!root) continue;
+        // Strip nav/aside/footer noise from auto-mode
+        const clone = root.cloneNode(true);
+        for (const el of clone.querySelectorAll(STRIP + ',nav,aside,footer,[role="navigation"],[role="complementary"],[role="contentinfo"]')) el.remove();
+        ${extraExcludes.length ? `for (const x of ${JSON.stringify(extraExcludes)}) { for (const el of clone.querySelectorAll(x)) el.remove(); }` : ''}
+        const text = clone.textContent.replace(/[ \\t]+/g, ' ').replace(/(\\n\\s*){3,}/g, '\\n\\n').trim();
+        if (text.length > 0) return JSON.stringify({ ok: true, sel: sel + ' (auto)', text });
+        tried.push(sel + ' (auto)');
+      }
+    }
+    if (selectors.length === 0 && !${auto ? 'true' : 'false'}) {
+      // Default behaviour: full body
+      return JSON.stringify({ ok: true, sel: 'body', text: clean(document.body) });
+    }
+    return JSON.stringify({ ok: false, tried });
+  })()`;
+}
+
+async function textStr(cdp, sid, args) {
+  // Support legacy single-string call: textStr(cdp, sid, 'main') — wrap into args[]
+  let optsArgs = args;
+  if (typeof args === 'string' || args == null) optsArgs = args ? [args] : [];
+  else if (!Array.isArray(args)) optsArgs = [];
+  const opts = parseTextArgs(optsArgs);
+  const result = await evalStr(cdp, sid, textPageScript(opts));
+  let parsed;
+  try { parsed = JSON.parse(result); }
+  catch { return result; }
+  if (!parsed.ok) {
+    const tried = (parsed.tried || []).join(', ') || '(no candidates)';
+    throw new Error(`text: no element matched. Tried: ${tried}. Try \`text <target> --auto\` or \`text <target> "main, [role=main], body"\`.`);
+  }
+  const out = parsed.text || '';
+  // Hint when no scope was given and text is large.
+  const noScope = opts.selectors.length === 0 && !opts.auto;
+  if (noScope && out.length > 2000) {
+    return out + '\n\n(Hint: output is large — use `text <target> --auto` or `text <target> "main"` / `text <target> "main, [role=main], #app .main"` to scope to a specific area)';
+  }
+  return out;
 }
 
 // --- Full table data extraction ---
@@ -2179,8 +2549,8 @@ async function installRecordMutationObserver(cdp, sid) {
       if (!node || node.nodeType !== 1) return '';
       const el = node;
       const id = el.id ? '#' + el.id : '';
-      const cls = typeof el.className === 'string' && el.className ? '.' + el.className.trim().split(/\s+/).slice(0,2).join('.') : '';
-      const text = (el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 40);
+      const cls = typeof el.className === 'string' && el.className ? '.' + el.className.trim().split(/\\s+/).slice(0,2).join('.') : '';
+      const text = (el.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 40);
       return '<' + el.tagName.toLowerCase() + id + cls + '>' + (text ? ' "' + text + '"' : '');
     };
     window.__cdp_record_observer = new MutationObserver((mutations) => {
@@ -2388,7 +2758,7 @@ async function resolveStyleSource(cdp, sid, rule) {
   return mapStyleSource(header?.text || '', sheetId, genLine0);
 }
 
-async function cascadeStr(cdp, sid, selector, property, refMap) {
+async function cascadeStr(cdp, sid, selector, property, refMap, refState) {
   if (!selector) throw new Error('CSS selector or @ref required');
 
   // CSS.getMatchedStylesForNode requires these domains/document state. Enable
@@ -2402,7 +2772,7 @@ async function cascadeStr(cdp, sid, selector, property, refMap) {
   if (isRef(selector)) {
     const num = parseInt(selector.slice(1));
     const backendNodeId = refMap.get(num);
-    if (!backendNodeId) throw new Error(`Unknown ref: ${selector}. Run "perceive" first.`);
+    if (!backendNodeId) throw new Error(formatUnknownRefError(selector, refState || {}));
     const { nodeIds } = await cdp.send('DOM.pushNodesByBackendIdsToFrontend',
       { backendNodeIds: [backendNodeId] }, sid);
     nodeId = nodeIds[0];
@@ -2789,6 +3159,198 @@ async function doctorStr(opts = {}) {
 }
 
 // ---------------------------------------------------------------------------
+// spawn-debug-browser: launch a browser with --remote-debugging-port using a
+// disposable user-data-dir. macOS reviewer feedback: previous skill docs said
+// to never suggest --remote-debugging-port, but the only way to debug a
+// fresh-install Chrome/Edge without touching the user's main profile is to
+// spawn an isolated debug profile. This helper keeps that path predictable.
+// ---------------------------------------------------------------------------
+
+const DEFAULT_BROWSER_PATHS = {
+  darwin: {
+    edge:   ['/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge'],
+    chrome: ['/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'],
+    brave:  ['/Applications/Brave Browser.app/Contents/MacOS/Brave Browser'],
+  },
+  linux: {
+    edge:   ['/usr/bin/microsoft-edge', '/usr/bin/microsoft-edge-stable', '/usr/bin/microsoft-edge-dev'],
+    chrome: ['/usr/bin/google-chrome', '/usr/bin/google-chrome-stable', '/usr/bin/chromium', '/usr/bin/chromium-browser'],
+    brave:  ['/usr/bin/brave-browser', '/usr/bin/brave'],
+  },
+  win32: {
+    edge:   [
+      'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+      'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
+    ],
+    chrome: [
+      'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+      'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+    ],
+    brave: [
+      'C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe',
+      'C:\\Program Files (x86)\\BraveSoftware\\Brave-Browser\\Application\\brave.exe',
+    ],
+  },
+};
+
+function parseSpawnDebugBrowserArgs(args, env = process.env) {
+  const opts = { browser: (env && env.CDP_DEBUG_BROWSER) || 'edge', port: 9222, url: null, profileDir: null, executable: null };
+  const tokens = (args || []).filter(a => a !== undefined && a !== null);
+  for (let i = 0; i < tokens.length; i++) {
+    const a = tokens[i];
+    if (a === '--port' || a === '-p') opts.port = parseInt(tokens[++i]) || 9222;
+    else if (a === '--url' || a === '-u') opts.url = tokens[++i];
+    else if (a === '--profile-dir') opts.profileDir = tokens[++i];
+    else if (a === '--browser') opts.browser = (tokens[++i] || opts.browser).toLowerCase();
+    else if (a === '--exe' || a === '--executable') opts.executable = tokens[++i];
+    else if (['edge','chrome','brave','google-chrome','msedge','chromium'].includes(a.toLowerCase())) {
+      const norm = a.toLowerCase();
+      if (norm === 'msedge') opts.browser = 'edge';
+      else if (norm === 'google-chrome' || norm === 'chromium') opts.browser = 'chrome';
+      else opts.browser = norm;
+    }
+  }
+  if (!opts.profileDir) {
+    const tmp = (env && env.TMPDIR) || '/tmp';
+    opts.profileDir = `${tmp.replace(/\/$/, '')}/chrome-cdp-ex-${opts.browser}-debug-profile-${opts.port}`;
+  }
+  return opts;
+}
+
+const BROWSER_COMMANDS = {
+  edge: ['microsoft-edge', 'microsoft-edge-stable', 'microsoft-edge-dev', 'msedge'],
+  chrome: ['google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser', 'chrome'],
+  brave: ['brave-browser', 'brave'],
+};
+
+function findOnPath(commands, env = process.env, fs = { existsSync }) {
+  const dirs = String(env?.PATH || '').split(delimiter).filter(Boolean);
+  for (const cmd of commands || []) {
+    for (const dir of dirs) {
+      const candidate = resolve(dir, cmd);
+      if (fs.existsSync(candidate)) return candidate;
+      if (IS_WINDOWS && fs.existsSync(candidate + '.exe')) return candidate + '.exe';
+    }
+  }
+  return null;
+}
+
+function detectBrowserPath(browser, platform = process.platform, fs = { existsSync }, env = process.env) {
+  const list = (DEFAULT_BROWSER_PATHS[platform] || {})[browser] || [];
+  for (const candidate of list) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return findOnPath(BROWSER_COMMANDS[browser] || [], env, fs);
+}
+
+function buildSpawnDebugBrowserPlan(opts, platform = process.platform, fs = { existsSync }, env = process.env) {
+  const exe = opts.executable || detectBrowserPath(opts.browser, platform, fs, env);
+  if (!exe || !fs.existsSync(exe)) {
+    const list = [
+      ...((DEFAULT_BROWSER_PATHS[platform] || {})[opts.browser] || []),
+      ...((BROWSER_COMMANDS[opts.browser] || []).map(c => `$PATH:${c}`)),
+    ];
+    const tried = list.length ? list.join(', ') : '(no candidates configured for this platform)';
+    throw new Error(`spawn-debug-browser: cannot find ${opts.browser} executable. Tried: ${tried}. Use --exe /path/to/browser, set CDP_DEBUG_BROWSER, or install it on PATH.`);
+  }
+  const args = [
+    `--remote-debugging-port=${opts.port}`,
+    `--user-data-dir=${opts.profileDir}`,
+    '--no-first-run',
+    '--no-default-browser-check',
+  ];
+  if (opts.url) args.push(opts.url);
+  return { exe, args, profileDir: opts.profileDir, port: opts.port, url: opts.url, browser: opts.browser };
+}
+
+async function spawnDebugBrowserStr(args, env = process.env, deps = {}) {
+  const platform = deps.platform || process.platform;
+  const fs = deps.fs || { existsSync, mkdirSync };
+  const launcher = deps.spawn || spawn;
+  const opts = parseSpawnDebugBrowserArgs(args, env);
+  const plan = buildSpawnDebugBrowserPlan(opts, platform, fs, env);
+  try { fs.mkdirSync(plan.profileDir, { recursive: true }); } catch {}
+  const child = launcher(plan.exe, plan.args, { detached: true, stdio: 'ignore' });
+  child.unref?.();
+  const lines = [];
+  lines.push(`Spawned ${plan.browser} debug profile on CDP_PORT=${plan.port} (pid ${child.pid || '?'})`);
+  lines.push(`  Executable: ${plan.exe}`);
+  lines.push(`  Profile:    ${plan.profileDir}`);
+  if (plan.url) lines.push(`  URL:        ${plan.url}`);
+  lines.push('');
+  lines.push(`Next: CDP_PORT=${plan.port} node skills/chrome-cdp-ex/scripts/cdp.mjs list`);
+  lines.push(`(Profile is disposable — delete ${plan.profileDir} to reset.)`);
+  return lines.join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// dismiss-modal: close common dialog/modal patterns without firing background
+// shortcuts. Reviewer feedback: pressing Space to close a "press any key" MOTD
+// also triggered the underlying game's `space` shortcut. dismiss-modal favours
+// safer signals (Escape / explicit close button / aria-modal click target)
+// over global-key presses.
+// ---------------------------------------------------------------------------
+
+function dismissModalScript() {
+  return `(function() {
+    function visible(el) {
+      if (!el) return false;
+      const r = el.getBoundingClientRect();
+      if (r.width < 1 || r.height < 1) return false;
+      const cs = getComputedStyle(el);
+      if (cs.display === 'none' || cs.visibility === 'hidden' || parseFloat(cs.opacity) === 0) return false;
+      return true;
+    }
+    function findCloseButton(root) {
+      const candidates = root.querySelectorAll('button, [role="button"], a, [aria-label], [data-dismiss], [data-close]');
+      const labels = ['close', 'dismiss', 'cancel', 'ok', '關閉', '取消', '確認', '繼續', '×', '✕'];
+      for (const el of candidates) {
+        if (!visible(el)) continue;
+        const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+        const txt  = (el.textContent || '').trim().toLowerCase();
+        const data = (el.getAttribute('data-dismiss') || el.getAttribute('data-close') || '').toLowerCase();
+        for (const lab of labels) {
+          if (aria.includes(lab) || txt === lab || txt.includes(lab) || data.includes(lab)) {
+            return { el, label: lab };
+          }
+        }
+      }
+      return null;
+    }
+    const dialogs = Array.from(document.querySelectorAll('[role="dialog"], dialog, [aria-modal="true"]')).filter(visible);
+    if (dialogs.length === 0) {
+      return JSON.stringify({ ok: false, reason: 'no-dialog' });
+    }
+    // Prefer an explicit close button inside a visible dialog.
+    for (const d of dialogs) {
+      const hit = findCloseButton(d);
+      if (hit) {
+        hit.el.click();
+        return JSON.stringify({ ok: true, action: 'click', label: hit.label, sel: d.tagName.toLowerCase() });
+      }
+    }
+    // Fall through: signal that the caller should send Escape next.
+    return JSON.stringify({ ok: false, reason: 'no-close-button', dialogs: dialogs.length });
+  })()`;
+}
+
+async function dismissModalStr(cdp, sid) {
+  const raw = await evalStr(cdp, sid, dismissModalScript());
+  let parsed;
+  try { parsed = JSON.parse(raw); }
+  catch { parsed = { ok: false, reason: 'parse-error' }; }
+  if (parsed.ok) {
+    return `Dismissed modal via close button "${parsed.label}" (${parsed.sel})`;
+  }
+  if (parsed.reason === 'no-dialog') {
+    return 'No visible modal/dialog detected.';
+  }
+  // Fallback: send Escape (does not fire window-level shortcuts the way Space does).
+  await pressStr(cdp, sid, 'escape');
+  return `No close button found in ${parsed.dialogs || 0} dialog(s); sent Escape as fallback.`;
+}
+
+// ---------------------------------------------------------------------------
 // Per-tab daemon
 // ---------------------------------------------------------------------------
 
@@ -2825,6 +3387,16 @@ async function runDaemon(targetId) {
   // --- Ref system & perceive diff state ---
   const refMap = new Map();               // ref number → backendDOMNodeId
   const lastPerceiveStore = { output: null }; // stores last perceive output for diff
+  // Ref lifecycle tracking — used to explain stale @ref errors.
+  // generation increments on every successful perceive; invalidationReason is
+  // set to 'navigation' on top-level frame nav, and 'daemon-start' until the
+  // first perceive runs.
+  const refState = {
+    generation: 0,
+    lastPerceiveAt: 0,
+    invalidatedAt: Date.now(),
+    invalidationReason: 'daemon-start',
+  };
 
   // Enable domains for background collection and ref resolution
   try { await cdp.send('Runtime.enable', {}, sessionId); } catch {}
@@ -2855,6 +3427,10 @@ async function runDaemon(targetId) {
   cdp.onEvent('Page.frameNavigated', (params) => {
     if (!params.frame.parentId) { // main frame only
       navBuf.push({ url: params.frame.url, ts: Date.now() });
+      // Top-level navigation (or Vite HMR full reload) invalidates all @refs.
+      refMap.clear();
+      refState.invalidatedAt = Date.now();
+      refState.invalidationReason = 'navigation';
     }
   });
 
@@ -2932,10 +3508,10 @@ async function runDaemon(targetId) {
   const OBSERVE_KEYS = new Set(['enter', 'escape', 'tab']);
   const BATCH_BLOCKED = new Set(['batch', 'stop']);
   // Commands that mutate shared state (refMap, lastPerceiveStore) — unsafe for parallel execution
-  const BATCH_NO_PARALLEL = new Set(['click', 'clickxy', 'select', 'press', 'scroll', 'nav', 'navigate', 'viewport', 'perceive', 'snap', 'snapshot']);
+  const BATCH_NO_PARALLEL = new Set(['click', 'clickxy', 'select', 'press', 'scroll', 'nav', 'navigate', 'viewport', 'perceive', 'snap', 'snapshot', 'dismiss-modal', 'dismissmodal']);
   async function actionFeedback(actionResult) {
     await waitForSettle(cdp, sessionId);
-    const diff = await perceiveStr(cdp, sessionId, consoleBuf, exceptionBuf, refMap, lastPerceiveStore, { diff: true });
+    const diff = await perceiveStr(cdp, sessionId, consoleBuf, exceptionBuf, refMap, lastPerceiveStore, { diff: true }, refState);
     return actionResult + '\n---\n' + diff;
   }
 
@@ -2961,14 +3537,15 @@ async function runDaemon(targetId) {
           if (args[0] === '--annotate' || args[0] === '-a') {
             result = await annotshotStr(cdp, sessionId, targetId, refMap);
           } else {
-            result = await shotStr(cdp, sessionId, args[0], targetId);
+            const sopts = parseShotArgs(args);
+            result = await shotStr(cdp, sessionId, sopts.filePath, targetId, { quiet: sopts.quiet, verbose: sopts.verbose });
           }
           break;
         }
         case 'html': result = await htmlStr(cdp, sessionId, args[0]); break;
         case 'nav': case 'navigate': {
           const navResult = await navStr(cdp, sessionId, args[0]);
-          const p = await perceiveStr(cdp, sessionId, consoleBuf, exceptionBuf, refMap, lastPerceiveStore, {});
+          const p = await perceiveStr(cdp, sessionId, consoleBuf, exceptionBuf, refMap, lastPerceiveStore, {}, refState);
           result = navResult + '\n---\n' + p;
           break;
         }
@@ -2978,11 +3555,11 @@ async function runDaemon(targetId) {
         case 'summary': result = await summaryStr(cdp, sessionId, consoleBuf, exceptionBuf); break;
         case 'perceive': {
           const popts = parsePerceiveArgs(args);
-          result = await perceiveStr(cdp, sessionId, consoleBuf, exceptionBuf, refMap, lastPerceiveStore, popts);
+          result = await perceiveStr(cdp, sessionId, consoleBuf, exceptionBuf, refMap, lastPerceiveStore, popts, refState);
           break;
         }
-        case 'elshot': result = await elshotStr(cdp, sessionId, args[0], targetId, refMap); break;
-        case 'click': result = await actionFeedback(await clickStr(cdp, sessionId, args[0], refMap)); break;
+        case 'elshot': result = await elshotStr(cdp, sessionId, args[0], targetId, refMap, refState); break;
+        case 'click': result = await actionFeedback(await clickStr(cdp, sessionId, args[0], refMap, refState)); break;
         case 'clickxy': result = await actionFeedback(await clickXyStr(cdp, sessionId, args[0], args[1])); break;
         case 'type': result = await typeStr(cdp, sessionId, args[0]); break;
         case 'press': {
@@ -2992,14 +3569,14 @@ async function runDaemon(targetId) {
         }
         case 'scroll': {
           const scrollResult = await scrollStr(cdp, sessionId, args[0], args[1]);
-          const diff = await perceiveStr(cdp, sessionId, consoleBuf, exceptionBuf, refMap, lastPerceiveStore, { diff: true });
+          const diff = await perceiveStr(cdp, sessionId, consoleBuf, exceptionBuf, refMap, lastPerceiveStore, { diff: true }, refState);
           result = scrollResult + '\n---\n' + diff;
           break;
         }
-        case 'hover': result = await hoverStr(cdp, sessionId, args[0], refMap); break;
-        case 'waitfor': result = await waitForStr(cdp, sessionId, args, refMap); break;
+        case 'hover': result = await hoverStr(cdp, sessionId, args[0], refMap, refState); break;
+        case 'waitfor': result = await waitForStr(cdp, sessionId, args, refMap, refState); break;
         case 'loadall': result = await loadAllStr(cdp, sessionId, args[0], args[1] ? parseInt(args[1]) : 1500); break;
-        case 'fill': result = await fillStr(cdp, sessionId, args[0], args[1], refMap); break;
+        case 'fill': result = await fillStr(cdp, sessionId, args[0], args[1], refMap, refState); break;
         case 'select': result = await actionFeedback(await selectStr(cdp, sessionId, args[0], args[1])); break;
         case 'fullshot': result = await fullshotStr(cdp, sessionId, args[0], targetId); break;
         case 'scanshot': result = await scanshotStr(cdp, sessionId, targetId); break;
@@ -3014,7 +3591,7 @@ async function runDaemon(targetId) {
           break;
         }
         case 'upload': result = await uploadStr(cdp, sessionId, args[0], args[1]); break;
-        case 'text': result = await textStr(cdp, sessionId, args[0]); break;
+        case 'text': result = await textStr(cdp, sessionId, args); break;
         case 'table': result = await tableStr(cdp, sessionId, args[0]); break;
         case 'back': result = await historyNavStr(cdp, sessionId, -1); break;
         case 'forward': result = await historyNavStr(cdp, sessionId, +1); break;
@@ -3023,7 +3600,8 @@ async function runDaemon(targetId) {
         case 'netlog': result = netlogStr(netReqBuf, args[0]); break;
         case 'inject': result = await injectStr(cdp, sessionId, args); break;
         case 'record': result = await recordStr(cdp, sessionId, args, refMap); break;
-        case 'cascade': result = await cascadeStr(cdp, sessionId, args[0], args[1], refMap); break;
+        case 'cascade': result = await cascadeStr(cdp, sessionId, args[0], args[1], refMap, refState); break;
+        case 'dismiss-modal': case 'dismissmodal': result = await actionFeedback(await dismissModalStr(cdp, sessionId)); break;
         case 'evalraw': result = await evalRawStr(cdp, sessionId, args[0], args[1]); break;
         case 'batch': {
           let commands;
@@ -3184,8 +3762,8 @@ function sendCommand(conn, req) {
     };
 
     const onError = (error) => settle(() => reject(error));
-    const onEnd = () => settle(() => reject(new Error('Connection closed before response')));
-    const onClose = () => settle(() => reject(new Error('Connection closed before response')));
+    const onEnd = () => settle(() => reject(new Error(`Connection closed before response. The daemon for this tab may have crashed or exited (idle timeout, page closed, or browser disconnect). Re-run "perceive <target>" to restart it; check ${RUNTIME_DIR} for stale sockets if this repeats.`)));
+    const onClose = () => settle(() => reject(new Error(`Connection closed before response. The daemon for this tab may have crashed or exited (idle timeout, page closed, or browser disconnect). Re-run "perceive <target>" to restart it; check ${RUNTIME_DIR} for stale sockets if this repeats.`)));
 
     const timer = setTimeout(() => {
       settle(() => { conn.destroy(); reject(new Error(`IPC timeout: command "${req.cmd}" took longer than ${IPC_TIMEOUT / 1000}s`)); });
@@ -3317,6 +3895,12 @@ Usage: cdp <command> [args]
                                     No target required. Exits 1 if any check FAILs.
   open  [url]                       Open a new tab (default: about:blank)
                                     Note: each new tab triggers a fresh "Allow debugging?" prompt
+  spawn-debug-browser [browser] [--port N] [--url URL] [--profile-dir DIR] [--exe PATH]
+                                    Launch an isolated debug profile (browser: edge|chrome|brave; default edge, port 9222).
+                                    Uses --remote-debugging-port + --user-data-dir; does not touch your main profile.
+                                    "spawn" is a short alias.
+  dismiss-modal <target>            Close common dialog/modal patterns safely (close button, then Escape) —
+                                    avoids triggering background shortcuts the way a bare "press Space" does.
   stop  [target]                    Stop daemon(s)
 
 ACTION FEEDBACK
@@ -3364,6 +3948,7 @@ const NEEDS_TARGET = new Set([
   'net','network','click','clickxy','type','press','scroll','hover','waitfor','loadall','fill','select','fullshot','scanshot','styles','cookies','cookieset','cookiedel','evalraw','status','console','summary','perceive','elshot','batch','dialog','viewport','upload',
   'text','table','back','forward','reload','closetab','netlog',
   'inject','cascade','record','flow',
+  'dismiss-modal','dismissmodal',
 ]);
 
 async function main() {
@@ -3466,6 +4051,18 @@ async function main() {
     process.exit(out.includes('Not ready') ? 1 : 0);
   }
 
+  // spawn-debug-browser / spawn — launch isolated debug profile (no target)
+  if (cmd === 'spawn-debug-browser' || cmd === 'spawn') {
+    try {
+      const out = await spawnDebugBrowserStr(args);
+      console.log(out);
+      process.exit(0);
+    } catch (e) {
+      console.error('Error:', e.message);
+      process.exit(1);
+    }
+  }
+
   // Page commands — need target prefix
   if (!NEEDS_TARGET.has(cmd)) {
     console.error(`Unknown command: ${cmd}\n`);
@@ -3565,11 +4162,18 @@ export const __test__ = process.env.NODE_ENV === 'test' ? {
   // Command implementations
   formatPageList, dialogStr, netlogStr, injectStr, cascadeStr, recordStr, parseRecordArgs,
   evalStr, navStr, clickStr, fillStr, waitForStr, snapshotStr,
+  // 3y-mud feedback additions
+  KEY_MAP, PUNCT_KEY_MAP, SHIFTED_PUNCT_KEY_MAP, keyForPress, pressStr,
+  formatUnknownRefError, resolveRefNode, formatRefRect,
+  parseTextArgs, textPageScript, textStr,
+  parseShotArgs, shotStr,
+  parseSpawnDebugBrowserArgs, detectBrowserPath, buildSpawnDebugBrowserPlan, spawnDebugBrowserStr,
+  dismissModalStr, dismissModalScript,
   // Screenshot
   captureScreenshot, screencastFallback,
   resetScreenshotTier, getScreenshotTier, SCREENSHOT_TIMEOUT,
   // Constants
-  KEY_MAP, ENRICHED_ROLES, INTERACTIVE_ROLES,
+  ENRICHED_ROLES, INTERACTIVE_ROLES,
   // Cascade source mapping
   decodeVLQ, mapLineToSource, mapInlineSourceMap, stripVitePathQuery, mapStyleSource,
   // Batch / flow / doctor

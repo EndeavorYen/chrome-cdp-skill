@@ -16,7 +16,8 @@
   "license": "MIT",
   "scripts": {
     "test": "NODE_ENV=test vitest run",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "smoke:live": "node scripts/live-smoke.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

@@ -407,6 +407,8 @@ describe('parsePerceiveArgs', () => {
       interactive: false,
       maxDepth: Infinity,
       cursorInteractive: false,
+      keepRefs: false,
+      last: null,
     });
   });
 
@@ -467,6 +469,8 @@ describe('parsePerceiveArgs', () => {
       exclude: 'nav',
       maxDepth: 2,
       cursorInteractive: true,
+      keepRefs: false,
+      last: null,
     });
   });
 
@@ -3259,5 +3263,580 @@ describe('doctorStr', () => {
     });
     expect(out).toContain('Not ready');
     expect(out).toMatch(/\[FAIL\] CDP/);
+  });
+});
+
+// =========================================================================
+// 3y-Mud feedback fixes — keyForPress + single-character press
+// =========================================================================
+
+describe('keyForPress (3y-mud feedback)', () => {
+  const { keyForPress } = T;
+
+  it('maps lowercase letters to KeyX with the right keyCode', () => {
+    expect(keyForPress('c')).toEqual({ key: 'c', code: 'KeyC', keyCode: 67 });
+    expect(keyForPress('z')).toEqual({ key: 'z', code: 'KeyZ', keyCode: 90 });
+  });
+
+  it('maps uppercase letters preserving the visible key + shift modifier', () => {
+    expect(keyForPress('C')).toEqual({ key: 'C', code: 'KeyC', keyCode: 67, shift: true });
+  });
+
+  it('maps digits to DigitN', () => {
+    expect(keyForPress('1')).toEqual({ key: '1', code: 'Digit1', keyCode: 49 });
+    expect(keyForPress('9')).toEqual({ key: '9', code: 'Digit9', keyCode: 57 });
+  });
+
+  it('keeps named keys case-insensitive', () => {
+    expect(keyForPress('Enter').code).toBe('Enter');
+    expect(keyForPress('escape').code).toBe('Escape');
+  });
+
+  it('maps common punctuation', () => {
+    expect(keyForPress('-').code).toBe('Minus');
+    expect(keyForPress('/').code).toBe('Slash');
+  });
+
+  it('maps shifted punctuation with shift modifier', () => {
+    expect(keyForPress('?')).toEqual({ key: '?', code: 'Slash', keyCode: 191, shift: true });
+    expect(keyForPress('!')).toEqual({ key: '!', code: 'Digit1', keyCode: 49, shift: true });
+    expect(keyForPress(':')).toEqual({ key: ':', code: 'Semicolon', keyCode: 186, shift: true });
+  });
+
+  it('returns null for unsupported multi-character input', () => {
+    expect(keyForPress('hello')).toBeNull();
+    expect(keyForPress('')).toBeNull();
+  });
+});
+
+describe('pressStr — single-character keys', () => {
+  const { pressStr } = T;
+
+  it('dispatches keyDown + char + keyUp for letter keys', async () => {
+    const cdp = createMockCDP({ 'Input.dispatchKeyEvent': () => ({}) });
+    const out = await pressStr(cdp, 'sid1', 'c');
+    expect(out).toContain('Pressed c');
+    const types = cdp.calls.filter(c => c.method === 'Input.dispatchKeyEvent').map(c => c.params.type);
+    expect(types).toContain('keyDown');
+    expect(types).toContain('char');
+    expect(types).toContain('keyUp');
+  });
+
+  it('rejects unsupported keys with an actionable error mentioning single characters', async () => {
+    const cdp = createMockCDP({});
+    await expect(pressStr(cdp, 'sid1', 'F13'))
+      .rejects.toThrow(/single characters|Unknown key/);
+  });
+});
+
+// =========================================================================
+// formatUnknownRefError — actionable stale-ref errors
+// =========================================================================
+
+describe('formatUnknownRefError', () => {
+  const { formatUnknownRefError } = T;
+
+  it('explains never-created refs (daemon-start)', () => {
+    const msg = formatUnknownRefError('@31', { generation: 0, invalidationReason: 'daemon-start' });
+    expect(msg).toMatch(/No refs have been assigned/);
+    expect(msg).toMatch(/perceive/);
+  });
+
+  it('explains navigation invalidation', () => {
+    const msg = formatUnknownRefError('@31', { generation: 2, invalidationReason: 'navigation' });
+    expect(msg).toMatch(/navigated|reloaded/);
+    expect(msg).toMatch(/stable CSS selector/);
+  });
+
+  it('explains DOM-mutation invalidation and suggests stable selectors', () => {
+    const msg = formatUnknownRefError('@31', { generation: 2, invalidationReason: 'dom-mutation' });
+    expect(msg).toMatch(/DOM changes/);
+    expect(msg).toMatch(/stable CSS selector/);
+  });
+
+  it('falls back to a generic message when state is unset', () => {
+    const msg = formatUnknownRefError('@5', {});
+    expect(msg).toMatch(/Unknown ref: @5/);
+  });
+});
+
+describe('resolveRefNode stale backend handling', () => {
+  const { resolveRefNode } = T;
+
+  it('classifies DOM-mutation stale refs when backend node resolution fails', async () => {
+    const refMap = new Map([[31, 12345]]);
+    const refState = { generation: 1, invalidationReason: null };
+    const cdp = { send: async () => { throw new Error('No node with given id'); } };
+    await expect(resolveRefNode(cdp, 'sid', refMap, '@31', refState))
+      .rejects.toThrow(/DOM changes/);
+    expect(refState.invalidationReason).toBe('dom-mutation');
+    expect(refMap.has(31)).toBe(false);
+  });
+});
+
+// =========================================================================
+// formatRefRect — fixed/sticky annotations
+// =========================================================================
+
+describe('formatRefRect', () => {
+  const { formatRefRect } = T;
+
+  it('formats plain rects without position tag', () => {
+    expect(formatRefRect({ x: 10, y: 20, w: 200, h: 30 })).toBe('(10,20 200×30)');
+  });
+
+  it('marks fixed elements explicitly', () => {
+    expect(formatRefRect({ x: 1543, y: 259, w: 266, h: 52, position: 'fixed' }))
+      .toBe('(1543,259 266×52, fixed)');
+  });
+
+  it('marks sticky elements explicitly', () => {
+    expect(formatRefRect({ x: 0, y: 0, w: 100, h: 48, position: 'sticky' }))
+      .toBe('(0,0 100×48, sticky)');
+  });
+
+  it('omits position for static/relative/absolute', () => {
+    expect(formatRefRect({ x: 0, y: 0, w: 1, h: 1, position: 'absolute' }))
+      .toBe('(0,0 1×1)');
+    expect(formatRefRect({ x: 0, y: 0, w: 1, h: 1, position: 'static' }))
+      .toBe('(0,0 1×1)');
+  });
+});
+
+// =========================================================================
+// parseTextArgs / textPageScript / textStr — fallback chain + --auto
+// =========================================================================
+
+describe('parseTextArgs', () => {
+  const { parseTextArgs } = T;
+
+  it('parses a single CSS selector', () => {
+    expect(parseTextArgs(['main']).selectors).toEqual(['main']);
+  });
+
+  it('parses comma fallback selectors into an ordered chain', () => {
+    expect(parseTextArgs(['main, [role=main], #app .main']).selectors)
+      .toEqual(['main', '[role=main]', '#app .main']);
+  });
+
+  it('parses --auto', () => {
+    const opts = parseTextArgs(['--auto']);
+    expect(opts.auto).toBe(true);
+    expect(opts.selectors).toEqual([]);
+  });
+
+  it('parses --auto with --exclude', () => {
+    const opts = parseTextArgs(['--auto', '--exclude', 'nav,.sidebar']);
+    expect(opts.auto).toBe(true);
+    expect(opts.exclude).toBe('nav,.sidebar');
+  });
+});
+
+describe('textPageScript', () => {
+  const { textPageScript } = T;
+
+  it('embeds the selector chain into the script', () => {
+    const script = textPageScript({ selectors: ['main', '[role=main]'] });
+    expect(script).toContain('"main"');
+    expect(script).toContain('"[role=main]"');
+  });
+
+  it('strips nav/aside/footer when auto=true', () => {
+    const script = textPageScript({ selectors: [], auto: true });
+    expect(script).toContain('nav');
+    expect(script).toContain('aside');
+    expect(script).toContain('footer');
+  });
+
+  it('embeds extra exclude selectors when provided', () => {
+    const script = textPageScript({ selectors: [], auto: true, exclude: '.sidebar,.banner' });
+    expect(script).toContain('.sidebar');
+    expect(script).toContain('.banner');
+  });
+});
+
+describe('textStr', () => {
+  const { textStr } = T;
+
+  it('returns extracted text from the first matching selector', async () => {
+    const cdp = createMockCDP({
+      'Runtime.evaluate': () => ({ result: { value: JSON.stringify({ ok: true, sel: 'main', text: 'Hello' }) } }),
+    });
+    const out = await textStr(cdp, 'sid1', ['main, [role=main]']);
+    expect(out).toBe('Hello');
+  });
+
+  it('throws an actionable error when no selector matches', async () => {
+    const cdp = createMockCDP({
+      'Runtime.evaluate': () => ({ result: { value: JSON.stringify({ ok: false, tried: ['main', '[role=main]'] }) } }),
+    });
+    await expect(textStr(cdp, 'sid1', ['main, [role=main]']))
+      .rejects.toThrow(/Tried: main, \[role=main\]/);
+  });
+
+  it('accepts legacy single-string call form', async () => {
+    const cdp = createMockCDP({
+      'Runtime.evaluate': () => ({ result: { value: JSON.stringify({ ok: true, sel: 'body', text: 'X' }) } }),
+    });
+    expect(await textStr(cdp, 'sid1', 'main')).toBe('X');
+  });
+});
+
+// =========================================================================
+// parseShotArgs / shotStr — saved path first, --quiet/--verbose
+// =========================================================================
+
+describe('parseShotArgs', () => {
+  const { parseShotArgs } = T;
+
+  it('returns defaults for empty args', () => {
+    expect(parseShotArgs([])).toEqual({ filePath: null, quiet: false, verbose: false });
+  });
+
+  it('parses --quiet', () => {
+    expect(parseShotArgs(['--quiet']).quiet).toBe(true);
+    expect(parseShotArgs(['-q']).quiet).toBe(true);
+  });
+
+  it('parses --verbose', () => {
+    expect(parseShotArgs(['--verbose']).verbose).toBe(true);
+  });
+
+  it('captures a positional file path', () => {
+    expect(parseShotArgs(['/tmp/a.png']).filePath).toBe('/tmp/a.png');
+  });
+
+  it('combines path with --quiet', () => {
+    expect(parseShotArgs(['/tmp/a.png', '--quiet']))
+      .toEqual({ filePath: '/tmp/a.png', quiet: true, verbose: false });
+  });
+});
+
+describe('shotStr', () => {
+  const { shotStr } = T;
+  beforeEach(() => { T.resetScreenshotTier(); });
+
+  it('puts the saved path on the first line by default', async () => {
+    const cdp = createMockCDP({
+      'Runtime.evaluate': () => ({ result: { value: 1 } }),
+      'Page.captureScreenshot': () => ({ data: Buffer.from('PNG').toString('base64') }),
+    });
+    // Use OS temp file path to avoid touching the real RUNTIME_DIR
+    const path = `/tmp/cdp-test-${Date.now()}.png`;
+    const out = await shotStr(cdp, 'sid1', path, 'TARGETID', { quiet: false });
+    expect(out.split('\n')[0]).toBe(path);
+  });
+
+  it('with --quiet returns ONLY the saved path', async () => {
+    const cdp = createMockCDP({
+      'Runtime.evaluate': () => ({ result: { value: 2 } }),
+      'Page.captureScreenshot': () => ({ data: Buffer.from('PNG').toString('base64') }),
+    });
+    const path = `/tmp/cdp-test-quiet-${Date.now()}.png`;
+    const out = await shotStr(cdp, 'sid1', path, 'X', { quiet: true });
+    expect(out.split('\n')).toEqual([path]);
+  });
+
+  it('with --verbose includes the full DPR coordinate-mapping tutorial', async () => {
+    const cdp = createMockCDP({
+      'Runtime.evaluate': () => ({ result: { value: 2 } }),
+      'Page.captureScreenshot': () => ({ data: Buffer.from('PNG').toString('base64') }),
+    });
+    const path = `/tmp/cdp-test-verbose-${Date.now()}.png`;
+    const out = await shotStr(cdp, 'sid1', path, 'X', { verbose: true });
+    expect(out).toMatch(/Coordinate mapping/);
+    expect(out).toMatch(/clickxy/);
+  });
+});
+
+// =========================================================================
+// waitfor --any-of and --selector-stable
+// =========================================================================
+
+describe('waitForStr --any-of', () => {
+  const { waitForStr } = T;
+
+  it('returns immediately when one of the alternatives is present', async () => {
+    const cdp = createMockCDP({
+      'Runtime.evaluate': () => ({ result: { value: JSON.stringify({ matched: 'win', snippet: '... you win ...', len: 200 }) } }),
+    });
+    const out = await waitForStr(cdp, 'sid1', ['--any-of', 'win|lose|escape', '5000'], new Map());
+    expect(out).toMatch(/Found "win"/);
+  });
+
+  it('throws when no alternative appears before timeout', async () => {
+    const cdp = createMockCDP({
+      'Runtime.evaluate': () => ({ result: { value: 'null' } }),
+    });
+    await expect(waitForStr(cdp, 'sid1', ['--any-of', 'a|b|c', '500'], new Map()))
+      .rejects.toThrow(/Timeout: any of/);
+  });
+
+  it('rejects empty patterns', async () => {
+    const cdp = createMockCDP({});
+    await expect(waitForStr(cdp, 'sid1', ['--any-of', '|', '500'], new Map()))
+      .rejects.toThrow(/at least one alternative/);
+  });
+});
+
+describe('waitForStr --selector-stable', () => {
+  const { waitForStr } = T;
+
+  it('throws when no selector is given', async () => {
+    const cdp = createMockCDP({});
+    await expect(waitForStr(cdp, 'sid1', ['--selector-stable'], new Map()))
+      .rejects.toThrow(/Selector required/);
+  });
+
+  it('returns once the selector content has stabilised', async () => {
+    let calls = 0;
+    const cdp = createMockCDP({
+      'Runtime.evaluate': () => {
+        calls++;
+        // Always returns the same hash → considered stable after 2 polls.
+        return { result: { value: JSON.stringify({ len: 10, hash: 'abc' }) } };
+      },
+    });
+    const out = await waitForStr(cdp, 'sid1', ['--selector-stable', '.combat-log', '50', '5000'], new Map());
+    expect(out).toMatch(/stable for 50ms/);
+    expect(calls).toBeGreaterThanOrEqual(2);
+  });
+
+  it('times out when the selector keeps changing', async () => {
+    let n = 0;
+    const cdp = createMockCDP({
+      'Runtime.evaluate': () => ({ result: { value: JSON.stringify({ len: 10, hash: 'h' + (n++) }) } }),
+    });
+    await expect(waitForStr(cdp, 'sid1', ['--selector-stable', '.x', '300', '500'], new Map()))
+      .rejects.toThrow(/did not stabilise/);
+  });
+});
+
+// =========================================================================
+// spawn-debug-browser arg parsing + plan
+// =========================================================================
+
+describe('parseSpawnDebugBrowserArgs', () => {
+  const { parseSpawnDebugBrowserArgs } = T;
+
+  it('defaults to edge on port 9222 with a temp profile', () => {
+    const opts = parseSpawnDebugBrowserArgs([], { TMPDIR: '/tmp' });
+    expect(opts.browser).toBe('edge');
+    expect(opts.port).toBe(9222);
+    expect(opts.profileDir).toBe('/tmp/chrome-cdp-ex-edge-debug-profile-9222');
+  });
+
+  it('parses browser, port, url, and profile-dir together', () => {
+    const opts = parseSpawnDebugBrowserArgs(
+      ['chrome', '--port', '9333', '--url', 'http://127.0.0.1:3000', '--profile-dir', '/tmp/p'],
+      { TMPDIR: '/tmp' }
+    );
+    expect(opts).toEqual({
+      browser: 'chrome',
+      port: 9333,
+      url: 'http://127.0.0.1:3000',
+      profileDir: '/tmp/p',
+      executable: null,
+    });
+  });
+
+  it('normalises browser aliases', () => {
+    expect(parseSpawnDebugBrowserArgs(['msedge'], { TMPDIR: '/tmp' }).browser).toBe('edge');
+    expect(parseSpawnDebugBrowserArgs(['google-chrome'], { TMPDIR: '/tmp' }).browser).toBe('chrome');
+    expect(parseSpawnDebugBrowserArgs(['chromium'], { TMPDIR: '/tmp' }).browser).toBe('chrome');
+  });
+
+  it('honours CDP_DEBUG_BROWSER and explicit executable path', () => {
+    const opts = parseSpawnDebugBrowserArgs(['--exe', '/opt/browser'], { TMPDIR: '/tmp', CDP_DEBUG_BROWSER: 'chrome' });
+    expect(opts.browser).toBe('chrome');
+    expect(opts.executable).toBe('/opt/browser');
+  });
+});
+
+describe('detectBrowserPath / buildSpawnDebugBrowserPlan', () => {
+  const { detectBrowserPath, buildSpawnDebugBrowserPlan } = T;
+
+  it('returns the first existing candidate path', () => {
+    const fs = { existsSync: (p) => p === '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge' };
+    expect(detectBrowserPath('edge', 'darwin', fs)).toBe('/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge');
+  });
+
+  it('returns null when nothing exists', () => {
+    const fs = { existsSync: () => false };
+    expect(detectBrowserPath('chrome', 'darwin', fs, { PATH: '' })).toBeNull();
+  });
+
+  it('falls back to browser executables on PATH', () => {
+    const fs = { existsSync: (p) => p === '/opt/bin/google-chrome' };
+    expect(detectBrowserPath('chrome', 'linux', fs, { PATH: '/usr/bin:/opt/bin' })).toBe('/opt/bin/google-chrome');
+  });
+
+  it('builds a plan with --remote-debugging-port and --user-data-dir', () => {
+    const fs = { existsSync: () => true };
+    const opts = { browser: 'edge', port: 9222, url: null, profileDir: '/tmp/p' };
+    const plan = buildSpawnDebugBrowserPlan(opts, 'darwin', fs);
+    expect(plan.args).toContain('--remote-debugging-port=9222');
+    expect(plan.args).toContain('--user-data-dir=/tmp/p');
+    expect(plan.args).toContain('--no-first-run');
+  });
+
+  it('throws an actionable error when the executable is missing', () => {
+    const fs = { existsSync: () => false };
+    expect(() => buildSpawnDebugBrowserPlan({ browser: 'edge', port: 9222, profileDir: '/tmp/p' }, 'darwin', fs, { PATH: '' }))
+      .toThrow(/Use --exe/);
+  });
+});
+
+describe('spawnDebugBrowserStr', () => {
+  const { spawnDebugBrowserStr } = T;
+
+  it('reports the launch command and next-step usage', async () => {
+    const calls = [];
+    const fakeSpawn = (exe, args, _opts) => {
+      calls.push({ exe, args });
+      return { pid: 4242, unref() {} };
+    };
+    const fs = { existsSync: () => true, mkdirSync: () => {} };
+    const out = await spawnDebugBrowserStr(['edge', '--port', '9311'], { TMPDIR: '/tmp' }, { fs, spawn: fakeSpawn, platform: 'darwin' });
+    expect(out).toContain('Spawned edge debug profile on CDP_PORT=9311');
+    expect(out).toContain('Next: CDP_PORT=9311');
+    expect(calls[0].args).toContain('--remote-debugging-port=9311');
+  });
+});
+
+// =========================================================================
+// dismiss-modal helper script + dispatch
+// =========================================================================
+
+describe('dismissModalScript', () => {
+  const { dismissModalScript } = T;
+
+  it('returns a self-invoking IIFE that looks for dialogs', () => {
+    const script = dismissModalScript();
+    expect(typeof script).toBe('string');
+    expect(script).toMatch(/role="dialog"/);
+    expect(script).toMatch(/aria-modal/);
+  });
+});
+
+describe('dismissModalStr', () => {
+  const { dismissModalStr } = T;
+
+  it('reports success when the page-side script clicks a close button', async () => {
+    const cdp = createMockCDP({
+      'Runtime.evaluate': () => ({ result: { value: JSON.stringify({ ok: true, action: 'click', label: 'close', sel: 'div' }) } }),
+    });
+    const out = await dismissModalStr(cdp, 'sid1');
+    expect(out).toMatch(/Dismissed modal via close button/);
+  });
+
+  it('returns a friendly message when no dialog is visible', async () => {
+    const cdp = createMockCDP({
+      'Runtime.evaluate': () => ({ result: { value: JSON.stringify({ ok: false, reason: 'no-dialog' }) } }),
+    });
+    const out = await dismissModalStr(cdp, 'sid1');
+    expect(out).toMatch(/No visible modal/);
+  });
+
+  it('falls back to Escape when no close button is found', async () => {
+    let evalCalls = 0;
+    const cdp = createMockCDP({
+      'Runtime.evaluate': () => {
+        evalCalls++;
+        return { result: { value: JSON.stringify({ ok: false, reason: 'no-close-button', dialogs: 1 }) } };
+      },
+      'Input.dispatchKeyEvent': () => ({}),
+    });
+    const out = await dismissModalStr(cdp, 'sid1');
+    expect(out).toMatch(/sent Escape as fallback/);
+    const keyEvents = cdp.calls.filter(c => c.method === 'Input.dispatchKeyEvent');
+    expect(keyEvents.length).toBeGreaterThan(0);
+    expect(evalCalls).toBeGreaterThan(0);
+  });
+});
+
+// =========================================================================
+// formatPageList — about:blank labelling (P2 polish)
+// =========================================================================
+
+describe('formatPageList about:blank', () => {
+  it('labels about:blank pages with "(blank tab)" so agents can still target them', () => {
+    const out = T.formatPageList([
+      { targetId: 'ABCDEF1234567890', type: 'page', title: '', url: 'about:blank' },
+    ]);
+    expect(out).toContain('(blank tab)');
+    expect(out).toContain('about:blank');
+    expect(out).toContain('ABCDEF12');
+  });
+});
+
+// =========================================================================
+// buildPerceiveTree — --keep-refs / --last truncation controls
+// =========================================================================
+
+describe('buildPerceiveTree truncation controls', () => {
+  const { buildPerceiveTree } = T;
+  const axNode = (id, role, name, opts = {}) => ({
+    nodeId: id,
+    role: { value: role },
+    name: { value: name },
+    ...(opts.parentId ? { parentId: opts.parentId } : {}),
+    ...(opts.childIds ? { childIds: opts.childIds } : {}),
+    ...(opts.backendDOMNodeId ? { backendDOMNodeId: opts.backendDOMNodeId } : {}),
+  });
+
+  it('keeps interactive @ref lines even when --last truncates static text', () => {
+    const nodes = [axNode('root', 'WebArea', 'Page')];
+    const childIds = [];
+    for (let i = 0; i < 60; i++) {
+      const id = `t${i}`;
+      nodes.push(axNode(id, 'StaticText', `entry ${i}`, { parentId: 'root' }));
+      childIds.push(id);
+    }
+    nodes.push(axNode('btn', 'button', 'Action', { parentId: 'root', backendDOMNodeId: 999 }));
+    childIds.push('btn');
+    nodes[0].childIds = childIds;
+
+    const refMap = new Map();
+    const { treeLines } = buildPerceiveTree(nodes, { layoutMap: {}, styleHints: {} }, refMap, { last: 5 });
+    const out = treeLines.join('\n');
+    // Ref line for the button always survives
+    expect(out).toMatch(/Action/);
+    expect(out).toMatch(/@1/);
+    // Truncation notice is present
+    expect(out).toMatch(/earlier text node\(s\) omitted/);
+  });
+
+  it('passes through unmodified when --last is not set', () => {
+    const nodes = [
+      axNode('root', 'WebArea', 'Page'),
+      axNode('s1', 'StaticText', 'a', { parentId: 'root' }),
+      axNode('s2', 'StaticText', 'b', { parentId: 'root' }),
+    ];
+    nodes[0].childIds = ['s1', 's2'];
+    const refMap = new Map();
+    const { treeLines } = buildPerceiveTree(nodes, { layoutMap: {}, styleHints: {} }, refMap, {});
+    const out = treeLines.join('\n');
+    expect(out).toMatch(/a/);
+    expect(out).toMatch(/b/);
+    expect(out).not.toMatch(/omitted/);
+  });
+});
+
+// =========================================================================
+// parsePerceiveArgs — --keep-refs / --last
+// =========================================================================
+
+describe('parsePerceiveArgs (keep-refs/last)', () => {
+  it('parses --keep-refs', () => {
+    expect(T.parsePerceiveArgs(['--keep-refs']).keepRefs).toBe(true);
+  });
+
+  it('parses --last with a numeric argument', () => {
+    expect(T.parsePerceiveArgs(['--last', '20']).last).toBe(20);
+  });
+
+  it('treats --last with a non-numeric argument as null', () => {
+    expect(T.parsePerceiveArgs(['--last', 'xyz']).last).toBeNull();
   });
 });

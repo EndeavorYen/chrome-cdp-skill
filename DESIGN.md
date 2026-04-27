@@ -4,6 +4,20 @@
 > Each feature addresses a **genuine capability gap** that `eval` or
 > existing commands cannot solve.
 
+## Current Status (2026-04 long-session feedback slice)
+
+| Area | Status | Notes |
+|---|---|---|
+| `inject` | Shipped | Keep zero-dependency, URL validation, tracked removal. |
+| `cascade` | Shipped / best-effort | Source locations depend on CDP/source maps; use `styles` for reliable computed values. |
+| `record` | Shipped | Useful for cause→effect and page-settle timelines. |
+| `spawn-debug-browser` | Shipped | Isolated debug profile path for macOS/Edge/Chrome/Brave when remote-debugging toggle is unavailable. |
+| Long-session robustness | Shipped in repair slice | Stale-ref diagnostics, single-char `press`, viewport/fixed coords, text fallback/auto, semantic waits, safe modal dismissal, script-friendly shots. |
+| `emulate`, `frame`, `components` | Future | Do not present old implementation sketches below as current shipped behavior. |
+| Replay/checkpoint/session reports | Future | Larger stateful workflow primitives; intentionally out of current repair slice. |
+
+The sections below are design notes and historical sketches. README/SKILL command references are the source of truth for currently shipped commands.
+
 ---
 
 ## Three Dimensions

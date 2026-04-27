@@ -5,6 +5,16 @@ description: "Your EYES into the user's live Chrome browser and Electron apps. T
 
 # Chrome CDP
 
+## TL;DR — 90% workflow
+
+1. **Discover tabs:** `cdp list`. If empty / no CDP available, run `cdp doctor` and either toggle remote debugging in Chrome's UI **or, with user consent, run `cdp spawn-debug-browser edge --port 9222 --url <url>`** — that launches an isolated debug profile that does not touch the user's main browser session.
+2. **Observe:** `cdp perceive <target> -C -d 8` — structure, refs, viewport CSS coordinates (fixed/sticky elements are tagged), console health.
+3. **Interact:** `cdp click|fill|press <target> @ref|selector` — `@ref` is best for the immediate next step after `perceive`; **use a stable CSS selector for long batch/loop scripts** (refs are short-lived handles).
+4. **Extract content:** `cdp text <target> --auto` (heuristic main-content extraction) or `cdp text <target> "main, [role=main], #app .main"` (fallback chain).
+5. **Visual evidence:** `cdp shot <target> /tmp/x.png --quiet` (saved path on first line) or `cdp shot <target> --annotate` for a labeled @ref overlay.
+
+For long-session game / animation work also reach for `cdp waitfor <target> --any-of "win|lose|escape" 60000 --scope ".combat-log"` and `cdp waitfor <target> --selector-stable ".combat-log" 3000 60000`. To close MOTD-style modals safely without firing background shortcuts, use `cdp dismiss-modal <target>` (it prefers an explicit close button, falls back to Escape — never `press Space`).
+
 ## When invoked directly (`/chrome-cdp-ex`)
 
 **Take action immediately — do not just read this document.**
@@ -61,10 +71,18 @@ After modifying code or interacting with a page, choose your verification tool b
 
 ## Prerequisites
 
-- Chrome (or Chromium, Brave, Edge, Vivaldi) with remote debugging enabled: open `chrome://inspect/#remote-debugging` and toggle the switch. This is sufficient — do NOT suggest restarting Chrome with `--remote-debugging-port`.
-- Node.js 22+ (uses built-in WebSocket)
-- **Electron apps**: set `CDP_PORT=<port>` (the app must be launched with `--remote-debugging-port=<port>` or `app.commandLine.appendSwitch('remote-debugging-port', '<port>')`)
-- If your browser's `DevToolsActivePort` is in a non-standard location, set `CDP_PORT_FILE` to its full path
+Pick one — listed in the order to try them on a fresh machine:
+
+1. **Existing browser session** — open `chrome://inspect/#remote-debugging` (or `edge://inspect`) in Chrome / Chromium / Brave / Edge / Vivaldi and toggle the remote-debugging switch. Cleanest path when the toggle is reachable.
+2. **Isolated debug profile (when the toggle path doesn't work, with user consent)** — `node skills/chrome-cdp-ex/scripts/cdp.mjs spawn-debug-browser edge --port 9222 --url https://example.com` launches a *separate* user-data-dir + `--remote-debugging-port` so you do not touch the user's main browser. macOS, Linux, and Windows browser paths are auto-detected; Linux also falls back to common browser names on `$PATH`, and `--exe /path/to/browser` handles non-standard installs. The disposable profile is at `/tmp/chrome-cdp-ex-<browser>-debug-profile-<port>`. Always confirm with the user before spawning.
+3. **Electron apps** — set `CDP_PORT=<port>` (the app must be launched with `--remote-debugging-port=<port>` or `app.commandLine.appendSwitch('remote-debugging-port', '<port>')`).
+
+Other requirements:
+
+- Node.js 22+ (uses built-in WebSocket).
+- If your browser's `DevToolsActivePort` is in a non-standard location, set `CDP_PORT_FILE` to its full path.
+
+> **macOS / Edge note:** the previous skill text said never to suggest `--remote-debugging-port`. That advice was too absolute — when Edge is fresh-installed and `edge://inspect` has never been touched, the only realistic non-invasive option is the `spawn-debug-browser` helper above. It is safe because it uses a disposable profile.
 
 ### Electron screenshot notes
 
@@ -737,6 +755,69 @@ scripts/cdp.mjs text <target> "main"              # scope to main content area
 3. `perceive <target> --diff` or `elshot <target> @ref` — verify the visual effect
 4. Iterate: `inject <target> --remove` → `inject <target> --css "..."` for each revision
 5. Once satisfied, apply the CSS to the actual source file
+
+## Long-session / game / animation recipes
+
+### Stale `@ref` lifecycle
+
+Refs are short-lived handles assigned by `perceive`. They become invalid when:
+
+- the page navigates or fully reloads (Vite HMR included),
+- a large DOM rewrite replaces the labelled element,
+- the daemon restarts (idle timeout, crash, or fresh `_daemon` spawn).
+
+The error you'll see is now classified, e.g. `Unknown ref: @31. Refs were cleared because the page navigated/reloaded after the last perceive (e.g. Vite HMR or in-app routing). Run "perceive" to refresh refs, or use a stable CSS selector for long loops.` Honour the suggestion — for any loop longer than 1–2 immediate actions, prefer a stable CSS selector like `input[placeholder*="look"]` over `@31`.
+
+### Wait primitives for combat / chat / animations
+
+```bash
+# 1) Multi-keyword OR ("won, lost, escaped"):
+cdp waitfor <t> --any-of "戰鬥勝利|戰敗|逃跑成功" 60000 --scope ".combat-log"
+
+# 2) Wait until DOM under a selector stops changing for 3s (event log settle):
+cdp waitfor <t> --selector-stable ".combat-log" 3000 60000
+
+# 3) Capture cause-and-effect timeline around an action:
+cdp record <t> --action click @5 --until "dom stable"
+```
+
+### Modal dismissal that does NOT fire underlying shortcuts
+
+```bash
+cdp dismiss-modal <t>   # clicks visible close button, falls back to Escape
+```
+
+The reviewer used `press Space` to dismiss an MOTD and accidentally triggered the underlying game's `space` hotkey. `dismiss-modal` only sends Escape if no close button is found — `Space` is never used.
+
+### Long event-log perception
+
+```bash
+cdp perceive <t> -i --keep-refs --last 20   # keep all refs + last 20 text rows
+cdp perceive <t> -s ".combat-log" -d 6      # scope to the log subtree
+```
+
+`--last N` truncates only static-text / paragraph rows; landmark and interactive `@ref` lines are always preserved.
+
+### Screenshot in scripts
+
+```bash
+cdp shot <t> /tmp/x.png --quiet     # only the saved path is printed (good for `head -1`)
+cdp shot <t> /tmp/x.png             # default: path on line 1, short DPR hint after
+cdp shot <t> /tmp/x.png --verbose   # path + full coordinate-mapping tutorial
+cdp shot <t> --annotate             # red-box overlay using the most recent perceive's @refs
+```
+
+### `@c` / cursor-interactive elements
+
+```bash
+cdp perceive <t> -C   # also lists non-ARIA clickables (cursor:pointer, onclick, tabindex)
+```
+
+These get `@c1`, `@c2`… handles. Useful for SPAs that wrap clickable behaviour on a `<div>` instead of a `<button>`.
+
+### Vite / HMR
+
+When Vite HMRs a route, `Page.frameNavigated` fires and the daemon clears its ref map automatically. The next `@ref` you try will produce the navigation-classified error. Just re-run `perceive` and continue.
 
 ## Source
 

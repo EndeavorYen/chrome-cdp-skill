@@ -143,8 +143,11 @@ mkdir -p ~/.claude/skills
 cp -r skills/chrome-cdp-ex ~/.claude/skills/
 ```
 
-3. Enable Chrome debugging at `chrome://inspect/#remote-debugging` and toggle it on.
-Do **not** restart Chrome with `--remote-debugging-port`.
+3. Connect — pick whichever path fits your machine:
+
+- **Existing browser session (preferred):** open `chrome://inspect/#remote-debugging` (or `edge://inspect`) and toggle remote debugging on. Cleanest path; touches no profile state.
+- **Isolated debug profile (when the toggle path doesn't work):** `node skills/chrome-cdp-ex/scripts/cdp.mjs spawn-debug-browser edge --port 9222 --url https://example.com`. Spawns the browser with `--remote-debugging-port` and a disposable `--user-data-dir`, leaving your main profile alone. Use `--exe /path/to/browser` for non-standard installs; Linux also falls back to common browser names on `$PATH`. Run `cdp doctor` first to confirm no port conflict.
+- **Electron app:** start it with `--remote-debugging-port=<port>` and run with `CDP_PORT=<port>`.
 
 **Requires:** Node.js 22+ (uses built-in WebSocket). Auto-detects Chrome, Chromium, Brave, Edge, and Vivaldi on macOS, Linux (including Flatpak), and Windows.
 
@@ -236,8 +239,11 @@ Tip: start with `perceive`, then use `click`/`fill`/`select`; use `status` or `c
 <summary><strong>Discovery & Lifecycle</strong></summary>
 
 ```bash
-list                               # list open tabs (shows targetId prefixes)
+list                               # list open tabs (shows targetId prefixes; about:blank is included as "(blank tab)")
 open   [url]                       # open new tab (default: about:blank)
+spawn-debug-browser [edge|chrome|brave] [--port 9222] [--url URL] [--profile-dir DIR] [--exe PATH]
+                                   # launch an isolated debug profile (disposable user-data-dir + remote-debugging-port)
+                                   # `spawn` is a short alias
 stop   [target]                    # stop daemon(s)
 closetab <target>                  # close a browser tab
 doctor / ready                     # one-call diagnostics (no target needed)
@@ -251,17 +257,24 @@ doctor / ready                     # one-call diagnostics (no target needed)
 <summary><strong>Perception</strong> - start here</summary>
 
 ```bash
-perceive <target> [flags]          # enriched AX tree with @ref indices + coordinates
+perceive <target> [flags]          # enriched AX tree with @ref indices + viewport CSS coordinates
                                    #   --diff: show only changes since last perceive
                                    #   -s <sel>: scope to CSS selector subtree
                                    #   -i: interactive elements only
                                    #   -d N: limit tree depth
                                    #   -C: include non-ARIA clickable elements
+                                   #   --keep-refs: preserve every @ref line under truncation
+                                   #   --last N: keep only the last N text/log rows
+                                   # Coords are viewport CSS pixels — same frame as clickxy.
+                                   # Fixed/sticky elements get a ", fixed"/", sticky" tag.
 snap     <target> [--full]         # accessibility tree (compact by default)
 summary  <target>                  # token-efficient overview (~100 tokens)
 status   <target>                  # URL, title + new console/exception entries
-console  <target> [--all|--errors] # console buffer (default: unread only)
-text     <target>                  # clean text content (strips scripts/styles/SVG)
+console  <target> [--all|--errors] # console buffer (default: unread only; preserves log/warn/error/debug levels)
+text     <target>                            # clean text content (strips scripts/styles/SVG)
+text     <target> "main, [role=main], #app .main"   # fallback chain — first match wins
+text     <target> --auto                     # heuristic main-content extraction (no nav/aside/footer)
+text     <target> --auto --exclude ".sidebar,.banner"
 table    <target> [selector]       # full table data extraction (tab-separated)
 ```
 
@@ -271,7 +284,12 @@ table    <target> [selector]       # full table data extraction (tab-separated)
 <summary><strong>Visual Capture</strong></summary>
 
 ```bash
-shot     <target> [file|--annotate] # viewport screenshot; --annotate overlays @ref labels
+shot     <target> [file] [--quiet|--verbose|--annotate]
+                                   # viewport screenshot. By default the saved path is on the
+                                   # FIRST line of stdout (good for `head -1`), followed by a short DPR hint.
+                                   # --quiet  print ONLY the saved path
+                                   # --verbose include the full coordinate-mapping tutorial
+                                   # --annotate overlay @ref labels onto the screenshot
 elshot   <target> <sel|@ref>        # element screenshot (auto scroll + clip, no DPR issues)
 scanshot <target>                   # segmented full-page (readable viewport-sized images)
 fullshot <target> [file]            # single full-page image (may be tiny on long pages)
@@ -302,12 +320,18 @@ cookiedel <target> <name>           # delete a cookie by name
 click   <target> <sel|@ref>         # click element (CDP mouse events, not el.click())
 clickxy <target> <x> <y>            # click at CSS pixel coordinates
 type    <target> <text>             # type at focused element (cross-origin safe)
-press   <target> <key>              # press key (Enter, Tab, Escape, etc.)
+press   <target> <key>              # press key (Enter, Tab, Escape, Backspace, Space, Arrow*,
+                                    # AND single characters a-z / A-Z / 0-9 / common punctuation)
 scroll  <target> <dir|x,y> [px]     # scroll (down/up/left/right; default 500px)
 hover   <target> <sel|@ref>         # hover (triggers :hover, tooltips)
 fill    <target> <sel|@ref> <text>  # clear field + type (form filling)
 select  <target> <selector> <val>   # select dropdown option by value
-waitfor <target> <selector> [ms]    # wait for element to appear (default 10s)
+waitfor <target> <selector> [ms]              # wait for element to appear (default 10s)
+waitfor <target> --gone <sel|@ref> [ms]       # wait for element to DISAPPEAR
+waitfor <target> --text "str" [--scope sel] [ms]  # wait for text to appear
+waitfor <target> --any-of "a|b|c" [ms] [--scope sel]  # any of the alternatives appears
+waitfor <target> --selector-stable <sel> [stableMs] [timeoutMs]  # wait until selector stops mutating
+dismiss-modal <target>              # close visible modal/dialog safely (close button, fallback Escape)
 loadall <target> <selector> [ms]    # click "load more" until gone
 upload  <target> <selector> <paths> # upload file(s) to <input type="file">
 dialog  <target> [accept|dismiss]   # dialog history; set auto-accept or auto-dismiss
