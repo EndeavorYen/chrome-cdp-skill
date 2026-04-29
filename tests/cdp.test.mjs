@@ -9,7 +9,9 @@ const {
   shouldShowAxNode, formatAxNode, orderedAxChildren, isRef,
   validateUrl, parsePerceiveArgs, dialogStr, netlogStr,
   formatPageList, buildPerceiveTree, perceivePageScript, injectStr, cascadeStr, recordStr, parseRecordArgs,
-  evalStr, navStr, clickStr, fillStr, waitForStr,
+  evalStr, evalFireAndForgetStr, parseEvalArgs, callStr, navStr, clickStr, fillStr, fillReactStr, waitForStr,
+  isTimeoutError, parseDelayMs, waitStr, ipcTimeoutForRequest, parseTargetAndCommandArgs,
+  statusStr, clearObservationBuffers,
   KEY_MAP, ENRICHED_ROLES, INTERACTIVE_ROLES,
   captureScreenshot, screencastFallback, snapshotStr,
   resetScreenshotTier, getScreenshotTier, SCREENSHOT_TIMEOUT,
@@ -1263,6 +1265,126 @@ describe('evalStr', () => {
 });
 
 // =========================================================================
+// eval fire-and-forget / call / wait helpers
+// =========================================================================
+
+describe('eval fire-and-forget and call helpers', () => {
+  it('dispatches eval without awaiting the returned promise', async () => {
+    const cdp = createMockCDP({
+      'Runtime.evaluate': (params) => {
+        expect(params.awaitPromise).toBe(false);
+        expect(params.returnByValue).toBe(false);
+        expect(params.expression).toContain('setInterval');
+        return { result: { objectId: 'promise-1' } };
+      },
+    });
+    const out = await evalFireAndForgetStr(cdp, 'sid1', 'setInterval(() => {}, 1000)', true);
+    expect(out).toMatch(/fire-and-forget eval/i);
+  });
+
+  it('parses --fire-and-forget with --b64', () => {
+    const b64 = Buffer.from('window.__loop = true', 'utf8').toString('base64');
+    const opts = parseEvalArgs(['--fire-and-forget', '--b64', b64]);
+    expect(opts.fireAndForget).toBe(true);
+    expect(opts.expression).toBe('window.__loop = true');
+  });
+
+  it('callStr awaits page result and serializes JSON values', async () => {
+    const cdp = createMockCDP({
+      'Runtime.evaluate': (params) => {
+        expect(params.awaitPromise).toBe(true);
+        expect(params.returnByValue).toBe(true);
+        expect(params.expression).toContain('typeof value');
+        return { result: { value: { ok: true, n: 2 } } };
+      },
+    });
+    const out = await callStr(cdp, 'sid1', 'async () => ({ ok: true, n: 2 })');
+    expect(JSON.parse(out)).toEqual({ ok: true, n: 2 });
+  });
+});
+
+describe('wait helpers', () => {
+  it('classifies CDP timeout messages by method', () => {
+    expect(isTimeoutError(new Error('Timeout: Runtime.evaluate'), ['Runtime.evaluate'])).toBe(true);
+    expect(isTimeoutError(new Error('Timeout: Runtime.evaluate'), ['Page.captureScreenshot'])).toBe(false);
+    expect(isTimeoutError(new Error('Other failure'))).toBe(false);
+  });
+
+  it('parses bounded positive millisecond durations', () => {
+    expect(parseDelayMs('30')).toBe(30);
+    expect(() => parseDelayMs('0')).toThrow(/at least/);
+    expect(() => parseDelayMs('x')).toThrow(/positive integer/);
+  });
+
+  it('waitStr waits inside the Node command and reports the duration', async () => {
+    const out = await waitStr('1');
+    expect(out).toBe('Waited 1ms');
+  });
+
+  it('extends IPC timeout for long daemon-backed waits', () => {
+    expect(ipcTimeoutForRequest({ cmd: 'wait', args: ['180000'] })).toBe(185000);
+    expect(ipcTimeoutForRequest({ cmd: 'wait', args: ['30'] })).toBe(120000);
+    expect(ipcTimeoutForRequest({ cmd: 'status', args: [] })).toBe(120000);
+  });
+
+  it('supports wait ms target form without stealing numeric target prefixes', () => {
+    expect(parseTargetAndCommandArgs('wait', ['30000', 'A7BA1234'])).toEqual({
+      targetPrefix: 'A7BA1234',
+      cmdArgs: ['30000'],
+    });
+    expect(parseTargetAndCommandArgs('wait', ['12345678', '30000'])).toEqual({
+      targetPrefix: '12345678',
+      cmdArgs: ['30000'],
+    });
+  });
+});
+
+describe('status --runtime and buffer reset', () => {
+  it('includes Performance.getMetrics counters only when requested', async () => {
+    const cdp = createMockCDP({
+      'Runtime.evaluate': () => ({ result: { value: JSON.stringify({ title: 'T', url: 'https://example.test/' }) } }),
+      'Performance.enable': () => ({}),
+      'Performance.getMetrics': () => ({
+        metrics: [
+          { name: 'Documents', value: 2 },
+          { name: 'Frames', value: 1 },
+          { name: 'JSEventListeners', value: 9 },
+          { name: 'Nodes', value: 123 },
+          { name: 'JSHeapUsedSize', value: 1048576 },
+          { name: 'Tasks', value: 7 },
+        ],
+      }),
+    });
+    const out = await statusStr(cdp, 'sid1', new RingBuffer(10), new RingBuffer(10), new RingBuffer(10), { console: 0, exception: 0 }, { runtime: true });
+    expect(out).toContain('Runtime metrics (Performance.getMetrics):');
+    expect(out).toContain('Documents: 2');
+    expect(out).toContain('JSHeapUsedSize: 1.0 MB');
+    expect(out).not.toMatch(/pending fetch|pending timer/i);
+  });
+
+  it('clears observation buffers and advances read sequence', () => {
+    const consoleBuf = new RingBuffer(10);
+    const exceptionBuf = new RingBuffer(10);
+    const navBuf = new RingBuffer(10);
+    const netReqBuf = new RingBuffer(10);
+    const pendingReqs = new Map([['1', { url: '/api' }]]);
+    consoleBuf.push({ text: 'a' });
+    exceptionBuf.push({ msg: 'b' });
+    navBuf.push({ url: 'https://example.test/' });
+    netReqBuf.push({ url: '/api' });
+    const lastReadSeq = { console: 0, exception: 0 };
+    clearObservationBuffers({ consoleBuf, exceptionBuf, navBuf, netReqBuf, pendingReqs, lastReadSeq });
+    expect(consoleBuf.all()).toEqual([]);
+    expect(exceptionBuf.all()).toEqual([]);
+    expect(navBuf.all()).toEqual([]);
+    expect(netReqBuf.all()).toEqual([]);
+    expect(pendingReqs.size).toBe(0);
+    expect(lastReadSeq.console).toBe(consoleBuf.latest());
+    expect(lastReadSeq.exception).toBe(exceptionBuf.latest());
+  });
+});
+
+// =========================================================================
 // navStr (with CDP mock)
 // =========================================================================
 
@@ -1422,6 +1544,41 @@ describe('fillStr', () => {
     const cdp = createMockCDP({});
     await expect(fillStr(cdp, 'sid1', '#input', null, new Map()))
       .rejects.toThrow(/Text required/);
+  });
+});
+
+describe('fill --react', () => {
+  it('uses the native value setter and input/change events for CSS selectors', async () => {
+    const cdp = createMockCDP({
+      'DOM.enable': () => ({}),
+      'DOM.getDocument': () => ({ root: { nodeId: 1 } }),
+      'DOM.querySelector': (params) => {
+        expect(params.selector).toBe('#name');
+        return { nodeId: 42 };
+      },
+      'DOM.resolveNode': () => ({ object: { objectId: 'obj-input' } }),
+      'Runtime.callFunctionOn': (params) => {
+        expect(params.objectId).toBe('obj-input');
+        expect(params.arguments[0].value).toBe('戰鬥勝利');
+        expect(params.functionDeclaration).toContain('Object.getOwnPropertyDescriptor');
+        expect(params.functionDeclaration).toContain("new InputEvent('input'");
+        expect(params.functionDeclaration).toContain("new Event('change'");
+        return { result: { value: { tag: 'INPUT', value: '戰鬥勝利' } } };
+      },
+    });
+    const out = await fillReactStr(cdp, 'sid1', '#name', '戰鬥勝利', new Map());
+    expect(out).toContain('React-filled <INPUT>');
+    expect(out).toContain('戰鬥勝利');
+  });
+
+  it('keeps normal fill using Input.insertText', async () => {
+    const cdp = createMockCDP({
+      'Runtime.evaluate': () => ({ result: { value: { ok: true, tag: 'INPUT' } } }),
+      'Input.insertText': () => ({}),
+    });
+    await fillStr(cdp, 'sid1', '#name', 'plain', new Map());
+    expect(cdp.calls.some(c => c.method === 'Input.insertText')).toBe(true);
+    expect(cdp.calls.some(c => c.method === 'Runtime.callFunctionOn')).toBe(false);
   });
 });
 
@@ -3430,6 +3587,11 @@ describe('parseTextArgs', () => {
     expect(opts.auto).toBe(true);
     expect(opts.exclude).toBe('nav,.sidebar');
   });
+
+  it('parses --root auto/default scope', () => {
+    expect(parseTextArgs(['--root', 'auto']).root).toBe('auto');
+    expect(parseTextArgs(['--root', '#root', 'header']).selectors).toEqual(['header']);
+  });
 });
 
 describe('textPageScript', () => {
@@ -3452,6 +3614,13 @@ describe('textPageScript', () => {
     const script = textPageScript({ selectors: [], auto: true, exclude: '.sidebar,.banner' });
     expect(script).toContain('.sidebar');
     expect(script).toContain('.banner');
+  });
+
+  it('uses app-root candidates and header fallback selectors', () => {
+    const script = textPageScript({ selectors: ['header'], root: 'auto' });
+    expect(script).toContain("['#root', '[data-reactroot]', 'main', 'body']");
+    expect(script).toContain("'[role=\"banner\"]'");
+    expect(script).toContain("'h1'");
   });
 });
 
@@ -3865,23 +4034,32 @@ describe('jsClickStr', () => {
     expect(cdp.calls.find(c => c.method === 'Input.dispatchMouseEvent')).toBeUndefined();
   });
 
-  it('uses document.querySelector + el.click() for CSS selectors', async () => {
-    let evalledExpr = '';
+  it('resolves CSS selectors to node objects and calls HTMLElement.click()', async () => {
+    let fnDecl = '';
     const cdp = createMockCDP({
-      'Runtime.evaluate': (params) => {
-        evalledExpr = params.expression;
-        return { result: { value: JSON.stringify({ ok: true, tag: 'A', text: 'Help' }) } };
+      'DOM.enable': () => ({}),
+      'DOM.getDocument': () => ({ root: { nodeId: 1 } }),
+      'DOM.querySelector': (params) => {
+        expect(params.selector).toBe('a.help');
+        return { nodeId: 77 };
+      },
+      'DOM.resolveNode': () => ({ object: { objectId: 'obj-77' } }),
+      'Runtime.callFunctionOn': (params) => {
+        expect(params.objectId).toBe('obj-77');
+        fnDecl = params.functionDeclaration;
+        return { result: { value: { tag: 'A', text: 'Help' } } };
       },
     });
     const out = await jsClickStr(cdp, 'sid', 'a.help', new Map());
     expect(out).toMatch(/JS-clicked <A> "Help"/);
-    expect(evalledExpr).toContain('document.querySelector');
-    expect(evalledExpr).toMatch(/el\.click\(\)/);
+    expect(fnDecl).toMatch(/this\.click\(\)/);
   });
 
   it('throws when the CSS selector does not match', async () => {
     const cdp = createMockCDP({
-      'Runtime.evaluate': () => ({ result: { value: JSON.stringify({ ok: false, error: 'Element not found: .nope' }) } }),
+      'DOM.enable': () => ({}),
+      'DOM.getDocument': () => ({ root: { nodeId: 1 } }),
+      'DOM.querySelector': () => ({ nodeId: 0 }),
     });
     await expect(jsClickStr(cdp, 'sid', '.nope', new Map())).rejects.toThrow(/Element not found/);
   });

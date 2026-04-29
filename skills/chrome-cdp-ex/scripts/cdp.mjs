@@ -17,6 +17,7 @@ const TIMEOUT = 15000;
 const SCREENSHOT_TIMEOUT = 30000;
 const NAVIGATION_TIMEOUT = 30000;
 const IDLE_TIMEOUT = 20 * 60 * 1000;
+const FIRE_AND_FORGET_KEEPALIVE = 60 * 60 * 1000;
 const DAEMON_CONNECT_RETRIES = 20;
 const DAEMON_CONNECT_DELAY = 300;
 const DAEMON_ALLOW_RETRIES = 200;  // For open --attach: 200 * 300ms = 60s
@@ -124,6 +125,40 @@ async function getWsUrl() {
 }
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+function isTimeoutError(err, methods = []) {
+  const msg = err?.message || String(err || '');
+  if (!msg.startsWith('Timeout:')) return false;
+  return methods.length === 0 || methods.some(method => msg.includes(method));
+}
+
+function parseDelayMs(value, { name = 'ms', min = 1, max = 24 * 60 * 60 * 1000 } = {}) {
+  const raw = String(value ?? '').trim();
+  if (!/^\d+$/.test(raw)) throw new Error(`${name} must be a positive integer in milliseconds`);
+  const ms = Number(raw);
+  if (!Number.isSafeInteger(ms) || ms < min) throw new Error(`${name} must be at least ${min}ms`);
+  if (ms > max) throw new Error(`${name} exceeds max ${max}ms`);
+  return ms;
+}
+
+function formatDuration(ms) {
+  if (ms < 1000) return `${ms}ms`;
+  const s = ms / 1000;
+  if (s < 60) return `${Number.isInteger(s) ? s : s.toFixed(1)}s`;
+  const m = s / 60;
+  if (m < 60) return `${Number.isInteger(m) ? m : m.toFixed(1)}m`;
+  const h = m / 60;
+  return `${Number.isInteger(h) ? h : h.toFixed(1)}h`;
+}
+
+async function waitStr(msArg) {
+  const ms = parseDelayMs(msArg, { name: 'wait duration', max: 60 * 60 * 1000 });
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    await sleep(Math.min(250, deadline - Date.now()));
+  }
+  return `Waited ${formatDuration(ms)}`;
+}
 
 function listDaemonSockets() {
   if (IS_WINDOWS) {
@@ -439,6 +474,74 @@ async function evalStr(cdp, sid, expression, autoWrap = false) {
   return typeof val === 'object' ? JSON.stringify(val, null, 2) : String(val ?? '');
 }
 
+function maybeAutoWrapEval(expression, autoWrap = false) {
+  let expr = expression;
+  if (autoWrap && /\bawait\b/.test(expr)) {
+    expr = expr.includes(';') || expr.includes('\n')
+      ? `(async()=>{${expr}})()`
+      : `(async()=>(${expr}))()`;
+  }
+  return expr;
+}
+
+async function evalFireAndForgetStr(cdp, sid, expression, autoWrap = false) {
+  if (!expression) throw new Error('Expression required');
+  await cdp.send('Runtime.evaluate', {
+    expression: maybeAutoWrapEval(expression, autoWrap),
+    returnByValue: false,
+    awaitPromise: false,
+  }, sid);
+  return 'Dispatched fire-and-forget eval (not awaiting returned promise)';
+}
+
+function formatCallResult(remote) {
+  if (!remote) return '';
+  if (Object.prototype.hasOwnProperty.call(remote, 'value')) {
+    if (remote.value === undefined) return 'undefined';
+    const json = JSON.stringify(remote.value, null, 2);
+    return json === undefined ? String(remote.value) : json;
+  }
+  if (remote.unserializableValue != null) return String(remote.unserializableValue);
+  return remote.description ?? '';
+}
+
+async function callStr(cdp, sid, expression) {
+  if (!expression) throw new Error('Expression required');
+  const wrapped = `Promise.resolve().then(async () => {
+    const value = (${expression});
+    let result = (typeof value === 'function') ? value() : value;
+    return await result;
+  })()`;
+  const result = await cdp.send('Runtime.evaluate', {
+    expression: wrapped,
+    returnByValue: true,
+    awaitPromise: true,
+  }, sid);
+  if (result.exceptionDetails) {
+    throw new Error(result.exceptionDetails.text || result.exceptionDetails.exception?.description);
+  }
+  return formatCallResult(result.result);
+}
+
+function parseEvalArgs(args) {
+  const opts = { expression: '', fireAndForget: false };
+  const rest = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--fire-and-forget' || a === '--faf') opts.fireAndForget = true;
+    else if (a === '--b64' || a === '-b') {
+      const b64 = (args[++i] || '').trim();
+      if (!b64) throw new Error('eval --b64: empty expression. Pass a base64-encoded JS expression.');
+      opts.expression = evalBase64Decode(b64);
+    } else {
+      rest.push(a);
+    }
+  }
+  if (!opts.expression) opts.expression = rest.join(' ');
+  if (!opts.expression) throw new Error('Expression required');
+  return opts;
+}
+
 // ---------------------------------------------------------------------------
 // Screenshot with multi-tier fallback (handles Electron CDP limitations)
 // ---------------------------------------------------------------------------
@@ -614,7 +717,29 @@ async function netStr(cdp, sid) {
   ).join('\n');
 }
 
-async function statusStr(cdp, sid, consoleBuf, exceptionBuf, navBuf, lastReadSeq) {
+function formatMetricValue(name, value) {
+  if (name === 'JSHeapUsedSize' || name === 'JSHeapTotalSize') {
+    if (!Number.isFinite(value)) return String(value);
+    return `${(value / 1024 / 1024).toFixed(1)} MB`;
+  }
+  return Number.isInteger(value) ? String(value) : String(Math.round(value * 100) / 100);
+}
+
+async function runtimeMetricsStr(cdp, sid) {
+  try { await cdp.send('Performance.enable', {}, sid); } catch {}
+  const { metrics = [] } = await cdp.send('Performance.getMetrics', {}, sid);
+  const wanted = ['Documents', 'Frames', 'JSEventListeners', 'Nodes', 'JSHeapUsedSize', 'Tasks'];
+  const byName = new Map(metrics.map(m => [m.name, m.value]));
+  const lines = ['Runtime metrics (Performance.getMetrics):'];
+  for (const name of wanted) {
+    if (!byName.has(name)) continue;
+    lines.push(`  ${name}: ${formatMetricValue(name, byName.get(name))}`);
+  }
+  if (lines.length === 1) lines.push('  (no requested metrics returned by this target)');
+  return lines.join('\n');
+}
+
+async function statusStr(cdp, sid, consoleBuf, exceptionBuf, navBuf, lastReadSeq, opts = {}) {
   let title = '', url = '';
   try {
     const info = JSON.parse(await evalStr(cdp, sid, 'JSON.stringify({ title: document.title, url: window.location.href })'));
@@ -652,6 +777,14 @@ async function statusStr(cdp, sid, consoleBuf, exceptionBuf, navBuf, lastReadSeq
     for (const e of newExceptions.slice(-10)) {
       const loc = e.loc ? ` at ${e.loc}` : '';
       lines.push(`  ${e.msg.substring(0, 200)}${loc}`);
+    }
+  }
+
+  if (opts.runtime) {
+    try {
+      lines.push(await runtimeMetricsStr(cdp, sid));
+    } catch (e) {
+      lines.push(`Runtime metrics (Performance.getMetrics): unavailable (${e.message})`);
     }
   }
 
@@ -1589,6 +1722,21 @@ async function getDpr(cdp, sid) {
   return 1;
 }
 
+async function resolveSelectorNode(cdp, sid, selector) {
+  if (!selector) throw new Error('CSS selector required');
+  try { await cdp.send('DOM.enable', {}, sid); } catch {}
+  const { root } = await cdp.send('DOM.getDocument', {}, sid);
+  let result;
+  try {
+    result = await cdp.send('DOM.querySelector', { nodeId: root.nodeId, selector }, sid);
+  } catch (e) {
+    throw new Error(`Invalid selector: ${selector}. ${e.message}`);
+  }
+  if (!result.nodeId) throw new Error('Element not found: ' + selector);
+  const { object } = await cdp.send('DOM.resolveNode', { nodeId: result.nodeId }, sid);
+  return object.objectId;
+}
+
 // JS-fallback click: uses HTMLElement.click() / dispatchEvent in the page
 // instead of CDP Input.dispatchMouseEvent. Useful when the page intercepts
 // real-pointer events with overlays, has misaligned hit testing under custom
@@ -1598,8 +1746,10 @@ async function getDpr(cdp, sid) {
 // dispatch.
 async function jsClickStr(cdp, sid, selector, refMap, refState) {
   if (!selector) throw new Error('CSS selector or @ref required');
-  if (isRef(selector)) {
-    const objectId = await resolveRefNode(cdp, sid, refMap, selector, refState);
+  const objectId = isRef(selector)
+    ? await resolveRefNode(cdp, sid, refMap, selector, refState)
+    : await resolveSelectorNode(cdp, sid, selector);
+  try {
     const res = await cdp.send('Runtime.callFunctionOn', {
       objectId,
       functionDeclaration: `function() {
@@ -1611,22 +1761,13 @@ async function jsClickStr(cdp, sid, selector, refMap, refState) {
       returnByValue: true,
     }, sid);
     const r = res.result.value || {};
-    return `JS-clicked <${r.tag || '?'}> "${r.text || ''}" (${selector})`;
+    return `JS-clicked <${r.tag || '?'}> "${r.text || ''}"${isRef(selector) ? ` (${selector})` : ''}`;
+  } catch (e) {
+    if (isTimeoutError(e, ['Runtime.callFunctionOn'])) {
+      return `JS-click dispatched for ${selector}; success but click acknowledgement timed out after dispatch (${e.message}). Run \`perceive --diff\` or \`status\` to refresh observation.`;
+    }
+    throw e;
   }
-  const expr = `
-    (function() {
-      const el = document.querySelector(${JSON.stringify(selector)});
-      if (!el) return { ok: false, error: 'Element not found: ' + ${JSON.stringify(selector)} };
-      el.scrollIntoView({ block: 'center', inline: 'center' });
-      if (typeof el.click === 'function') el.click();
-      else el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-      return { ok: true, tag: el.tagName, text: (el.textContent || '').trim().substring(0, 80) };
-    })()
-  `;
-  const result = await evalStr(cdp, sid, expr);
-  const r = JSON.parse(result);
-  if (!r.ok) throw new Error(r.error);
-  return `JS-clicked <${r.tag}> "${r.text}"`;
 }
 
 // Click element by CSS selector or @ref
@@ -1980,9 +2121,51 @@ async function waitForStr(cdp, sid, args, refMap, refState) {
   }
 }
 
-async function fillStr(cdp, sid, selector, text, refMap, refState) {
+function formatInputTextPreview(text) {
+  return `${text.substring(0, 40)}${text.length > 40 ? '...' : ''}`;
+}
+
+async function fillReactStr(cdp, sid, selector, text, refMap, refState) {
+  const objectId = isRef(selector)
+    ? await resolveRefNode(cdp, sid, refMap, selector, refState)
+    : await resolveSelectorNode(cdp, sid, selector);
+  const res = await cdp.send('Runtime.callFunctionOn', {
+    objectId,
+    functionDeclaration: `function(value) {
+      const el = this;
+      el.scrollIntoView({ block: 'center', inline: 'center' });
+      el.focus();
+      if (el.isContentEditable) {
+        el.textContent = value;
+      } else {
+        const proto = el instanceof HTMLTextAreaElement
+          ? HTMLTextAreaElement.prototype
+          : el instanceof HTMLSelectElement
+            ? HTMLSelectElement.prototype
+            : HTMLInputElement.prototype;
+        const descriptor = Object.getOwnPropertyDescriptor(proto, 'value')
+          || Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'value');
+        if (descriptor && descriptor.set) descriptor.set.call(el, value);
+        else el.value = value;
+      }
+      const inputEvent = typeof InputEvent === 'function'
+        ? new InputEvent('input', { bubbles: true, cancelable: true, composed: true, inputType: 'insertText', data: value })
+        : new Event('input', { bubbles: true, cancelable: true });
+      el.dispatchEvent(inputEvent);
+      el.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+      return { tag: el.tagName, value: el.isContentEditable ? el.textContent : el.value };
+    }`,
+    arguments: [{ value: text }],
+    returnByValue: true,
+  }, sid);
+  const tag = res.result.value?.tag || '?';
+  return `React-filled ${isRef(selector) ? selector : `<${tag}>`} with "${formatInputTextPreview(text)}"`;
+}
+
+async function fillStr(cdp, sid, selector, text, refMap, refState, opts = {}) {
   if (!selector) throw new Error('CSS selector or @ref required');
   if (text == null) throw new Error('Text required');
+  if (opts.react) return fillReactStr(cdp, sid, selector, text, refMap, refState);
   if (isRef(selector)) {
     const objectId = await resolveRefNode(cdp, sid, refMap, selector, refState);
     await cdp.send('Runtime.callFunctionOn', {
@@ -1991,7 +2174,7 @@ async function fillStr(cdp, sid, selector, text, refMap, refState) {
       returnByValue: true,
     }, sid);
     await cdp.send('Input.insertText', { text }, sid);
-    return `Filled ${selector} with "${text.substring(0, 40)}${text.length > 40 ? '...' : ''}"`;
+    return `Filled ${selector} with "${formatInputTextPreview(text)}"`;
   }
   // Focus via JS (more reliable than mouse events for input focus) + get element info
   const expr = `
@@ -2010,7 +2193,7 @@ async function fillStr(cdp, sid, selector, text, refMap, refState) {
   if (!r.ok) throw new Error(r.error);
   // Insert text into the now-focused, cleared field
   await cdp.send('Input.insertText', { text }, sid);
-  return `Filled <${r.tag}> with "${text.substring(0, 40)}${text.length > 40 ? '...' : ''}"`;
+  return `Filled <${r.tag}> with "${formatInputTextPreview(text)}"`;
 }
 
 async function selectStr(cdp, sid, selector, value) {
@@ -2298,6 +2481,18 @@ function netlogStr(netReqBuf, flag) {
   return lines.join('\n');
 }
 
+function clearObservationBuffers({ consoleBuf, exceptionBuf, navBuf, netReqBuf, pendingReqs, lastReadSeq }) {
+  consoleBuf?.clear();
+  exceptionBuf?.clear();
+  navBuf?.clear();
+  netReqBuf?.clear();
+  pendingReqs?.clear();
+  if (lastReadSeq) {
+    lastReadSeq.console = consoleBuf?.latest?.() || 0;
+    lastReadSeq.exception = exceptionBuf?.latest?.() || 0;
+  }
+}
+
 async function viewportStr(cdp, sid, size) {
   if (!size) {
     const dims = await evalStr(cdp, sid, `JSON.stringify({w:window.innerWidth,h:window.innerHeight,dpr:window.devicePixelRatio})`);
@@ -2371,13 +2566,15 @@ async function uploadStr(cdp, sid, selector, filePaths) {
 //   text                          → full body
 //   text "main, [role=main]"      → fallback chain (try first, then next…)
 //   text --auto                   → auto-pick main content (excludes nav/aside/script/style)
+//   text --root auto              → scope extraction to #root / [data-reactroot] / main / body
 //   text --auto --exclude "nav,.sidebar"  → custom extra exclusions
 function parseTextArgs(args) {
-  const opts = { selectors: [], auto: false, exclude: null };
+  const opts = { selectors: [], auto: false, exclude: null, root: null };
   const tokens = Array.isArray(args) ? args.filter(a => a !== undefined && a !== null) : [];
   for (let i = 0; i < tokens.length; i++) {
     const a = tokens[i];
     if (a === '--auto') opts.auto = true;
+    else if (a === '--root') opts.root = tokens[++i] || 'auto';
     else if (a === '--exclude' || a === '-x') opts.exclude = tokens[++i];
     else if (typeof a === 'string') {
       // Comma list = fallback chain (try each until one matches)
@@ -2390,40 +2587,96 @@ function parseTextArgs(args) {
 }
 
 function textPageScript(opts) {
-  const { selectors = [], auto = false, exclude = null } = opts || {};
+  const { selectors = [], auto = false, exclude = null, root = null } = opts || {};
   const extraExcludes = exclude ? exclude.split(',').map(s => s.trim()).filter(Boolean) : [];
   return `(function() {
-    const STRIP = 'script,style,noscript,svg,link,meta';
-    function clean(root) {
-      const clone = root.cloneNode(true);
-      for (const el of clone.querySelectorAll(STRIP)) el.remove();
-      ${extraExcludes.length ? `for (const sel of ${JSON.stringify(extraExcludes)}) { for (const el of clone.querySelectorAll(sel)) el.remove(); }` : ''}
-      return clone.textContent.replace(/[ \\t]+/g, ' ').replace(/(\\n\\s*){3,}/g, '\\n\\n').trim();
+    const STRIP = ['script','style','noscript','svg','link','meta','template'];
+    const AUTO_NOISE = ['nav','aside','footer','[role="navigation"]','[role="complementary"]','[role="contentinfo"]'];
+    const ROOT_CANDIDATES = ['#root', '[data-reactroot]', 'main', 'body'];
+    const AUTO_CANDIDATES = ['main', '[role="main"]', 'article', '#root main', '#app main', '#root', '[data-reactroot]', '#app', 'body'];
+    const EXTRA_EXCLUDES = ${JSON.stringify(extraExcludes)};
+    function safeMatches(el, sel) { try { return !!el?.matches?.(sel); } catch { return false; } }
+    function safeQuery(root, sel) { try { return root?.querySelector?.(sel) || null; } catch { return null; } }
+    function selectorFallbacks(sel) {
+      const s = String(sel || '').trim();
+      if (s.toLowerCase() === 'header') {
+        return ['header', '[role="banner"]', '[data-testid*="header" i]', '[class*="header" i]', '[id*="header" i]', 'h1', 'h2'];
+      }
+      return [s];
+    }
+    function pickRoot() {
+      const setting = ${JSON.stringify(root || 'auto')};
+      if (!setting || setting === 'auto' || setting === 'default') {
+        for (const sel of ROOT_CANDIDATES) {
+          const found = safeQuery(document, sel);
+          if (found) return { el: found, sel };
+        }
+        return { el: document.body || document.documentElement, sel: 'body' };
+      }
+      const found = safeQuery(document, setting);
+      return found ? { el: found, sel: setting } : { el: null, sel: setting };
+    }
+    function shouldSkipElement(el, rootEl, skipSelectors) {
+      if (!el || el === rootEl) return false;
+      if (el.hidden || el.getAttribute('aria-hidden') === 'true') return true;
+      for (const sel of skipSelectors) if (safeMatches(el, sel)) return true;
+      const style = window.getComputedStyle(el);
+      return style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse';
+    }
+    function clean(rootEl, stripNoise) {
+      if (!rootEl) return '';
+      const skipSelectors = STRIP.concat(EXTRA_EXCLUDES, stripNoise ? AUTO_NOISE : []);
+      const parts = [];
+      const blockish = new Set(['ADDRESS','ARTICLE','ASIDE','BLOCKQUOTE','BR','DIV','DL','FIELDSET','FIGCAPTION','FIGURE','FOOTER','FORM','H1','H2','H3','H4','H5','H6','HEADER','HR','LI','MAIN','NAV','OL','P','PRE','SECTION','TABLE','TR','UL']);
+      function walk(node) {
+        if (!node) return;
+        if (node.nodeType === Node.TEXT_NODE) {
+          parts.push(node.nodeValue || '');
+          return;
+        }
+        if (node.nodeType !== Node.ELEMENT_NODE && node.nodeType !== Node.DOCUMENT_NODE) return;
+        const el = node.nodeType === Node.ELEMENT_NODE ? node : null;
+        if (el && shouldSkipElement(el, rootEl, skipSelectors)) return;
+        if (el?.tagName === 'BR') { parts.push('\\n'); return; }
+        for (const child of node.childNodes) walk(child);
+        if (el && blockish.has(el.tagName)) parts.push('\\n');
+      }
+      walk(rootEl);
+      return parts.join('')
+        .replace(/[ \\t\\f\\v]+/g, ' ')
+        .replace(/ *\\n */g, '\\n')
+        .replace(/(\\n\\s*){3,}/g, '\\n\\n')
+        .trim();
+    }
+    function findWithin(scope, sel, tried) {
+      for (const candidate of selectorFallbacks(sel)) {
+        tried.push(candidate);
+        if (safeMatches(scope, candidate)) return { el: scope, sel: candidate };
+        const found = safeQuery(scope, candidate);
+        if (found) return { el: found, sel: candidate === sel ? candidate : candidate + ' (fallback for ' + sel + ')' };
+      }
+      return null;
     }
     const tried = [];
+    const rootInfo = pickRoot();
+    if (!rootInfo.el) return JSON.stringify({ ok: false, tried: ['--root ' + rootInfo.sel] });
+    const scope = rootInfo.el;
     const selectors = ${JSON.stringify(selectors)};
     for (const sel of selectors) {
-      const root = document.querySelector(sel);
-      tried.push(sel);
-      if (root) return JSON.stringify({ ok: true, sel, text: clean(root) });
+      const found = findWithin(scope, sel, tried);
+      if (found) return JSON.stringify({ ok: true, sel: found.sel, root: rootInfo.sel, text: clean(found.el, false) });
     }
     if (${auto ? 'true' : 'false'}) {
-      const candidates = ['main', '[role="main"]', 'article', '#root main', '#app main', '#root', '#app', 'body'];
-      for (const sel of candidates) {
-        const root = document.querySelector(sel);
-        if (!root) continue;
-        // Strip nav/aside/footer noise from auto-mode
-        const clone = root.cloneNode(true);
-        for (const el of clone.querySelectorAll(STRIP + ',nav,aside,footer,[role="navigation"],[role="complementary"],[role="contentinfo"]')) el.remove();
-        ${extraExcludes.length ? `for (const x of ${JSON.stringify(extraExcludes)}) { for (const el of clone.querySelectorAll(x)) el.remove(); }` : ''}
-        const text = clone.textContent.replace(/[ \\t]+/g, ' ').replace(/(\\n\\s*){3,}/g, '\\n\\n').trim();
-        if (text.length > 0) return JSON.stringify({ ok: true, sel: sel + ' (auto)', text });
+      for (const sel of AUTO_CANDIDATES) {
+        const found = findWithin(scope, sel, tried);
+        if (!found) continue;
+        const text = clean(found.el, true);
+        if (text.length > 0) return JSON.stringify({ ok: true, sel: found.sel + ' (auto)', root: rootInfo.sel, text });
         tried.push(sel + ' (auto)');
       }
     }
     if (selectors.length === 0 && !${auto ? 'true' : 'false'}) {
-      // Default behaviour: full body
-      return JSON.stringify({ ok: true, sel: 'body', text: clean(document.body) });
+      return JSON.stringify({ ok: true, sel: rootInfo.sel, root: rootInfo.sel, text: clean(scope, false) });
     }
     return JSON.stringify({ ok: false, tried });
   })()`;
@@ -3665,10 +3918,20 @@ async function runDaemon(targetId) {
   process.on('SIGINT', shutdown);
 
   // Idle timer
+  let keepaliveUntil = 0;
   let idleTimer = setTimeout(shutdown, IDLE_TIMEOUT);
-  function resetIdle() {
+  function scheduleIdle() {
     clearTimeout(idleTimer);
-    idleTimer = setTimeout(shutdown, IDLE_TIMEOUT);
+    const delay = Math.max(IDLE_TIMEOUT, keepaliveUntil - Date.now(), 1000);
+    idleTimer = setTimeout(shutdown, delay);
+  }
+  function resetIdle() {
+    scheduleIdle();
+  }
+  function extendKeepalive(ms) {
+    keepaliveUntil = Math.max(keepaliveUntil, Date.now() + ms);
+    scheduleIdle();
+    return `Daemon keepalive extended for ${ms}ms (until ${new Date(keepaliveUntil).toISOString()})`;
   }
 
   // Action feedback: wait for DOM to settle, then return perceive diff
@@ -3677,9 +3940,23 @@ async function runDaemon(targetId) {
   // Commands that mutate shared state (refMap, lastPerceiveStore) — unsafe for parallel execution
   const BATCH_NO_PARALLEL = new Set(['click', 'clickxy', 'jsclick', 'select', 'press', 'scroll', 'nav', 'navigate', 'viewport', 'perceive', 'snap', 'snapshot', 'dismiss-modal', 'dismissmodal']);
   async function actionFeedback(actionResult) {
-    await waitForSettle(cdp, sessionId);
-    const diff = await perceiveStr(cdp, sessionId, consoleBuf, exceptionBuf, refMap, lastPerceiveStore, { diff: true }, refState);
-    return actionResult + '\n---\n' + diff;
+    try {
+      await waitForSettle(cdp, sessionId);
+    } catch (e) {
+      if (isTimeoutError(e, ['Runtime.evaluate'])) {
+        return actionResult + `\n---\n(success but observation timed out after action dispatch: ${e.message}. The action was already sent; run \`perceive --diff\` or \`status\` to refresh.)`;
+      }
+      throw e;
+    }
+    try {
+      const diff = await perceiveStr(cdp, sessionId, consoleBuf, exceptionBuf, refMap, lastPerceiveStore, { diff: true }, refState);
+      return actionResult + '\n---\n' + diff;
+    } catch (e) {
+      if (isTimeoutError(e)) {
+        return actionResult + `\n---\n(success but observation timed out after action dispatch: ${e.message}. The action was already sent; run \`perceive --diff\` or \`status\` to refresh.)`;
+      }
+      throw e;
+    }
   }
 
   // Handle a command
@@ -3700,14 +3977,12 @@ async function runDaemon(targetId) {
         }
         case 'snap': case 'snapshot': result = await snapshotStr(cdp, sessionId, args[0] !== '--full'); break;
         case 'eval': {
-          // `eval --b64 <base64>` decodes a CJK / shell-hostile expression
-          // before running it; otherwise args[0] is treated as the literal
-          // expression as before.
-          if (args[0] === '--b64' || args[0] === '-b') {
-            const decoded = evalBase64Decode(args[1]);
-            result = await evalStr(cdp, sessionId, decoded, true);
+          const eopts = parseEvalArgs(args);
+          if (eopts.fireAndForget) {
+            result = await evalFireAndForgetStr(cdp, sessionId, eopts.expression, true);
+            result += `\n${extendKeepalive(FIRE_AND_FORGET_KEEPALIVE)} (fire-and-forget default)`;
           } else {
-            result = await evalStr(cdp, sessionId, args[0], true);
+            result = await evalStr(cdp, sessionId, eopts.expression, true);
           }
           break;
         }
@@ -3716,6 +3991,9 @@ async function runDaemon(targetId) {
           result = await evalStr(cdp, sessionId, decoded, true);
           break;
         }
+        case 'call': result = await callStr(cdp, sessionId, args.join(' ')); break;
+        case 'wait': result = await waitStr(args[0]); break;
+        case 'keepalive': result = extendKeepalive(parseDelayMs(args[0], { name: 'keepalive duration' })); break;
         case 'shot': case 'screenshot': {
           if (args[0] === '--annotate' || args[0] === '-a') {
             result = await annotshotStr(cdp, sessionId, targetId, refMap);
@@ -3728,12 +4006,17 @@ async function runDaemon(targetId) {
         case 'html': result = await htmlStr(cdp, sessionId, args[0]); break;
         case 'nav': case 'navigate': {
           const navResult = await navStr(cdp, sessionId, args[0]);
-          const p = await perceiveStr(cdp, sessionId, consoleBuf, exceptionBuf, refMap, lastPerceiveStore, {}, refState);
-          result = navResult + '\n---\n' + p;
+          try {
+            const p = await perceiveStr(cdp, sessionId, consoleBuf, exceptionBuf, refMap, lastPerceiveStore, {}, refState);
+            result = navResult + '\n---\n' + p;
+          } catch (e) {
+            if (!isTimeoutError(e)) throw e;
+            result = navResult + `\n---\n(success but observation timed out after navigation: ${e.message}. Run \`perceive\` or \`status\` to refresh.)`;
+          }
           break;
         }
         case 'net': case 'network': result = await netStr(cdp, sessionId); break;
-        case 'status': result = await statusStr(cdp, sessionId, consoleBuf, exceptionBuf, navBuf, lastReadSeq); break;
+        case 'status': result = await statusStr(cdp, sessionId, consoleBuf, exceptionBuf, navBuf, lastReadSeq, { runtime: args.includes('--runtime') }); break;
         case 'console': result = await consoleStr(consoleBuf, exceptionBuf, lastReadSeq, args[0]); break;
         case 'summary': result = await summaryStr(cdp, sessionId, consoleBuf, exceptionBuf); break;
         case 'perceive': {
@@ -3764,14 +4047,23 @@ async function runDaemon(targetId) {
         }
         case 'scroll': {
           const scrollResult = await scrollStr(cdp, sessionId, args[0], args[1]);
-          const diff = await perceiveStr(cdp, sessionId, consoleBuf, exceptionBuf, refMap, lastPerceiveStore, { diff: true }, refState);
-          result = scrollResult + '\n---\n' + diff;
+          try {
+            const diff = await perceiveStr(cdp, sessionId, consoleBuf, exceptionBuf, refMap, lastPerceiveStore, { diff: true }, refState);
+            result = scrollResult + '\n---\n' + diff;
+          } catch (e) {
+            if (!isTimeoutError(e)) throw e;
+            result = scrollResult + `\n---\n(success but observation timed out after action dispatch: ${e.message}. The scroll was already sent; run \`perceive --diff\` or \`status\` to refresh.)`;
+          }
           break;
         }
         case 'hover': result = await hoverStr(cdp, sessionId, args[0], refMap, refState); break;
         case 'waitfor': result = await waitForStr(cdp, sessionId, args, refMap, refState); break;
         case 'loadall': result = await loadAllStr(cdp, sessionId, args[0], args[1] ? parseInt(args[1]) : 1500); break;
-        case 'fill': result = await fillStr(cdp, sessionId, args[0], args[1], refMap, refState); break;
+        case 'fill': {
+          if (args[0] === '--react') result = await fillStr(cdp, sessionId, args[1], args[2], refMap, refState, { react: true });
+          else result = await fillStr(cdp, sessionId, args[0], args[1], refMap, refState);
+          break;
+        }
         case 'select': result = await actionFeedback(await selectStr(cdp, sessionId, args[0], args[1])); break;
         case 'fullshot': result = await fullshotStr(cdp, sessionId, args[0], targetId); break;
         case 'scanshot': result = await scanshotStr(cdp, sessionId, targetId); break;
@@ -3790,7 +4082,12 @@ async function runDaemon(targetId) {
         case 'table': result = await tableStr(cdp, sessionId, args[0]); break;
         case 'back': result = await historyNavStr(cdp, sessionId, -1); break;
         case 'forward': result = await historyNavStr(cdp, sessionId, +1); break;
-        case 'reload': result = await reloadStr(cdp, sessionId); break;
+        case 'reload': {
+          result = await reloadStr(cdp, sessionId);
+          clearObservationBuffers({ consoleBuf, exceptionBuf, navBuf, netReqBuf, pendingReqs, lastReadSeq });
+          result += ' (console/exception/navigation buffers cleared)';
+          break;
+        }
         case 'closetab': result = await closetabStr(cdp, targetId); break;
         case 'netlog': result = netlogStr(netReqBuf, args[0]); break;
         case 'inject': result = await injectStr(cdp, sessionId, args); break;
@@ -3941,6 +4238,16 @@ async function getOrStartTabDaemon(targetId) {
 
 const IPC_TIMEOUT = 120000; // 2 minutes — generous for slow commands like scanshot
 
+function ipcTimeoutForRequest(req) {
+  if (req?.cmd !== 'wait') return IPC_TIMEOUT;
+  try {
+    const waitMs = parseDelayMs(req.args?.[0], { name: 'wait duration', max: 60 * 60 * 1000 });
+    return Math.max(IPC_TIMEOUT, waitMs + 5000);
+  } catch {
+    return IPC_TIMEOUT;
+  }
+}
+
 function sendCommand(conn, req) {
   return new Promise((resolve, reject) => {
     let buf = '';
@@ -3966,9 +4273,10 @@ function sendCommand(conn, req) {
     const onEnd = () => settle(() => reject(new Error(`Connection closed before response. The daemon for this tab may have crashed or exited (idle timeout, page closed, or browser disconnect). Re-run "perceive <target>" to restart it; check ${RUNTIME_DIR} for stale sockets if this repeats.`)));
     const onClose = () => settle(() => reject(new Error(`Connection closed before response. The daemon for this tab may have crashed or exited (idle timeout, page closed, or browser disconnect). Re-run "perceive <target>" to restart it; check ${RUNTIME_DIR} for stale sockets if this repeats.`)));
 
+    const timeoutMs = ipcTimeoutForRequest(req);
     const timer = setTimeout(() => {
-      settle(() => { conn.destroy(); reject(new Error(`IPC timeout: command "${req.cmd}" took longer than ${IPC_TIMEOUT / 1000}s`)); });
-    }, IPC_TIMEOUT);
+      settle(() => { conn.destroy(); reject(new Error(`IPC timeout: command "${req.cmd}" took longer than ${timeoutMs / 1000}s`)); });
+    }, timeoutMs);
 
     conn.on('data', onData);
     conn.on('error', onError);
@@ -4032,12 +4340,15 @@ Usage: cdp <command> [args]
   eval  <target> <expr>             Evaluate JS expression
                                     --b64 / -b <base64>: decode UTF-8 base64 first
                                     (safe transport for CJK / shell-hostile expressions)
+                                    --fire-and-forget: dispatch without awaiting returned promise
   eval64 <target> <base64>          Shorthand for eval --b64; preserves multibyte characters
+  call  <target> <expr|fn>          Await expression/function result and print JSON when possible
   elshot <target> <sel|@ref>        Element screenshot: captures element by CSS selector or @ref
   shot  <target> [file|--annotate]  Viewport screenshot; --annotate (-a) overlays @ref labels
   html  <target> [selector]         Get HTML (full page or CSS selector)
   nav   <target> <url>              Navigate to URL and wait for load completion
-  status <target>                    Page state + new console/exception entries (primary debug entry point)
+  status <target> [--runtime]        Page state + new console/exception entries (primary debug entry point)
+                                    --runtime: include Performance.getMetrics counters
   console <target> [--all|--errors] Console buffer (default: new entries only; --all: last 200; --errors: errors+exceptions)
   summary <target>                  Token-efficient page overview (interactive elements, scroll, console health)
   net   <target>                    Network performance entries
@@ -4056,7 +4367,9 @@ Usage: cdp <command> [args]
   waitfor <target> --text "str" [--scope sel] [ms]  Wait for text to appear on page
   loadall <target> <selector> [ms]  Repeatedly click a "load more" button until it disappears
                                     Optional interval in ms between clicks (default 1500)
+  wait    <target> <ms>             Delay inside cdp (also: cdp wait <ms> [target])
   fill    <target> <sel|@ref> <txt> Clear field and type text (for form filling)
+                                    --react: native value setter + input/change events
   select  <target> <selector> <val> Select an option in a <select> element by value
   fullshot <target> [file]          Full-page screenshot (single image — may be hard to read)
   scanshot <target>                 Segmented full-page capture (viewport-sized images, readable)
@@ -4067,11 +4380,12 @@ Usage: cdp <command> [args]
   dialog  <target> [accept|dismiss] Show dialog history; set auto-accept (default) or auto-dismiss
   viewport <target> [WxH]           Show or set viewport size (e.g. 375x812, 1280x720)
   upload  <target> <selector> <paths>  Upload file(s) to <input type="file"> (comma-separated paths)
-  text    <target> [selector]       Clean text content — optional CSS selector to scope
+  text    <target> [selector]       Clean visible text — optional CSS selector to scope
+                                    --root auto|default|<sel>: scope to #root/[data-reactroot]/main/body or selector
   table   <target> [selector]       Full table data extraction (tab-separated, no row limit)
   back    <target>                  Navigate back in browser history
   forward <target>                  Navigate forward in browser history
-  reload  <target>                  Reload current page
+  reload  <target>                  Reload current page and clear console/exception/navigation buffers
   closetab <target>                 Close a browser tab
   netlog  <target> [--clear]        Network request log (XHR/Fetch/Document with status + timing)
   inject <target> <flag> [content]   Live CSS/JS injection with tracking and removal
@@ -4109,6 +4423,7 @@ Usage: cdp <command> [args]
   doctor / ready                    One-call diagnostics: Node version, skill install path,
                                     daemon socket state, CDP_PORT/DevToolsActivePort reachability.
                                     No target required. Exits 1 if any check FAILs.
+  keepalive <target> <ms>           Extend this tab daemon lifetime (fire-and-forget eval extends 1h)
   open  [url]                       Open a new tab (default: about:blank)
                                     Note: each new tab triggers a fresh "Allow debugging?" prompt
   spawn-debug-browser [browser] [--port N] [--url URL] [--profile-dir DIR] [--exe PATH]
@@ -4122,6 +4437,8 @@ Usage: cdp <command> [args]
 ACTION FEEDBACK
   click, clickxy, press (Enter/Escape/Tab), select, scroll, and viewport (when
   resizing) automatically wait for DOM to settle and return a perceive diff.
+  If that post-action observation times out after the action was sent, the
+  command reports success with "observation timed out" instead of a pure timeout.
   nav automatically returns a full perceive of the loaded page.
   No need to manually run perceive or perceive --diff after these actions.
 
@@ -4151,7 +4468,7 @@ DAEMON IPC (for advanced use / scripting)
     Request:  {"id":<number>, "cmd":"<command>", "args":["arg1","arg2",...]}
     Response: {"id":<number>, "ok":true,  "result":"<string>"}
            or {"id":<number>, "ok":false, "error":"<message>"}
-  Commands mirror the CLI: perceive, status, summary, console, snap, eval, eval64, shot,
+  Commands mirror the CLI: perceive, status, summary, console, snap, eval, eval64, call, wait, keepalive, shot,
   elshot, fullshot, scanshot, html, nav, net, click, jsclick, clickxy, hover, type, press,
   scroll, fill, select, waitfor, loadall, styles, cookies, cookieset, cookiedel, dialog,
   viewport, upload, text, table, back, forward, reload, closetab, netlog, inject, cascade,
@@ -4160,12 +4477,22 @@ DAEMON IPC (for advanced use / scripting)
 `;
 
 const NEEDS_TARGET = new Set([
-  'snap','snapshot','eval','eval64','shot','screenshot','html','nav','navigate',
+  'snap','snapshot','eval','eval64','call','wait','keepalive','shot','screenshot','html','nav','navigate',
   'net','network','click','clickxy','jsclick','type','press','scroll','hover','waitfor','loadall','fill','select','fullshot','scanshot','styles','cookies','cookieset','cookiedel','evalraw','status','console','summary','perceive','elshot','batch','dialog','viewport','upload',
   'text','table','back','forward','reload','closetab','netlog',
   'inject','cascade','record','flow','repeat',
   'dismiss-modal','dismissmodal',
 ]);
+
+function parseTargetAndCommandArgs(cmd, args) {
+  let targetPrefix = args[0];
+  let cmdArgs = args.slice(1);
+  if (cmd === 'wait' && /^\d+$/.test(args[0] || '') && args[1] && !/^\d+$/.test(args[1] || '')) {
+    targetPrefix = args[1];
+    cmdArgs = [args[0], ...args.slice(2)];
+  }
+  return { targetPrefix, cmdArgs };
+}
 
 async function main() {
   const [cmd, ...args] = process.argv.slice(2);
@@ -4279,6 +4606,12 @@ async function main() {
     }
   }
 
+  // Targetless wait: avoids shell sleep policy for simple delays.
+  if (cmd === 'wait' && /^\d+$/.test(args[0] || '') && !args[1]) {
+    console.log(await waitStr(args[0]));
+    return;
+  }
+
   // Page commands — need target prefix
   if (!NEEDS_TARGET.has(cmd)) {
     console.error(`Unknown command: ${cmd}\n`);
@@ -4286,7 +4619,7 @@ async function main() {
     process.exit(1);
   }
 
-  const targetPrefix = args[0];
+  let { targetPrefix, cmdArgs } = parseTargetAndCommandArgs(cmd, args);
   if (!targetPrefix) {
     console.error('Error: target ID required. Run "cdp list" first.');
     process.exit(1);
@@ -4310,25 +4643,31 @@ async function main() {
 
   const conn = await getOrStartTabDaemon(targetId);
 
-  const cmdArgs = args.slice(1);
-
   if (cmd === 'eval') {
-    if (cmdArgs[0] === '--b64' || cmdArgs[0] === '-b') {
+    const fire = cmdArgs.includes('--fire-and-forget') || cmdArgs.includes('--faf');
+    const b64Index = cmdArgs.findIndex(a => a === '--b64' || a === '-b');
+    if (b64Index !== -1) {
       // eval --b64 <base64>: pass the flag and the (possibly chunked) base64
       // payload through to the daemon untouched. Shells split a long base64
       // blob across argv slots; rejoin without spaces.
-      const b64 = cmdArgs.slice(1).join('').trim();
+      const b64 = cmdArgs.slice(b64Index + 1)
+        .filter(a => a !== '--fire-and-forget' && a !== '--faf')
+        .join('').trim();
       if (!b64) { console.error('Error: base64 expression required'); process.exit(1); }
-      cmdArgs.splice(0, cmdArgs.length, '--b64', b64);
+      cmdArgs.splice(0, cmdArgs.length, ...(fire ? ['--fire-and-forget'] : []), '--b64', b64);
     } else {
-      const expr = cmdArgs.join(' ');
+      const expr = cmdArgs.filter(a => a !== '--fire-and-forget' && a !== '--faf').join(' ');
       if (!expr) { console.error('Error: expression required'); process.exit(1); }
-      cmdArgs[0] = expr;
+      cmdArgs.splice(0, cmdArgs.length, ...(fire ? ['--fire-and-forget'] : []), expr);
     }
   } else if (cmd === 'eval64') {
     const b64 = cmdArgs.join('').trim();
     if (!b64) { console.error('Error: base64 expression required'); process.exit(1); }
     cmdArgs.splice(0, cmdArgs.length, b64);
+  } else if (cmd === 'call') {
+    const expr = cmdArgs.join(' ');
+    if (!expr) { console.error('Error: expression required'); process.exit(1); }
+    cmdArgs.splice(0, cmdArgs.length, expr);
   } else if (cmd === 'elshot') {
     if (!cmdArgs[0]) { console.error('Error: CSS selector required'); process.exit(1); }
   } else if (cmd === 'type') {
@@ -4337,8 +4676,15 @@ async function main() {
     if (!text) { console.error('Error: text required'); process.exit(1); }
     cmdArgs[0] = text;
   } else if (cmd === 'fill') {
-    if (!cmdArgs[0]) { console.error('Error: selector required'); process.exit(1); }
-    if (cmdArgs.length > 2) cmdArgs[1] = cmdArgs.slice(1).join(' ');
+    if (cmdArgs[0] === '--react') {
+      if (!cmdArgs[1]) { console.error('Error: selector required'); process.exit(1); }
+      const text = cmdArgs.slice(2).join(' ');
+      if (!text) { console.error('Error: text required'); process.exit(1); }
+      cmdArgs.splice(0, cmdArgs.length, '--react', cmdArgs[1], text);
+    } else {
+      if (!cmdArgs[0]) { console.error('Error: selector required'); process.exit(1); }
+      if (cmdArgs.length > 2) cmdArgs[1] = cmdArgs.slice(1).join(' ');
+    }
   } else if (cmd === 'evalraw') {
     // args: [method, ...jsonParts] — join json parts in case of spaces
     if (!cmdArgs[0]) { console.error('Error: CDP method required'); process.exit(1); }
@@ -4390,7 +4736,10 @@ export const __test__ = process.env.NODE_ENV === 'test' ? {
   parsePerceiveArgs, buildPerceiveTree, perceivePageScript,
   // Command implementations
   formatPageList, dialogStr, netlogStr, injectStr, cascadeStr, recordStr, parseRecordArgs,
-  evalStr, evalBase64Decode, navStr, clickStr, jsClickStr, fillStr, waitForStr, snapshotStr,
+  isTimeoutError, parseDelayMs, waitStr, ipcTimeoutForRequest, parseTargetAndCommandArgs,
+  evalStr, evalFireAndForgetStr, parseEvalArgs, callStr, formatCallResult, evalBase64Decode,
+  navStr, clickStr, jsClickStr, fillStr, fillReactStr, waitForStr, snapshotStr,
+  statusStr, runtimeMetricsStr, clearObservationBuffers,
   parseRepeatArgs, repeatStr,
   // 3y-mud feedback additions
   KEY_MAP, PUNCT_KEY_MAP, SHIFTED_PUNCT_KEY_MAP, keyForPress, pressStr,

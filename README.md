@@ -1,6 +1,6 @@
 # chrome-cdp-ex
 
-[![50 Commands](https://img.shields.io/badge/commands-50-orange)](skills/chrome-cdp-ex/scripts/cdp.mjs)
+[![53 Commands](https://img.shields.io/badge/commands-53-orange)](skills/chrome-cdp-ex/scripts/cdp.mjs)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0-blue)](skills/chrome-cdp-ex/scripts/cdp.mjs)
 [![Node 22+](https://img.shields.io/badge/node-22%2B-brightgreen)](https://nodejs.org)
 [![MIT License](https://img.shields.io/badge/license-MIT-gray)](LICENSE)
@@ -22,7 +22,7 @@
 - [The Redesign Experiment](#the-redesign-experiment)
 - [Quick Start](#quick-start)
 - [How It Works](#how-it-works)
-- [Commands (50 total)](#commands-50-total)
+- [Commands (53 total)](#commands-53-total)
 - [WSL2 -> Windows Browser Control](#wsl2---windows-browser-control)
 - [Credits](#credits)
 - [License](#license)
@@ -231,7 +231,7 @@ Each tab gets its own daemon process that keeps the CDP session open.
 Chrome's "Allow debugging" dialog appears **once per tab**, not once per command.
 Daemons auto-exit after 20 minutes of inactivity and passively collect console/exception/navigation events into ring buffers.
 
-## Commands (50 total)
+## Commands (53 total)
 
 Tip: start with `perceive`, then use `click`/`fill`/`select`; use `status` or `console` when you need debugging context.
 
@@ -302,6 +302,7 @@ spawn-debug-browser [edge|chrome|brave] [--port 9222] [--url URL] [--profile-dir
                                    # `spawn` is a short alias
 stop   [target]                    # stop daemon(s)
 closetab <target>                  # close a browser tab
+keepalive <target> <ms>            # extend a tab daemon lifetime for long background work
 doctor / ready                     # one-call diagnostics (no target needed)
                                    # checks: Node 22+, skill install, daemon sockets, CDP reachability
                                    # prints OK/WARN/FAIL with hints; exits 1 if any check FAILs
@@ -325,12 +326,13 @@ perceive <target> [flags]          # enriched AX tree with @ref indices + viewpo
                                    # Fixed/sticky elements get a ", fixed"/", sticky" tag.
 snap     <target> [--full]         # accessibility tree (compact by default)
 summary  <target>                  # token-efficient overview (~100 tokens)
-status   <target>                  # URL, title + new console/exception entries
+status   <target> [--runtime]      # URL, title + new console/exception entries; --runtime adds Performance metrics
 console  <target> [--all|--errors] # console buffer (default: unread only; preserves log/warn/error/debug levels)
 text     <target>                            # clean text content (strips scripts/styles/SVG)
 text     <target> "main, [role=main], #app .main"   # fallback chain — first match wins
 text     <target> --auto                     # heuristic main-content extraction (no nav/aside/footer)
 text     <target> --auto --exclude ".sidebar,.banner"
+text     <target> --root auto "header"       # scope to #root/[data-reactroot]/main/body; header falls back to banner/h1/h2
 table    <target> [selector]       # full table data extraction (tab-separated)
 ```
 
@@ -359,6 +361,9 @@ fullshot <target> [file]            # single full-page image (may be tiny on lon
 ```bash
 html      <target> [selector]       # full HTML or scoped to CSS selector
 eval      <target> <expr>           # evaluate JS in page context
+eval      <target> --b64 <base64>   # decode UTF-8 base64 first
+eval      <target> --fire-and-forget <expr>  # dispatch async/background JS without awaiting its promise
+call      <target> <expr|fn>        # await expression/function result and print JSON when possible
 styles    <target> <selector>       # computed styles (meaningful props only)
 net       <target>                  # network performance entries
 netlog    <target> [--clear]        # network request log (XHR/Fetch with status + timing)
@@ -383,6 +388,8 @@ press   <target> <key>              # press key (Enter, Tab, Escape, Backspace, 
 scroll  <target> <dir|x,y> [px]     # scroll (down/up/left/right; default 500px)
 hover   <target> <sel|@ref>         # hover (triggers :hover, tooltips)
 fill    <target> <sel|@ref> <text>  # clear field + type (form filling)
+fill    <target> --react <sel|@ref> <text>  # native value setter + input/change events for React controlled inputs
+wait    <target> <ms>               # delay inside cdp; also supports: cdp wait <ms> [target]
 select  <target> <selector> <val>   # select dropdown option by value
 waitfor <target> <selector> [ms]              # wait for element to appear (default 10s)
 waitfor <target> --gone <sel|@ref> [ms]       # wait for element to DISAPPEAR
@@ -404,7 +411,7 @@ dialog  <target> [accept|dismiss]   # dialog history; set auto-accept or auto-di
 nav      <target> <url>             # navigate to URL and wait for load
 back     <target>                   # navigate back in browser history
 forward  <target>                   # navigate forward
-reload   <target>                   # reload current page
+reload   <target>                   # reload current page and clear console/exception/navigation buffers
 viewport <target> [WxH]             # show or set viewport size (e.g. 375x812)
 ```
 
@@ -453,14 +460,32 @@ repeat  <target> <N> <cmd> [args]   # run a single command up to N times (cap 50
                                     # selectors if the DOM mutates during the loop.
 eval    <target> <expr>             # evaluate JS in page context
 eval    <target> --b64 <base64>     # decode UTF-8 base64 first (CJK / shell-hostile transport)
+eval    <target> --fire-and-forget <expr>  # start async/background JS; returns after dispatch; keeps daemon alive 1h
 eval64  <target> <base64>           # alias for `eval --b64`
+call    <target> <expr|fn>          # await page function/expression result, including promises, as JSON when possible
 evalraw <target> <method> [json]    # raw CDP command passthrough
                                     # e.g. evalraw <t> "DOM.getDocument" '{}'
 ```
 
 </details>
 
-**Action feedback:** `click`, `clickxy`, `press` (Enter/Escape/Tab), and `select` automatically wait for DOM to settle and return a `perceive` diff showing what changed. You usually do not need to run `perceive --diff` manually after these actions.
+**Action feedback:** `click`, `clickxy`, `press` (Enter/Escape/Tab), `select`, `scroll`, and viewport resizing automatically wait for DOM to settle and return a `perceive` diff showing what changed. If the action was sent but the post-action observation times out during a React rerender or navigation churn, the command reports `success but observation timed out` instead of a pure timeout, so agents should verify with `perceive --diff` or `status` rather than retrying the click.
+
+Use `wait` instead of shell `sleep` when policy blocks long sleeps:
+
+```bash
+cdp wait <target> 30000
+cdp wait 30000 <target>
+cdp wait 30000
+```
+
+Use `call` for page-level functions whose results matter, and `eval --fire-and-forget` for intentional background loops:
+
+```bash
+cdp call <target> "async () => window.app.getState()"
+cdp eval <target> --fire-and-forget "setInterval(() => window.tick?.(), 1000)"
+cdp keepalive <target> 3600000
+```
 
 `<target>` is a unique targetId prefix from `list`. See [SKILL.md](skills/chrome-cdp-ex/SKILL.md) for detailed usage patterns and coordinate-system notes.
 

@@ -424,7 +424,9 @@ scripts/cdp.mjs waitfor <target> <selector> [ms]      # wait for CSS selector to
 scripts/cdp.mjs waitfor <target> --gone <sel|@ref> [ms]  # wait for element to DISAPPEAR (streaming end)
 scripts/cdp.mjs waitfor <target> --text "str" [ms]   # wait for text to appear on page (max 5min)
 scripts/cdp.mjs waitfor <target> --text "str" --scope ".reply" 120000  # scoped text wait
+scripts/cdp.mjs wait    <target> 30000                 # agent-safe delay; use instead of shell sleep
 scripts/cdp.mjs fill    <target> <sel|@ref> <text>     # clear field + type text (form filling)
+scripts/cdp.mjs fill    <target> --react <sel|@ref> <text>  # React-controlled input value setter + input/change events
 scripts/cdp.mjs select  <target> <selector> <value>    # select option (auto-returns perceive diff)
 scripts/cdp.mjs styles  <target> <selector>            # computed styles (meaningful props only)
 scripts/cdp.mjs text    <target> [selector]              # clean text — optional CSS selector to scope
@@ -454,6 +456,7 @@ scripts/cdp.mjs flow    <target> "<steps>"               # sequential runner; se
 scripts/cdp.mjs doctor                          # one-call diagnostics (Node, skill install, daemon state, CDP reachability)
 scripts/cdp.mjs ready                           # alias of doctor; exits 1 if any check FAILs
 scripts/cdp.mjs open    [url]                  # open new tab + auto-attach + auto-perceive (waits up to 60s for approval)
+scripts/cdp.mjs keepalive <target> <ms>        # keep a tab daemon alive for long background work
 scripts/cdp.mjs stop    [target]               # stop daemon(s)
 ```
 
@@ -502,9 +505,12 @@ scripts/cdp.mjs upload <target> "#file-input" /path/a.jpg,/path/b.jpg   # multip
 ```bash
 scripts/cdp.mjs text <target>                  # full page text (strips scripts/styles/SVG)
 scripts/cdp.mjs text <target> ".reply"         # scoped to CSS selector — much less noise
+scripts/cdp.mjs text <target> "main, [role=main], #app .main"  # fallback chain
+scripts/cdp.mjs text <target> --root auto "header"             # scope to app root; header falls back to banner/h1/h2
 ```
 
 Returns page content as plain text. **Use the selector form** to extract specific sections (e.g. AI replies, article body) instead of drowning in sidebar/nav noise.
+Use `--root auto` when a React/Vite app has repeated shell text outside the app mount; it scopes extraction to `#root`, `[data-reactroot]`, `main`, then `body`.
 
 ### Table data extraction
 
@@ -520,8 +526,10 @@ Returns full table data with no row truncation (unlike perceive which caps at 5 
 ```bash
 scripts/cdp.mjs back    <target>              # go back
 scripts/cdp.mjs forward <target>              # go forward
-scripts/cdp.mjs reload  <target>              # reload current page
+scripts/cdp.mjs reload  <target>              # reload current page and clear observation buffers
 ```
+
+`reload` clears the daemon's console, exception, navigation, and network observation buffers after the page comes back, so the next `status` starts from the fresh page.
 
 ### Tab management
 
@@ -842,6 +850,18 @@ The default `click` is still preferred — it produces realistic event sequences
 that pass through `:active`/`:hover`/focus rings — but `jsclick` is the right
 escape hatch when you can prove the mouse path is the blocker.
 
+### React-controlled inputs — `fill --react`
+
+```bash
+cdp fill <t> --react "input[name='message']" "hello"
+cdp fill <t> --react @12 "hello"
+```
+
+Use this when normal `fill` appears to type but the app state does not update.
+It uses the native value setter and dispatches `input` plus `change`, which is
+the fallback controlled React inputs usually need. Keep normal `fill` as the
+default because it exercises the browser's text input path.
+
 ### Safe transport for CJK / shell-hostile JS — `eval64` / `eval --b64`
 
 ```bash
@@ -855,6 +875,21 @@ Encoding the expression as base64 sidesteps the entire quoting layer and produce
 lossless round-trip for CJK/RTL/control-character expressions. The decoder
 validates the input — non-base64 garbage raises a clear error rather than
 silently evaluating part of the payload.
+
+### Long async page work
+
+```bash
+cdp call <t> "async () => window.app.getState()"
+cdp eval <t> --fire-and-forget "setInterval(() => window.tick?.(), 1000)"
+cdp keepalive <t> 3600000
+cdp wait <t> 30000
+cdp wait 30000
+```
+
+Use `call` when the result matters and `eval --fire-and-forget` only for
+intentional background work. Fire-and-forget eval extends the daemon keepalive
+by one hour; `keepalive` can extend it explicitly. Prefer `cdp wait` to shell
+`sleep` when long sleeps are blocked by agent policy.
 
 ### Game / MUD sequence capture — putting it all together
 
